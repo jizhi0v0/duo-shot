@@ -21,22 +21,32 @@ import CoreGraphics
 /// order, and it needs no Screen Recording grant: it reads window geometry, not
 /// pixels. So it costs nothing to consult and it is the only authority on depth.
 enum WindowZOrder {
-    /// `CGWindowID` -> depth, 0 being frontmost.
-    static func depths() -> [CGWindowID: Int] {
+    /// What the window server says about an on-screen window.
+    struct Entry: Sendable {
+        /// 0 is frontmost.
+        let depth: Int
+        /// The window's own opacity, which ScreenCaptureKit does not report at
+        /// all. A window can be `isOnScreen` and completely invisible.
+        let alpha: Double
+    }
+
+    /// `CGWindowID` -> what the window server knows about it.
+    static func entries() -> [CGWindowID: Entry] {
         let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
         guard let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]]
         else { return [:] }
 
-        var depths: [CGWindowID: Int] = [:]
-        depths.reserveCapacity(list.count)
+        var entries: [CGWindowID: Entry] = [:]
+        entries.reserveCapacity(list.count)
         for (depth, entry) in list.enumerated() {
             // Bridged CFNumber: it arrives as NSNumber, so a direct
             // `as? CGWindowID` (UInt32) cast fails and would silently drop every
             // window, leaving the order untouched.
             guard let number = entry[kCGWindowNumber as String] as? NSNumber else { continue }
-            depths[CGWindowID(number.uint32Value)] = depth
+            let alpha = (entry[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
+            entries[CGWindowID(number.uint32Value)] = Entry(depth: depth, alpha: alpha)
         }
-        return depths
+        return entries
     }
 
     /// Sorts front-to-back.
@@ -44,12 +54,14 @@ enum WindowZOrder {
     /// Windows the window server did not list keep their relative input order and
     /// go behind everything it did list: an unknown depth is not a reason to
     /// reshuffle, and `sorted(by:)` is not stable, hence the index tiebreak.
-    static func sortedFrontToBack(_ windows: [WindowInfo]) -> [WindowInfo] {
-        let depths = depths()
-        guard !depths.isEmpty else { return windows }
+    static func sortedFrontToBack(
+        _ windows: [WindowInfo], using entries: [CGWindowID: Entry]? = nil
+    ) -> [WindowInfo] {
+        let entries = entries ?? Self.entries()
+        guard !entries.isEmpty else { return windows }
         return windows.enumerated().sorted { lhs, rhs in
-            let left = depths[lhs.element.id] ?? Int.max
-            let right = depths[rhs.element.id] ?? Int.max
+            let left = entries[lhs.element.id]?.depth ?? Int.max
+            let right = entries[rhs.element.id]?.depth ?? Int.max
             return left == right ? lhs.offset < rhs.offset : left < right
         }.map(\.element)
     }

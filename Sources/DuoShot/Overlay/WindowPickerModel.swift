@@ -71,6 +71,12 @@ final class WindowPickerModel {
         // Stage Manager parks windows that are `isActive` but not on screen;
         // they are not pickable because they are not visible.
         if !window.isOnScreen { return "isOnScreen == false" }
+        // And `isOnScreen` is not the whole of "visible": a window can be on
+        // screen at zero opacity, which several menu-bar utilities keep parked
+        // over the display. Measured on DuoPaste — alpha 0.000, 701×596, ranked
+        // in front of Claude, and offered by the picker as though it were there.
+        // You cannot be pointing at something you cannot see.
+        if window.alpha < 0.05 { return "invisible (alpha \(window.alpha))" }
         if !isPickable(layer: window.layer) { return "layer \(window.layer)" }
         // The Dock's window is the whole screen, so it is only usable once
         // `ScreenIndex` has told us where the dock itself actually is. An

@@ -11,6 +11,14 @@ nonisolated struct WindowInfo: Sendable, Identifiable, Hashable {
     let bundleID: String?
     let layer: Int
     let isOnScreen: Bool
+    /// The window server's own opacity for this window, 0–1.
+    ///
+    /// ScreenCaptureKit does not report it, and `isOnScreen` is not a substitute:
+    /// measured 2026-07-30, a DuoPaste panel sat at alpha 0.000, on screen, 701×596,
+    /// ranked directly in front of Claude — completely invisible and completely
+    /// pickable. Defaults to 1 for a window the window server did not list, so a
+    /// missing measurement never hides anything.
+    let alpha: Double
     /// The part of `frame` the window actually occupies, when the two differ.
     ///
     /// Only the Dock needs this today, and it needs it badly: its window is the
@@ -58,8 +66,10 @@ final class ShareableContentCache {
         ).value
         content = fetched
         let dockStrip = ScreenIndex.dockStripInCGGlobal()
+        let entries = WindowZOrder.entries()
         windows = WindowZOrder.sortedFrontToBack(
-            fetched.windows.map { WindowInfo($0, dockStrip: dockStrip) })
+            fetched.windows.map { WindowInfo($0, dockStrip: dockStrip, entries: entries) },
+            using: entries)
     }
 
     func scWindow(for id: CGWindowID) -> SCWindow? {
@@ -119,7 +129,9 @@ extension WindowInfo {
     static let dockLayer = Int(CGWindowLevelForKey(.dockWindow))
     static let menuBarLayer = Int(CGWindowLevelForKey(.mainMenuWindow))
 
-    fileprivate init(_ window: SCWindow, dockStrip: CGRect?) {
+    fileprivate init(
+        _ window: SCWindow, dockStrip: CGRect?, entries: [CGWindowID: WindowZOrder.Entry]
+    ) {
         let isDock = window.owningApplication?.bundleIdentifier == Self.dockBundleID
             && window.windowLayer == Self.dockLayer
         self.init(
@@ -130,6 +142,7 @@ extension WindowInfo {
             bundleID: window.owningApplication?.bundleIdentifier,
             layer: window.windowLayer,
             isOnScreen: window.isOnScreen,
+            alpha: entries[window.windowID]?.alpha ?? 1,
             visibleFrame: isDock ? dockStrip : nil
         )
     }

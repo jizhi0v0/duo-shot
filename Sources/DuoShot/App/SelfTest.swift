@@ -931,8 +931,8 @@ enum SelfTest {
         // picker shipped highlighting App Store from three layers behind the
         // window the user was looking at. `SCShareableContent.windows` is not
         // z-ordered; comparing against CGWindowList's order catches it directly.
-        let depths = WindowZOrder.depths()
-        let ranked = all.compactMap { window in depths[window.id].map { (window, $0) } }
+        let entries = WindowZOrder.entries()
+        let ranked = all.compactMap { window in entries[window.id].map { (window, $0.depth) } }
         let inversions = zip(ranked, ranked.dropFirst()).filter { $0.1 > $1.1 }
         print("z-order:       \(ranked.count) of \(all.count) windows ranked by the window server, "
             + "\(inversions.count) out of order  <- must be 0")
@@ -1089,6 +1089,7 @@ enum SelfTest {
         settings.close()
 
         let furnitureOK = try await systemFurnitureIsPickable(coordinator, all)
+        let opacityOK = try await invisibleWindowsAreNotPickable(coordinator)
 
         let childOK = try await childWindowIsolation()
 
@@ -1182,7 +1183,7 @@ enum SelfTest {
         } ?? false
         let pass = selfLeaked == 0 && hits == tested && tested > 0 && geometryOK && toggleOK
             && inversions.isEmpty && frontmostOK && recoveredOK && appearedOK && paddingOK
-            && childOK && shadowOK && ownWindowOK && cardOK && menuBarOK && furnitureOK
+            && childOK && shadowOK && ownWindowOK && cardOK && menuBarOK && furnitureOK && opacityOK
         print("result:        \(pass ? "PASS" : "FAIL")")
         return pass ? 0 : 1
     }
@@ -1221,6 +1222,58 @@ enum SelfTest {
         print(String(format: "  shadow: %dx%d px, %d shadowed px on a white backdrop -> %@",
                      padded.width, padded.height, darkened,
                      (ok ? "OK" : "FAIL") as NSString))
+        return ok
+    }
+
+    /// A window at zero opacity is never offered, however well it ranks.
+    ///
+    /// `isOnScreen` does not mean visible. Several menu-bar utilities keep a
+    /// panel parked over the display at alpha 0 — measured on DuoPaste: 701×596,
+    /// on screen, ranked directly in front of Claude, and duly highlighted by the
+    /// picker as though the user could see it.
+    ///
+    /// Two windows are put up, identical but for opacity, so the assertion is a
+    /// comparison rather than a claim about one window: the visible one must be
+    /// offered and the invisible one must not. Without the visible control, a
+    /// picker that had simply stopped enumerating would pass.
+    private static func invisibleWindowsAreNotPickable(
+        _ coordinator: CaptureCoordinator
+    ) async throws -> Bool {
+        func panel(alpha: CGFloat, x: CGFloat) -> NSWindow {
+            let window = NSWindow(
+                contentRect: CGRect(x: x, y: 400, width: 300, height: 300),
+                styleMask: [.borderless], backing: .buffered, defer: false)
+            window.backgroundColor = .green
+            window.alphaValue = alpha
+            window.level = .floating
+            window.orderFrontRegardless()
+            return window
+        }
+        let visible = panel(alpha: 1, x: 100)
+        let invisible = panel(alpha: 0, x: 500)
+        defer {
+            visible.orderOut(nil)
+            invisible.orderOut(nil)
+        }
+
+        try await Task.sleep(for: .milliseconds(500))
+        try await coordinator.engine.refreshContent()
+        let windows = coordinator.engine.shareableContent.windows
+
+        let presentation = Task {
+            await coordinator.overlay.present(mode: .window, windows: windows)
+        }
+        try await Task.sleep(for: .milliseconds(400))
+        let pickable = coordinator.overlay.pickableWindowIDs
+        coordinator.overlay.tearDown()
+        presentation.cancel()
+        try await Task.sleep(for: .milliseconds(200))
+
+        let visibleOffered = pickable.contains(CGWindowID(visible.windowNumber))
+        let invisibleOffered = pickable.contains(CGWindowID(invisible.windowNumber))
+        let ok = visibleOffered && !invisibleOffered
+        print("opacity:       alpha 1 pickable=\(visibleOffered), "
+            + "alpha 0 pickable=\(invisibleOffered) -> \(ok ? "OK" : "FAIL")")
         return ok
     }
 
