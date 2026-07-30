@@ -221,15 +221,27 @@ enum SelfTest {
                          display.width, display.height))
         }
 
-        print("\nSCWindow (\(content.windows.count)):")
-        for window in content.windows.sorted(by: { $0.windowLayer < $1.windowLayer }) {
-            let app = window.owningApplication?.applicationName ?? "?"
-            print(String(format: "  id=%-8u L%-4d %@ %-24@ %-24@ %@",
-                         window.windowID, window.windowLayer,
-                         window.isOnScreen ? "on " : "off",
-                         app as NSString,
-                         rectString(window.frame) as NSString,
-                         (window.title ?? "") as NSString))
+        // The picker's verdict on every window, from the picker's own rules
+        // rather than a second copy of them. This is the tool for "why can I not
+        // select that window": the rule that dropped it is named outright,
+        // instead of being worked out by measuring one property at a time.
+        //
+        // Front-to-back, because the order is half of what the picker does — a
+        // window is only reachable if nothing accepted sits in front of it.
+        let cache = ShareableContentCache()
+        try await cache.refresh()
+        let picker = WindowPickerModel()
+        let entries = WindowZOrder.entries()
+
+        print("\nwindow picker (\(cache.windows.count) enumerated, front to back):")
+        for window in cache.windows {
+            let verdict = picker.rejectionReason(for: window).map { "dropped: \($0)" } ?? "PICKABLE"
+            print(String(format: "  depth=%-5@ L%-4d a=%.2f %-22@ %-32@ %@",
+                         entries[window.id].map { "\($0.depth)" } as NSString? ?? "—",
+                         window.layer, window.alpha,
+                         rectString(window.pickFrame) as NSString,
+                         window.displayName as NSString,
+                         verdict as NSString))
         }
         return 0
     }

@@ -58,7 +58,7 @@ final class WindowPickerModel {
     /// typically a maximized window, so the highlight becomes a full-screen band
     /// and the pick looks broken. The reason string is what makes that
     /// diagnosable after the fact instead of a guessing game.
-    private func rejectionReason(for window: WindowInfo) -> String? {
+    func rejectionReason(for window: WindowInfo) -> String? {
         // The overlay's own panels would sit topmost over everything and make the
         // picker useless. They are normally invisible to the enumeration anyway
         // (sharingType = .none), so this is a second line of defence.
