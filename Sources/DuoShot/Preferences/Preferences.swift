@@ -33,6 +33,7 @@ final class Preferences {
         static let previewCorner = "previewCorner"
         static let showsCursor = "showsCursor"
         static let includeMenuBar = "includeMenuBar"
+        static let includeChildWindows = "includeChildWindows"
         static let windowPadding = "windowPadding"
         static let filenameTemplate = "filenameTemplate"
         static let hotkeys = "hotkeys.v1"
@@ -76,6 +77,11 @@ final class Preferences {
     var includeMenuBar: Bool {
         didSet { defaults.set(includeMenuBar, forKey: Key.includeMenuBar) }
     }
+    /// See `CaptureOptions.includeChildWindows` for why this is off by default
+    /// and why the name flatters what it does.
+    var includeChildWindows: Bool {
+        didSet { defaults.set(includeChildWindows, forKey: Key.includeChildWindows) }
+    }
     /// Points of wallpaper margin around a window capture. 0 is off, and is the
     /// default: this changes every window screenshot that comes out of the app,
     /// so it is opt-in rather than something a user discovers after the fact.
@@ -110,6 +116,7 @@ final class Preferences {
             Key.previewCorner: PreviewCorner.bottomRight.rawValue,
             Key.showsCursor: false,
             Key.includeMenuBar: true,
+            Key.includeChildWindows: false,
             Key.windowPadding: 0.0,
             Key.filenameTemplate: FilenameFormatter.defaultTemplate,
         ])
@@ -133,6 +140,7 @@ final class Preferences {
             .flatMap(PreviewCorner.init(rawValue:)) ?? .bottomRight
         showsCursor = defaults.bool(forKey: Key.showsCursor)
         includeMenuBar = defaults.bool(forKey: Key.includeMenuBar)
+        includeChildWindows = defaults.bool(forKey: Key.includeChildWindows)
         windowPadding = defaults.double(forKey: Key.windowPadding)
         filenameTemplate = defaults.string(forKey: Key.filenameTemplate)
             .flatMap { $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0 }
@@ -164,6 +172,7 @@ final class Preferences {
         var options = CaptureOptions.default
         options.showsCursor = showsCursor
         options.includeMenuBar = includeMenuBar
+        options.includeChildWindows = includeChildWindows
         options.windowPadding = windowPadding
         return options
     }

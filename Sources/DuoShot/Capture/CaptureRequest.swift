@@ -21,7 +21,18 @@ nonisolated enum CaptureRequest: Sendable {
 nonisolated struct CaptureOptions: Sendable {
     var showsCursor = false
     var ignoreShadows = true
-    var includeChildWindows = true
+    /// Whether a window capture takes the window's whole group — its sheets and
+    /// attached panels — or only the window that was picked.
+    ///
+    /// Off, because "on" does not mean what the name suggests. With a
+    /// `desktopIndependentWindow` filter, ScreenCaptureKit composites the entire
+    /// group and then crops to the picked window's rect, so picking a *child*
+    /// drags its parent in behind it. Measured 2026-07-30 on WeChat's "Tip"
+    /// alert: the file was 560×462, exactly the alert's bounds, with the login
+    /// window's title bar and buttons showing through around it. The marching
+    /// ants said "this alert" and the pixels said "the whole window", which is
+    /// the one thing a selection UI must never do.
+    var includeChildWindows = false
     var includeMenuBar = true
     /// Margin in points added around a **window** capture, filled with the
     /// desktop wallpaper. Zero disables it.

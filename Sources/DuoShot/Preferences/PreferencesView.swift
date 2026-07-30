@@ -303,6 +303,8 @@ struct CaptureSettingsView: View {
             }
 
             Section {
+                Toggle("Include attached sheets and panels",
+                       isOn: $preferences.includeChildWindows)
                 LabeledContent("Padding") {
                     HStack(spacing: 8) {
                         Slider(value: $preferences.windowPadding, in: 0...96, step: 4)
@@ -316,7 +318,11 @@ struct CaptureSettingsView: View {
             } header: {
                 Text("Window captures")
             } footer: {
-                Text("Adds a margin around a captured window, filled with the desktop wallpaper. Area and fullscreen captures are unaffected — they have a backdrop already.")
+                Text("""
+                    Off, a window capture is exactly the window you picked. On, it is the whole window group — so picking an alert also brings in the window behind it.
+
+                    Padding adds a margin filled with the desktop wallpaper. Area and fullscreen captures are unaffected; they have a backdrop already.
+                    """)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

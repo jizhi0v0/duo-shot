@@ -1053,6 +1053,8 @@ enum SelfTest {
         missingPresentation.cancel()
         try await Task.sleep(for: .milliseconds(200))
 
+        let childOK = try await childWindowIsolation()
+
         // Geometry: capture the largest window and check the pixel size against
         // its frame. Also compare ignoreShadows on/off, which is the setting
         // most likely to silently change the output size.
@@ -1126,8 +1128,86 @@ enum SelfTest {
         } ?? false
         let pass = selfLeaked == 0 && hits == tested && tested > 0 && geometryOK && toggleOK
             && inversions.isEmpty && frontmostOK && recoveredOK && appearedOK && paddingOK
+            && childOK
         print("result:        \(pass ? "PASS" : "FAIL")")
         return pass ? 0 : 1
+    }
+
+    /// Draws a filled shape well inside its bounds, leaving a transparent margin
+    /// for whatever is behind the window to show through.
+    private final class InsetFillView: NSView {
+        override func draw(_ dirtyRect: NSRect) {
+            NSColor.systemBlue.setFill()
+            NSBezierPath(
+                roundedRect: bounds.insetBy(dx: 24, dy: 24), xRadius: 12, yRadius: 12
+            ).fill()
+        }
+    }
+
+    /// Picking a child window must capture that window, not its whole group.
+    ///
+    /// `includeChildWindows` does not mean what its name suggests. With a
+    /// `desktopIndependentWindow` filter, ScreenCaptureKit composites the entire
+    /// window group and then crops to the picked window's rect — so turning it on
+    /// and then picking a *child* drags the parent in behind it. Reported
+    /// 2026-07-30 against WeChat's "Tip" alert: the saved file was 560×462,
+    /// exactly the alert's bounds, with the login window's title bar and buttons
+    /// showing through around it. The marching ants said "this alert"; the pixels
+    /// said "the whole window".
+    ///
+    /// The pair is built here rather than hunted for on screen, so the result
+    /// does not depend on what the machine happens to have open: an opaque red
+    /// parent, and a child that is transparent except for a blue shape inset
+    /// inside it. Any red in the child's capture is the parent leaking through.
+    ///
+    /// The `includeChildWindows = true` capture is the negative control. Without
+    /// it, a test that only asserts "no red" would still pass if the capture came
+    /// back blank.
+    private static func childWindowIsolation() async throws -> Bool {
+        let engine = CaptureEngine()
+
+        let parent = NSWindow(
+            contentRect: CGRect(x: 200, y: 200, width: 400, height: 300),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        parent.backgroundColor = .red
+        parent.level = .floating
+        parent.orderFrontRegardless()
+
+        let child = NSWindow(
+            contentRect: CGRect(x: 300, y: 275, width: 200, height: 150),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        child.backgroundColor = .clear
+        child.isOpaque = false
+        child.hasShadow = false
+        child.contentView = InsetFillView(
+            frame: CGRect(x: 0, y: 0, width: 200, height: 150))
+        child.level = .floating
+        parent.addChildWindow(child, ordered: .above)
+
+        defer {
+            parent.removeChildWindow(child)
+            child.orderOut(nil)
+            parent.orderOut(nil)
+        }
+
+        try await Task.sleep(for: .milliseconds(400))
+        try await engine.refreshContent()
+
+        let childID = CGWindowID(child.windowNumber)
+        func redPixels(_ options: CaptureOptions) async throws -> Int {
+            let result = try await engine.capture(.window(childID), options: options)
+            return PixelCompare.count(result.image) { r, g, b in r > 180 && g < 90 && b < 90 }
+        }
+
+        var options = CaptureOptions.default
+        let alone = try await redPixels(options)
+        options.includeChildWindows = true
+        let grouped = try await redPixels(options)
+
+        let ok = alone == 0 && grouped > 0
+        print("child window:  parent bleed \(alone) px on its own, "
+            + "\(grouped) px with includeChildWindows -> \(ok ? "OK" : "FAIL")")
+        return ok
     }
 
     // MARK: - Fullscreen mode
