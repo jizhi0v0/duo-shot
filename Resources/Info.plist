@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>DuoShot</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.boli.duoshot</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>DuoShot</string>
+	<key>CFBundleDisplayName</key>
+	<string>DuoShot</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.0</string>
+	<!-- Menu-bar-only app: no Dock icon, no main menu. -->
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSSupportsAutomaticTermination</key>
+	<false/>
+	<key>NSSupportsSuddenTermination</key>
+	<false/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2026 Bo Li. All rights reserved.</string>
+	<!--
+	  Deliberately NOT present: NSScreenCaptureUsageDescription.
+	  Screen Recording is not a usage-string TCC service; the prompt copy is
+	  entirely system-supplied. Adding the key does nothing.
+	  NSMicrophoneUsageDescription belongs here only once recording lands (phase 2).
+	-->
+</dict>
+</plist>
