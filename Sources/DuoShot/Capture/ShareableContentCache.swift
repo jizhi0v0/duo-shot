@@ -30,6 +30,9 @@ nonisolated struct WindowInfo: Sendable, Identifiable, Hashable {
 /// instances, so we cannot work from projections alone — hence the MainActor-only
 /// accessors alongside the Sendable `WindowInfo` list.
 final class ShareableContentCache {
+    /// Front-to-back, frontmost first. SCK does not hand them over that way — see
+    /// `WindowZOrder` — and the window picker's hit-test depends on it, so the
+    /// ordering is established here once rather than at each use site.
     private(set) var windows: [WindowInfo] = []
     private var content: SCShareableContent?
     private var ownWindows: SCShareableContent?
@@ -39,7 +42,7 @@ final class ShareableContentCache {
             excludingDesktopWindows: true, onScreenWindowsOnly: onScreenOnly
         ).value
         content = fetched
-        windows = fetched.windows.map(WindowInfo.init(_:))
+        windows = WindowZOrder.sortedFrontToBack(fetched.windows.map(WindowInfo.init(_:)))
     }
 
     func scWindow(for id: CGWindowID) -> SCWindow? {
@@ -48,6 +51,16 @@ final class ShareableContentCache {
 
     func scDisplay(for id: CGDirectDisplayID) -> SCDisplay? {
         content?.displays.first { $0.displayID == id }
+    }
+
+    /// A filter containing only the desktop: every running application excluded,
+    /// so what is left to render is the wallpaper. See `DesktopWallpaper`.
+    func wallpaperFilter(for displayID: CGDirectDisplayID) -> SCContentFilter? {
+        guard let content, let display = scDisplay(for: displayID) else { return nil }
+        return SCContentFilter(
+            display: display,
+            excludingApplications: content.applications,
+            exceptingWindows: [])
     }
 
     var displayIDs: [CGDirectDisplayID] {

@@ -54,6 +54,15 @@ final class OverlayPanel: NSPanel {
         // app's fullscreen Space instead of forcing a Space switch.
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
 
+        // NSPanel resolves `.default` to the utility-window behaviour: macOS
+        // scales the window up from ~90% and cross-fades it in on order-front.
+        // For a full-screen overlay that means the crosshair, the dim edge and
+        // the hint are all composited *offset from where they belong* for the
+        // first ~0.15 s and then slide to their true positions — the pointer's
+        // crosshair visibly drifts in from down-and-right of the real pointer.
+        // A screenshot overlay must be exact on frame one, so: no animation.
+        animationBehavior = .none
+
         isOpaque = false
         backgroundColor = .clear
         hasShadow = false

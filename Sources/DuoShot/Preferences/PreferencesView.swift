@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -13,7 +14,55 @@ import UniformTypeIdentifiers
 
 // MARK: - General
 
+/// The app itself: how it shows up, and the one piece of capture feedback that
+/// belongs to the app rather than to the image.
 struct GeneralSettingsView: View {
+    @Bindable var preferences: Preferences
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Show menu bar icon", isOn: $preferences.showsMenuBarIcon)
+                    .onChange(of: preferences.showsMenuBarIcon) { _, _ in
+                        preferences.onMenuBarIconChanged?()
+                    }
+                // Reads through the mirrored status, so the setter's effect is
+                // observable and the switch actually settles on what the system
+                // now reports.
+                Toggle("Launch at login", isOn: $preferences.launchAtLogin)
+                if preferences.launchAtLoginStatus == .requiresApproval {
+                    Button("Open Login Items…") { preferences.openLoginItemsSettings() }
+                }
+            } footer: {
+                Text(preferences.launchAtLoginStatusDescription)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Play shutter sound", isOn: $preferences.playsSound)
+            } footer: {
+                Text("DuoShot has no Dock icon. With the menu bar icon hidden, the keyboard shortcuts are the only way to reach it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        // Approving a login item — or switching it back off — happens in System
+        // Settings, so the only moment we can be sure the mirrored status is
+        // stale is when the app comes back to the front.
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didBecomeActiveNotification)
+        ) { _ in
+            preferences.refreshLaunchAtLoginStatus()
+        }
+    }
+}
+
+// MARK: - Saving
+
+/// Where a capture ends up: the two destinations, the folder and the filename.
+struct SavingSettingsView: View {
     @Bindable var preferences: Preferences
 
     @State private var draftFilenameTemplate: String = ""
@@ -21,6 +70,17 @@ struct GeneralSettingsView: View {
 
     var body: some View {
         Form {
+            Section {
+                Toggle("Save to disk", isOn: $preferences.saveToDisk)
+                Toggle("Copy to clipboard", isOn: $preferences.copyToClipboard)
+            } header: {
+                Text("After capture")
+            } footer: {
+                Text("Both apply to every mode — area, window and fullscreen alike.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section {
                 LabeledContent("Save to") {
                     HStack(spacing: 6) {
@@ -33,6 +93,7 @@ struct GeneralSettingsView: View {
                     }
                 }
                 .help(preferences.saveDirectoryPath)
+                .disabled(!preferences.saveToDisk)
 
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Filename")
@@ -69,53 +130,9 @@ struct GeneralSettingsView: View {
                     }
                     .onAppear { draftFilenameTemplate = preferences.filenameTemplate }
                 }
-            }
-
-            Section("After capture") {
-                Toggle("Save to disk", isOn: $preferences.saveToDisk)
-                Toggle("Copy to clipboard", isOn: $preferences.copyToClipboard)
-                Toggle("Play shutter sound", isOn: $preferences.playsSound)
-            }
-
-            Section {
-                Toggle("Show after capture", isOn: $preferences.showsPreviewOverlay)
-                Picker("Position", selection: $preferences.previewCorner) {
-                    ForEach(PreviewCorner.allCases, id: \.self) { corner in
-                        Text(corner.title).tag(corner)
-                    }
-                }
-                .disabled(!preferences.showsPreviewOverlay)
-                LabeledContent("Dismiss after") {
-                    HStack(spacing: 8) {
-                        Slider(value: $preferences.previewTimeout, in: 2...30, step: 1)
-                        Text("\(Int(preferences.previewTimeout))s")
-                            .monospacedDigit()
-                            .foregroundStyle(.secondary)
-                            .frame(width: 28, alignment: .trailing)
-                    }
-                }
-                .disabled(!preferences.showsPreviewOverlay)
-            } header: {
-                Text("Floating preview")
-            } footer: {
-                Text("Hovering the stack pauses the countdown. Drag a card toward the screen edge to throw it away.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section {
-                Toggle("Show menu bar icon", isOn: $preferences.showsMenuBarIcon)
-                    .onChange(of: preferences.showsMenuBarIcon) { _, _ in
-                        preferences.onMenuBarIconChanged?()
-                    }
-                Toggle("Launch at login", isOn: Binding(
-                    get: { preferences.launchAtLogin },
-                    set: { preferences.launchAtLogin = $0 }
-                ))
-            } footer: {
-                Text(preferences.launchAtLoginStatusDescription)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                // NOT disabled with "Save to disk": the template also names the
+                // staged file, which is what a drag-out or a Finder reveal from
+                // the floating preview hands over.
             }
         }
         .formStyle(.grouped)
@@ -145,6 +162,43 @@ struct GeneralSettingsView: View {
         if panel.runModal() == .OK, let url = panel.url {
             preferences.saveDirectory = url
         }
+    }
+}
+
+// MARK: - Preview
+
+struct PreviewSettingsView: View {
+    @Bindable var preferences: Preferences
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Show after capture", isOn: $preferences.showsPreviewOverlay)
+                Picker("Position", selection: $preferences.previewCorner) {
+                    ForEach(PreviewCorner.allCases, id: \.self) { corner in
+                        Text(corner.title).tag(corner)
+                    }
+                }
+                .disabled(!preferences.showsPreviewOverlay)
+                LabeledContent("Dismiss after") {
+                    HStack(spacing: 8) {
+                        Slider(value: $preferences.previewTimeout, in: 2...30, step: 1)
+                        Text("\(Int(preferences.previewTimeout))s")
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                            .frame(width: 28, alignment: .trailing)
+                    }
+                }
+                .disabled(!preferences.showsPreviewOverlay)
+            } header: {
+                Text("Floating preview")
+            } footer: {
+                Text("Hovering the stack pauses the countdown. Drag a card toward the screen edge to throw it away.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
     }
 }
 
@@ -246,6 +300,25 @@ struct CaptureSettingsView: View {
                 Toggle("Include the pointer", isOn: $preferences.showsCursor)
                 Toggle("Include the menu bar in fullscreen captures",
                        isOn: $preferences.includeMenuBar)
+            }
+
+            Section {
+                LabeledContent("Padding") {
+                    HStack(spacing: 8) {
+                        Slider(value: $preferences.windowPadding, in: 0...96, step: 4)
+                        Text(preferences.windowPadding == 0
+                             ? "Off" : "\(Int(preferences.windowPadding))pt")
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                            .frame(width: 34, alignment: .trailing)
+                    }
+                }
+            } header: {
+                Text("Window captures")
+            } footer: {
+                Text("Adds a margin around a captured window, filled with the desktop wallpaper. Area and fullscreen captures are unaffected — they have a backdrop already.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)

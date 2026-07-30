@@ -2,6 +2,7 @@ import AppKit
 import Carbon.HIToolbox
 import Darwin
 import ScreenCaptureKit
+import ServiceManagement
 import UniformTypeIdentifiers
 
 /// Headless CLI modes, dispatched from `main.swift` before any UI exists.
@@ -921,9 +922,29 @@ enum SelfTest {
         print("filtered out:  \(all.count - pickable) "
             + "(\(offScreen.count) off-screen incl. Stage Manager, plus non-zero layers/tiny/self)")
 
-        // Hit-test: hover the centre of each candidate and check the picker
-        // returns *a* window whose frame contains that point. It may return one
-        // in front, which is correct z-order behaviour, not a failure.
+        // Z-order. The picker resolves a hover as "first frame in the list that
+        // contains the point", so the list order IS the hit-test, and the window
+        // server is the only authority on it.
+        //
+        // This check used to be written off as untestable — "it may return one in
+        // front, which is correct z-order behaviour" — and that is exactly how the
+        // picker shipped highlighting App Store from three layers behind the
+        // window the user was looking at. `SCShareableContent.windows` is not
+        // z-ordered; comparing against CGWindowList's order catches it directly.
+        let depths = WindowZOrder.depths()
+        let ranked = all.compactMap { window in depths[window.id].map { (window, $0) } }
+        let inversions = zip(ranked, ranked.dropFirst()).filter { $0.1 > $1.1 }
+        print("z-order:       \(ranked.count) of \(all.count) windows ranked by the window server, "
+            + "\(inversions.count) out of order  <- must be 0")
+        for (lhs, rhs) in inversions.prefix(3) {
+            print("  \(lhs.0.displayName) (depth \(lhs.1)) listed ahead of "
+                + "\(rhs.0.displayName) (depth \(rhs.1))")
+        }
+
+        // Hit-test: hover the centre of each candidate. A window may legitimately
+        // resolve to one in front of it — that is what z-order means — so the
+        // assertion is that the result contains the point, plus the strict version
+        // below for the frontmost window, which has nothing in front of it.
         var tested = 0
         var hits = 0
         var selfLeaked = 0
@@ -940,6 +961,97 @@ enum SelfTest {
         }
         print("hit-test:      \(hits)/\(tested) centres resolved to a window containing the point")
         print("self leaked:   \(selfLeaked)  <- must be 0")
+
+        // The strict one: the frontmost pickable window has nothing above it, so
+        // hovering its centre must resolve to *itself* and nothing else.
+        //
+        // `layer <= 8`, not `layer == 0`: an app's floating panel (level 3) is a
+        // perfectly ordinary capture target and is very often the frontmost thing
+        // on screen. Written as `== 0` this test agreed with the picker's own
+        // too-narrow filter and so could never catch it refusing to see one —
+        // which is how a translator popup ended up unselectable.
+        let frontmost = all.first {
+            $0.isOnScreen && (0...8).contains($0.layer) && $0.bundleID != ownBundleID
+                && $0.frame.width >= 200 && $0.frame.height >= 200
+        }
+        var frontmostOK = true
+        if let frontmost {
+            coordinator.overlay.forceHover(atAppKitGlobal: DisplayGeometry.flipped(
+                CGPoint(x: frontmost.frame.midX, y: frontmost.frame.midY)))
+            let hovered = coordinator.overlay.hoveredWindow
+            frontmostOK = hovered?.id == frontmost.id
+            print("frontmost:     \(frontmost.displayName) -> "
+                + "\(hovered?.displayName ?? "nothing") \(frontmostOK ? "" : "MISMATCH")")
+        }
+
+        // Staleness. The window list is enumerated once, when the overlay opens,
+        // and the order it captured does not survive the interaction — ⌘-Tab
+        // raises a different app while the picker is up. Simulated by presenting
+        // a deliberately wrong order (reversed) and checking the picker recovers.
+        //
+        // Nothing here moves the mouse or re-ranks by hand, so the only thing
+        // that can fix the order is the controller's poll — which is the point.
+        // The first version of this fix hung off the app-activation notification
+        // instead, and that notification arrives before the window server has
+        // restacked, so it recovered only once the user moved the pointer.
+        //
+        // Not a cosmetic staleness, which is why it is worth a test of its own:
+        // with a maximized window stuck at the head of the list every point on
+        // screen hit-tests to it, so the highlight cannot be moved off it at all.
+        // Measured in the wild as 21 seconds inside the picker with exactly one
+        // hover change logged.
+        coordinator.overlay.tearDown()
+        try await Task.sleep(for: .milliseconds(150))
+
+        // Re-enumeration is disabled for this half, so the ONLY thing that can
+        // repair a reversed list is the re-rank. Left on, it would repair the
+        // order as a side effect and this would pass with the re-rank deleted.
+        let enumerate = coordinator.overlay.refreshWindows
+        coordinator.overlay.refreshWindows = nil
+        let stalePresentation = Task {
+            await coordinator.overlay.present(mode: .window, windows: all.reversed())
+        }
+        try await Task.sleep(for: .milliseconds(400))
+
+        var recoveredOK = true
+        if let frontmost {
+            coordinator.overlay.forceHover(atAppKitGlobal: DisplayGeometry.flipped(
+                CGPoint(x: frontmost.frame.midX, y: frontmost.frame.midY)))
+            let recovered = coordinator.overlay.hoveredWindow
+            recoveredOK = recovered?.id == frontmost.id
+            print("stale order:   reversed list -> re-ranked to "
+                + "\(recovered?.displayName ?? "nothing") \(recoveredOK ? "" : "MISMATCH")")
+        }
+        coordinator.overlay.tearDown()
+        stalePresentation.cancel()
+        coordinator.overlay.refreshWindows = enumerate
+        try await Task.sleep(for: .milliseconds(200))
+
+        // The other half of staleness: a window that is not in the list at all.
+        // Presented without the frontmost window, the picker can only find it by
+        // re-enumerating — which is what an open/save dialog appearing while the
+        // picker is up looks like from in here.
+        let missingPresentation = Task {
+            await coordinator.overlay.present(
+                mode: .window,
+                windows: all.filter { $0.id != frontmost?.id })
+        }
+        // Long enough for the enumeration tick, which runs at a quarter of the
+        // 120 ms poll and then has an async SCK round trip of its own.
+        try await Task.sleep(for: .milliseconds(1400))
+
+        var appearedOK = true
+        if let frontmost {
+            coordinator.overlay.forceHover(atAppKitGlobal: DisplayGeometry.flipped(
+                CGPoint(x: frontmost.frame.midX, y: frontmost.frame.midY)))
+            let found = coordinator.overlay.hoveredWindow
+            appearedOK = found?.id == frontmost.id
+            print("missing window: omitted \(frontmost.displayName) -> re-enumerated to "
+                + "\(found?.displayName ?? "nothing") \(appearedOK ? "" : "MISMATCH")")
+        }
+        coordinator.overlay.tearDown()
+        missingPresentation.cancel()
+        try await Task.sleep(for: .milliseconds(200))
 
         // Geometry: capture the largest window and check the pixel size against
         // its frame. Also compare ignoreShadows on/off, which is the setting
@@ -974,6 +1086,32 @@ enum SelfTest {
             }
         }
 
+        // Padding. The arithmetic is the part worth asserting — the margin is in
+        // POINTS while the image is in pixels, so a missing `* scale` gives half
+        // the requested margin on a Retina display and nobody notices until they
+        // compare two screenshots side by side.
+        let padding: CGFloat = 32
+        var paddingOptions = CaptureOptions.default
+        paddingOptions.windowPadding = padding
+        let padded = try await coordinator.engine.capture(
+            .window(target.id), options: paddingOptions)
+        let base = sizes["ignoreShadows"] ?? .zero
+        let expected = CGSize(
+            width: base.width + padding * 2 * padded.scale,
+            height: base.height + padding * 2 * padded.scale)
+        let paddingOK = padded.pixelSize == expected
+            // The point size has to grow with it, or the file is stamped with a
+            // DPI that makes it paste at the wrong size.
+            && padded.pointSize.width == target.frame.width + padding * 2
+        print(String(format: "  padding=%.0fpt -> %dx%d px (expected %dx%d), points %.0fx%.0f -> %@",
+                     padding, Int(padded.pixelSize.width), Int(padded.pixelSize.height),
+                     Int(expected.width), Int(expected.height),
+                     padded.pointSize.width, padded.pointSize.height,
+                     (paddingOK ? "OK" : "FAIL") as NSString))
+        let paddedURL = directory.appendingPathComponent("window-capture-padded.png")
+        try? ImageEncoder.write(padded.image, to: paddedURL, as: .png, scale: padded.scale)
+        print("  wrote \(paddedURL.path)")
+
         // Child windows (sheets) change the captured bounds when included.
         for includeChildren in [true, false] {
             var options = CaptureOptions.default
@@ -987,6 +1125,7 @@ enum SelfTest {
             $0.width > 0 && $0.height > 0
         } ?? false
         let pass = selfLeaked == 0 && hits == tested && tested > 0 && geometryOK && toggleOK
+            && inversions.isEmpty && frontmostOK && recoveredOK && appearedOK && paddingOK
         print("result:        \(pass ? "PASS" : "FAIL")")
         return pass ? 0 : 1
     }
@@ -1233,8 +1372,12 @@ enum SelfTest {
             let mode: SelectionMode = path == .confirmWindow ? .window : .area
 
             let flag = CompletionFlag()
+            let box = OutcomeBox()
+            // Set by the paths that confirm a selection, so the outcome can be
+            // checked. The paths that are *supposed* to cancel leave it false.
+            var expectsConfirmation = false
             Task {
-                _ = await overlay.present(mode: mode, windows: windows)
+                box.outcome = await overlay.present(mode: mode, windows: windows)
                 flag.markDone()
             }
             try await Task.sleep(for: .milliseconds(120))
@@ -1246,11 +1389,23 @@ enum SelfTest {
                 overlay.forceSelection(
                     CGRect(x: 100, y: 100, width: 200, height: 150), on: screen)
                 overlay.confirmForTest()
+                expectsConfirmation = true
             case .confirmWindow:
-                overlay.forceHover(atAppKitGlobal: NSEvent.mouseLocation)
-                // Falls back to cancelling if nothing is under the pointer,
-                // which is itself a path worth exercising.
-                overlay.tearDown()
+                // Confirming for real, not `tearDown()` standing in for it. The
+                // outcome is then checked below, because the interesting failure
+                // is not a hang — it is `present()` resuming promptly with
+                // `.cancelled`, which looks like a pass from here and means every
+                // window capture silently does nothing.
+                if let target = windows.first(where: {
+                    $0.isOnScreen && $0.layer == 0 && $0.bundleID != Bundle.main.bundleIdentifier
+                }) {
+                    overlay.forceHover(atAppKitGlobal: NSEvent.mouseLocation)
+                    overlay.confirmWindowForTest(target.id)
+                    expectsConfirmation = true
+                } else {
+                    failures.append("\(path.label): no pickable window to confirm")
+                    overlay.tearDown()
+                }
             case .screenReconfiguration:
                 NotificationCenter.default.post(
                     name: NSApplication.didChangeScreenParametersNotification, object: nil)
@@ -1280,6 +1435,10 @@ enum SelfTest {
 
             if !completed {
                 failures.append("\(path.label): present() never resumed")
+            }
+            if expectsConfirmation, case .cancelled? = box.outcome {
+                failures.append(
+                    "\(path.label): resumed with .cancelled instead of the confirmed selection")
             }
             overlay.tearDown()
             if overlay.panelCount != 0 {
@@ -1351,6 +1510,14 @@ enum SelfTest {
     /// "timeout" branch cannot actually abandon the work. That combination hung
     /// this very test for the full 300 s.
     @MainActor
+    /// What `present()` actually resumed with, carried out of the detached task.
+    ///
+    /// The lifecycle test used to discard it, which is why a confirm path that
+    /// resumed promptly with `.cancelled` read as a pass.
+    private final class OutcomeBox {
+        var outcome: OverlayController.Outcome?
+    }
+
     private final class CompletionFlag {
         private(set) var isDone = false
         func markDone() { isDone = true }
@@ -1474,7 +1641,9 @@ enum SelfTest {
         var allPassed = true
         let coordinator = CaptureCoordinator()
 
-        for tab in [PreferencesWindowController.Tab.general, .shortcuts, .capture] {
+        // Every tab, from the enum rather than a hand-written list: a tab added
+        // without a screenshot is a tab whose layout nobody has looked at.
+        for tab in PreferencesWindowController.Tab.allCases {
             let controller = PreferencesWindowController()
             controller.activatesOnShow = false
             controller.show(tab: tab)
@@ -1524,7 +1693,10 @@ enum SelfTest {
     private static func settingsResize() async throws -> Int32 {
         let controller = PreferencesWindowController()
         controller.activatesOnShow = false
-        let order: [PreferencesWindowController.Tab] = [.general, .capture, .shortcuts, .capture, .general]
+        // Walks every tab and then back to the tallest, which is where an
+        // overshoot shows up: shrinking is the direction that flashes.
+        let order: [PreferencesWindowController.Tab] =
+            PreferencesWindowController.Tab.allCases + [.general, .shortcuts, .capture]
         controller.show(tab: order[0])
         try await Task.sleep(for: .milliseconds(700))
 
@@ -1690,8 +1862,140 @@ enum SelfTest {
             failures.append("settings did not persist to UserDefaults")
         }
 
-        print("login item:    \(preferences.launchAtLoginStatusDescription)")
+        failures.append(contentsOf: loginItemChecks(preferences))
         return report(failures)
+    }
+
+    // MARK: - Launch at login
+
+    /// Everything about the login-item toggle that does not need a human at
+    /// System Settings.
+    ///
+    /// Which is, as it turns out, both halves of what was actually broken. The
+    /// footer copy read `.notFound` as "Unavailable — move DuoShot to
+    /// /Applications" on a copy that was already in /Applications; and
+    /// `launchAtLogin` queried `SMAppService` from a computed property, which
+    /// `@Observable` cannot track, so the Toggle never re-rendered after its own
+    /// setter and the switch looked dead even when `register()` had succeeded.
+    /// Both are assertable here with no UI and no system mutation.
+    ///
+    /// Measured on macOS 26.5 (Developer ID, /Applications), which is the fact
+    /// the copy hangs on: never registered -> `.notFound`, register() ->
+    /// `.enabled`, unregister() -> `.notRegistered`. `.notFound` is the pristine
+    /// state, not a broken install.
+    ///
+    /// The live `register()` round trip is opt-in (`--register-login-item`)
+    /// because it writes a row into the user's real Login Items, and `.notFound`
+    /// is a one-way door: once registered, the way back is `.notRegistered`.
+    private static func loginItemChecks(_ preferences: Preferences) -> [String] {
+        var failures: [String] = []
+        let live = preferences.launchAtLoginStatus
+
+        print("login item:    \(preferences.launchAtLoginStatusDescription)")
+        print("               live=\(name(of: live)) (\(live.rawValue))  "
+            + "in an Applications folder: \(preferences.isInstalledInApplicationsDirectory)")
+        print("               \(Bundle.main.bundleURL.path)")
+
+        // 1. Copy for every state the system can report. Nothing that is merely
+        // *off* may say anything about where the app is installed, wherever this
+        // binary happens to be running from.
+        var offCopy: Set<String> = []
+        for status in [SMAppService.Status.enabled, .notRegistered, .requiresApproval, .notFound] {
+            preferences.setLaunchAtLoginStateForTest(status)
+            let copy = preferences.launchAtLoginStatusDescription
+            print("  \(name(of: status).padding(toLength: 17, withPad: " ", startingAt: 0))"
+                + "on=\(preferences.launchAtLogin ? "yes" : "no ")  \(copy)")
+
+            if copy.isEmpty { failures.append("\(name(of: status)) has no description") }
+            if mentionsInstallLocation(copy) {
+                failures.append("\(name(of: status)) blames the install location")
+            }
+            if (status == .enabled) != preferences.launchAtLogin {
+                failures.append("launchAtLogin does not follow \(name(of: status))")
+            }
+            if status == .notFound || status == .notRegistered { offCopy.insert(copy) }
+        }
+        if offCopy.count != 1 {
+            failures.append("notFound and notRegistered read differently; both just mean off")
+        }
+
+        // 2. A thrown registration error is the only branch allowed to mention
+        // the location — and not even then, if the app is already in
+        // /Applications. That combination is the reported bug.
+        preferences.setLaunchAtLoginStateForTest(.notFound, failure: "Operation not permitted")
+        let failureCopy = preferences.launchAtLoginStatusDescription
+        print("  \("failure".padding(toLength: 17, withPad: " ", startingAt: 0))     \(failureCopy)")
+        if !failureCopy.contains("Operation not permitted") {
+            failures.append("a registration failure is never shown to the user")
+        }
+        if preferences.isInstalledInApplicationsDirectory, mentionsInstallLocation(failureCopy) {
+            failures.append("blames the install location for an app already in /Applications")
+        }
+
+        // 3. The dead-switch regression: is a change to the login-item state
+        // visible to SwiftUI's observation at all?
+        for (label, read) in [
+            ("launchAtLogin", { _ = preferences.launchAtLogin }),
+            ("status footer", { _ = preferences.launchAtLoginStatusDescription }),
+        ] as [(String, () -> Void)] {
+            preferences.setLaunchAtLoginStateForTest(.notRegistered)
+            let witness = ObservationWitness()
+            withObservationTracking(read) { witness.fired = true }
+            preferences.setLaunchAtLoginStateForTest(.enabled)
+            print("observable:    \(label) notifies on change: \(witness.fired)")
+            if !witness.fired {
+                failures.append("\(label) is not observable — the settings UI will not update")
+            }
+        }
+
+        preferences.refreshLaunchAtLoginStatus()
+        if preferences.launchAtLoginStatus != live {
+            failures.append("the live login-item status was not restored")
+        }
+
+        guard CommandLine.arguments.contains("--register-login-item") else { return failures }
+
+        // 4. Opt-in: the real thing, restored to whatever it was on the way out.
+        let wasEnabled = live == .enabled
+        preferences.launchAtLogin = true
+        print("register:      \(name(of: preferences.launchAtLoginStatus)) "
+            + "failure=\(preferences.launchAtLoginFailure ?? "none")")
+        if preferences.launchAtLoginStatus != .enabled {
+            failures.append("register() did not enable the login item")
+        }
+        preferences.launchAtLogin = false
+        print("unregister:    \(name(of: preferences.launchAtLoginStatus)) "
+            + "failure=\(preferences.launchAtLoginFailure ?? "none")")
+        if preferences.launchAtLogin {
+            failures.append("unregister() left the login item enabled")
+        }
+        preferences.launchAtLogin = wasEnabled
+        print("restored:      \(name(of: preferences.launchAtLoginStatus))"
+            + (live == .notFound ? "  (was notFound; there is no way back to \"no record\")" : ""))
+        return failures
+    }
+
+    private static func name(of status: SMAppService.Status) -> String {
+        switch status {
+        case .enabled: "enabled"
+        case .notRegistered: "notRegistered"
+        case .requiresApproval: "requiresApproval"
+        case .notFound: "notFound"
+        @unknown default: "unknown(\(status.rawValue))"
+        }
+    }
+
+    private static func mentionsInstallLocation(_ copy: String) -> Bool {
+        let lowered = copy.lowercased()
+        return lowered.contains("/applications") || lowered.contains("move ")
+    }
+
+    /// `withObservationTracking`'s callback is `@Sendable`, so it cannot write to
+    /// a captured `var`.
+    /// `nonisolated` because the module defaults to `MainActor` isolation and the
+    /// callback is not — it fires from wherever the mutation happened.
+    private nonisolated final class ObservationWitness: @unchecked Sendable {
+        var fired = false
     }
 
     private static func report(_ failures: [String]) -> Int32 {

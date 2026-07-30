@@ -27,10 +27,27 @@ enum PixelCompare {
         /// over a blurred backdrop legitimately differs by more than any small
         /// bound on a handful of pixels, while a misplaced rect is obvious in
         /// aggregate — measured, the rejected "global" reading of `sourceRect`
-        /// put 83% of pixels at delta 255. So judge on how much of the image
-        /// differs and by how much on average, not on the single worst pixel.
+        /// put 83% of pixels at delta 255. So the *aggregate* is the hard gate,
+        /// never the single worst pixel.
+        ///
+        /// Past that gate a difference qualifies two ways, and it needs both
+        /// clauses because recompositing comes in two shapes:
+        ///
+        /// - **Narrow and deep** — a caret blinked, a clock ticked. Few pixels,
+        ///   any depth.
+        /// - **Wide and shallow** — the region sits over a large vibrancy
+        ///   surface (a sidebar, a translucent toolbar), which samples its
+        ///   backdrop from a different area in the two capture paths. Measured
+        ///   2026-07-30 over Safari: 20.4% of pixels differing, max channel
+        ///   delta 5, i.e. invisible to anyone looking at it — and rejected by a
+        ///   5%-of-pixels rule that only ever anticipated the first shape.
+        ///
+        /// A misplaced rect is neither: it is wide *and* deep, so the mean
+        /// catches it three orders of magnitude before either clause matters.
         var isSamePicture: Bool {
-            identical || (differingFraction < 0.05 && meanAbsoluteDifference < 1.0)
+            guard !identical else { return true }
+            guard meanAbsoluteDifference < 1.0 else { return false }
+            return differingFraction < 0.05 || maxChannelDelta <= 16
         }
 
         var summary: String {

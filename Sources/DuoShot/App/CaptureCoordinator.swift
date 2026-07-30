@@ -16,6 +16,16 @@ final class CaptureCoordinator {
     /// Fired when ScreenCaptureKit reports the Screen Recording grant has lapsed.
     var onAuthorisationLost: (() -> Void)?
 
+    init() {
+        // Captures `engine` rather than `self`: the overlay holds this closure
+        // for the life of the app, and routing it through the coordinator would
+        // be a retain cycle for no gain.
+        overlay.refreshWindows = { [engine] in
+            try? await engine.refreshContent()
+            return engine.shareableContent.windows
+        }
+    }
+
     private var isCapturing = false
     /// Remembered for "Capture Previous Area", which repeats the last region
     /// without showing the overlay at all.

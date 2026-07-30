@@ -3,22 +3,38 @@ import SwiftUI
 
 @MainActor
 final class PreferencesWindowController {
+    /// One tab per *decision the user is making*, which is why there are five of
+    /// them and not three.
+    ///
+    /// General used to carry the save folder, the filename builder, the
+    /// after-capture switches, the whole floating-preview block and the two app
+    /// switches: 680 pt of form in a 480 pt-wide window, i.e. a tab you scan
+    /// rather than read. Splitting Saving and Preview out of it puts every tab
+    /// under ~380 pt, and the window no longer changes height dramatically as you
+    /// move along the toolbar.
+    ///
+    /// Order follows the life of a capture — take it, store it, look at it — with
+    /// the two "settings about the app itself" tabs at the ends.
     enum Tab: String, CaseIterable {
-        case general, shortcuts, capture
+        case general, capture, saving, preview, shortcuts
 
         var label: String {
             switch self {
             case .general: "General"
-            case .shortcuts: "Shortcuts"
             case .capture: "Capture"
+            case .saving: "Saving"
+            case .preview: "Preview"
+            case .shortcuts: "Shortcuts"
             }
         }
 
         var symbol: String {
             switch self {
             case .general: "gearshape"
-            case .shortcuts: "command"
             case .capture: "camera.viewfinder"
+            case .saving: "folder"
+            case .preview: "rectangle.stack"
+            case .shortcuts: "command"
             }
         }
 
@@ -26,14 +42,15 @@ final class PreferencesWindowController {
         /// SwiftUI (see `measuredContentSize`).
         static let width: CGFloat = 480
 
-        /// Used only if the SwiftUI measurement comes back nonsense. These are the
-        /// hand-tuned numbers from before it was measured — they never clip, they
-        /// just leave dead space at the bottom of the shorter tabs.
+        /// Used only if the SwiftUI measurement comes back nonsense. Deliberately
+        /// generous: these never clip, they just leave dead space at the bottom.
         var fallbackHeight: CGFloat {
             switch self {
-            case .general: 680
+            case .general: 320
+            case .capture: 360
+            case .saving: 420
+            case .preview: 360
             case .shortcuts: 420
-            case .capture: 320
             }
         }
     }
@@ -71,6 +88,9 @@ final class PreferencesWindowController {
     var onRecordingChanged: (Bool) -> Void = { _ in }
 
     func show(tab: Tab = .general) {
+        // Nothing tells us when the login-item state changes underneath us, so
+        // it is re-read on the way in.
+        Preferences.shared.refreshLaunchAtLoginStatus()
         if let window {
             select(tab)
             bringToFront(window)
@@ -162,14 +182,18 @@ final class PreferencesWindowController {
         switch tab {
         case .general:
             GeneralSettingsView(preferences: Preferences.shared)
+        case .capture:
+            CaptureSettingsView(preferences: Preferences.shared)
+        case .saving:
+            SavingSettingsView(preferences: Preferences.shared)
+        case .preview:
+            PreviewSettingsView(preferences: Preferences.shared)
         case .shortcuts:
             ShortcutsSettingsView(
                 preferences: Preferences.shared,
                 onHotkeysChanged: { [weak self] in self?.onHotkeysChanged() },
                 onRecordingChanged: { [weak self] in self?.onRecordingChanged($0) }
             )
-        case .capture:
-            CaptureSettingsView(preferences: Preferences.shared)
         }
     }
 

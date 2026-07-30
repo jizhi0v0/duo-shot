@@ -11,6 +11,7 @@ import ScreenCaptureKit
 /// Sendable box around every screen read and buy nothing.
 final class CaptureEngine {
     private let content = ShareableContentCache()
+    private let wallpaper = DesktopWallpaper()
 
     var shareableContent: ShareableContentCache { content }
 
@@ -146,15 +147,48 @@ final class CaptureEngine {
             .flatMap(ScreenIndex.displayID(of:))
             ?? CGMainDisplayID()
 
+        let (padded, pointSize) = await pad(
+            image, size: filter.contentRect.size, scale: scale,
+            on: displayID, options: options)
+
         let info = content.windows.first { $0.id == windowID }
         return CaptureResult(
-            image: image,
-            pointSize: filter.contentRect.size,
+            image: padded,
+            pointSize: pointSize,
             scale: scale,
             sourceDisplayID: displayID,
             sourceDescription: info?.displayName ?? "Window",
             capturedAt: .now
         )
+    }
+
+    /// Applies `options.windowPadding`, returning the image and its new point size.
+    ///
+    /// Baked into the `CaptureResult` rather than applied per output action, so
+    /// the file, the clipboard, the floating preview and a drag-out can never
+    /// disagree about what the capture is. Every failure path returns the
+    /// original: padding is decoration, and losing the screenshot over it would
+    /// be a poor trade.
+    private func pad(
+        _ image: CGImage, size: CGSize, scale: CGFloat,
+        on displayID: CGDirectDisplayID, options: CaptureOptions
+    ) async -> (CGImage, CGSize) {
+        let padding = options.windowPadding
+        guard padding > 0 else { return (image, size) }
+
+        var backdrop: CGImage?
+        if let wallpaperFilter = content.wallpaperFilter(for: displayID) {
+            backdrop = await wallpaper.image(for: displayID, filter: wallpaperFilter)
+        }
+        guard let result = ImagePadding.pad(
+            image, by: padding, scale: scale, backdrop: backdrop,
+            fallbackFill: NSColor.windowBackgroundColor.cgColor)
+        else {
+            Log.capture.error("padding failed; falling back to the unpadded capture")
+            return (image, size)
+        }
+        return (result, CGSize(width: size.width + padding * 2,
+                               height: size.height + padding * 2))
     }
 
     // MARK: - Filter / configuration

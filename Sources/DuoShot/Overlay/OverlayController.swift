@@ -29,7 +29,17 @@ final class OverlayController {
     private let picker = WindowPickerModel()
     private var continuation: CheckedContinuation<Outcome, Never>?
     private var screenObserver: (any NSObjectProtocol)?
+    private var rankTimer: Timer?
+    private var ticksSinceEnumeration = 0
+    private var isEnumerating = false
     private var mode: SelectionMode = .area
+
+    /// Re-enumerates the pickable windows while the overlay is up.
+    ///
+    /// Injected rather than reached for, because this type owns no capture
+    /// engine — and because the self-tests need to drive the picker from a fixed
+    /// list, which they do by leaving this nil.
+    var refreshWindows: (() async -> [WindowInfo])?
 
     var isPresenting: Bool { !panels.isEmpty }
 
@@ -71,26 +81,28 @@ final class OverlayController {
             // never be torn down and its view would be freed under AppKit's feet.
             panels.append(panel)
             views.append(view)
+        }
+
+        // Seeded before anything is composited, not after. Ordering the panels on
+        // screen first and only then filling in the pointer state means the first
+        // frame the window server shows has no crosshair (or, in window mode, no
+        // highlight) and the correct one arrives a frame or two later — which
+        // reads as the selection UI popping into place rather than being there.
+        seedPointer()
+
+        for panel in panels {
             guard ordering({ panel.orderFrontRegardless() }) else {
                 dismiss(resumingWith: .cancelled)
                 return .cancelled
             }
         }
 
-        // Only the panel under the pointer needs the keyboard; AppKit routes
-        // mouse events by position on its own.
-        let pointerDisplayID = ScreenIndex.screenUnderMouse().flatMap(ScreenIndex.displayID(of:))
-        let keyPanel = panels.first {
-            $0.screen.flatMap(ScreenIndex.displayID(of:)) == pointerDisplayID
-        } ?? panels.first
-        guard ordering({ keyPanel?.makeKeyAndOrderFront(nil) }) else {
+        guard takeKeyboard() else {
             dismiss(resumingWith: .cancelled)
             return .cancelled
         }
-        if let index = panels.firstIndex(where: { $0 === keyPanel }) {
-            keyPanel?.makeFirstResponder(views[index])
-        }
-        seedPointer()
+
+        startRankPolling()
 
         // A display topology change mid-selection is not worth the bug surface
         // of remapping an in-flight rect: tear down and cancel.
@@ -152,8 +164,112 @@ final class OverlayController {
         model.reset()
         picker.reset()
         views.forEach { $0.mode = self.mode }
+        // Ahead of the poll rather than waiting up to 120 ms for it: Space is a
+        // deliberate switch into window mode, and the first highlight should be
+        // right the moment it lands.
+        if mode == .window { picker.reRank() }
         seedPointer()
         Log.overlay.notice("selection mode -> \(String(describing: self.mode), privacy: .public)")
+    }
+
+    // MARK: - Keeping the picker's z-order live
+
+    /// Polls the window server's z-order while the overlay is up.
+    ///
+    /// A timer, not `NSWorkspace.didActivateApplicationNotification`, which is
+    /// what this was first written as. That notification is posted *before* the
+    /// window server finishes restacking, so re-ranking on it read the old order
+    /// straight back and changed nothing — the highlight only caught up when the
+    /// user happened to move the mouse, which after a ⌘-Tab they have no reason
+    /// to do. Polling has no such race.
+    ///
+    /// A tick is one `CGWindowListCopyWindowInfo` read and an ID comparison: no
+    /// ScreenCaptureKit call, no TCC, nothing async, and no redraw at all unless
+    /// the order actually moved. 120 ms is below where a highlight starts to feel
+    /// like it lags the switch.
+    ///
+    /// `.common` run-loop modes so it keeps firing inside any AppKit tracking
+    /// loop, where a `.default`-mode timer silently stops.
+    private func startRankPolling() {
+        ticksSinceEnumeration = 0
+        let timer = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.isPresenting else { return }
+                self.poll()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        rankTimer = timer
+    }
+
+    /// Makes the panel under the pointer key and its view first responder.
+    ///
+    /// Only the panel under the pointer needs the keyboard; AppKit routes mouse
+    /// events by position on its own. Returns false if AppKit threw while
+    /// ordering — see `ordering`.
+    @discardableResult
+    private func takeKeyboard() -> Bool {
+        let pointerDisplayID = ScreenIndex.screenUnderMouse().flatMap(ScreenIndex.displayID(of:))
+        let keyPanel = panels.first {
+            $0.screen.flatMap(ScreenIndex.displayID(of:)) == pointerDisplayID
+        } ?? panels.first
+        guard ordering({ keyPanel?.makeKeyAndOrderFront(nil) }) else { return false }
+        if let index = panels.firstIndex(where: { $0 === keyPanel }) {
+            keyPanel?.makeFirstResponder(views[index])
+        }
+        return true
+    }
+
+    /// Takes the keyboard back after some other application has been activated.
+    ///
+    /// Measured 2026-07-30: a `.nonactivatingPanel` holding key status loses it
+    /// the instant any other application activates — which is precisely what
+    /// ⌘-Tab does, and ⌘-Tab is a gesture this overlay now actively supports,
+    /// since the picker follows the switch. Mouse tracking survives it (the
+    /// tracking area is `.activeAlways`), so the highlight keeps following the
+    /// pointer and nothing *looks* wrong — but `keyDown` stops arriving, and Esc,
+    /// Space, Return and the arrow keys all silently stop working. Reported as
+    /// "can't Esc out once a window is selected".
+    ///
+    /// Re-taking key does not undo the switch: measured, the frontmost
+    /// application stays the one the user just moved to.
+    private func restoreKeyboardIfLost() {
+        guard !panels.contains(where: \.isKeyWindow) else { return }
+        Log.overlay.debug("overlay lost key status; taking the keyboard back")
+        takeKeyboard()
+    }
+
+    private func poll() {
+        // Both modes: every key the overlay handles dies with key status, not
+        // just the picker's.
+        restoreKeyboardIfLost()
+        guard mode == .window else { return }
+
+        if picker.reRank() { seedPointer() }
+
+        // Membership, not just order. The window list is enumerated once, before
+        // the overlay opens, so anything that appears afterwards — an open/save
+        // dialog, a new document, an alert — was unpickable for as long as the
+        // picker stayed up, no matter where the pointer went.
+        //
+        // At a quarter of the polling rate because this one is not free: a
+        // ScreenCaptureKit enumeration is an async round trip, against the
+        // CGWindowList read that `reRank` does inline. Windows appear far more
+        // rarely than they restack, so ~half a second is the right trade.
+        ticksSinceEnumeration += 1
+        guard ticksSinceEnumeration >= 4, !isEnumerating, let refreshWindows else { return }
+        ticksSinceEnumeration = 0
+        isEnumerating = true
+
+        Task { [weak self] in
+            let windows = await refreshWindows()
+            guard let self else { return }
+            isEnumerating = false
+            // The overlay can have been torn down or switched to area mode while
+            // the enumeration was in flight.
+            guard isPresenting, mode == .window else { return }
+            if picker.load(windows) { seedPointer() }
+        }
     }
 
     /// Populates the hover/crosshair state immediately, so the overlay is not
@@ -192,8 +308,19 @@ final class OverlayController {
         // only ever contains that one window — our panels cannot get in. So
         // unlike the area path there is nothing to exclude, and tearing down
         // first avoids photographing the dim if the window is translucent.
+        //
+        // The continuation is taken BEFORE the tear-down and resumed after it.
+        // `tearDown()` resumes any pending continuation with `.cancelled` (its
+        // never-hang guarantee), so calling it first threw this outcome away:
+        // `resume(with: .window(id))` then found a nil continuation and did
+        // nothing, and EVERY window capture came back `.cancelled`. Measured
+        // 2026-07-30: five `fired captureWindow` log lines, not one `captured
+        // window` — which is also why window mode produced no floating preview
+        // and never reached the clipboard.
+        let pending = continuation
+        continuation = nil
         tearDown()
-        resume(with: .window(id))
+        pending?.resume(returning: .window(id))
     }
 
     private func dismiss(resumingWith outcome: Outcome) {
@@ -211,6 +338,11 @@ final class OverlayController {
             NotificationCenter.default.removeObserver(screenObserver)
             self.screenObserver = nil
         }
+        // The run loop holds the timer, and a repeating timer's block holds
+        // whatever it captured, so leaving it running keeps this controller's
+        // work alive for the rest of the process.
+        rankTimer?.invalidate()
+        rankTimer = nil
         for view in views { view.detachFromDisplayCycle() }
         for panel in panels { panel.orderOut(nil) }
         // Held one turn past the tear-down, the same way PreviewStackController
@@ -279,6 +411,14 @@ final class OverlayController {
     /// Drives the confirm path without a mouse-up, for `--selftest-lifecycle`.
     func confirmForTest() {
         confirmArea()
+    }
+
+    /// The window-mode equivalent. Worth its own hook: the lifecycle test used to
+    /// stand in for this path by calling `tearDown()`, which exercises the cancel
+    /// route instead — and that is precisely how `confirmWindow` shipped resuming
+    /// every window capture with `.cancelled`.
+    func confirmWindowForTest(_ id: CGWindowID) {
+        confirmWindow(id)
     }
 
     var panelCount: Int { panels.count }

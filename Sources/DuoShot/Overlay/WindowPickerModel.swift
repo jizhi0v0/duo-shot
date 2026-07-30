@@ -16,29 +16,123 @@ final class WindowPickerModel {
     /// window rather than something a user means to capture.
     private let minimumSize = CGSize(width: 40, height: 40)
 
-    func load(_ candidates: [WindowInfo]) {
-        let ownBundleID = Bundle.main.bundleIdentifier
-        windows = candidates.filter { window in
-            // Our own overlay panels would sit topmost over everything and make
-            // the picker useless. They are normally invisible to the enumeration
-            // anyway (sharingType = .none), so this is a second line of defence.
-            guard window.bundleID != ownBundleID else { return false }
-            // Stage Manager parks windows that are `isActive` but not on screen;
-            // they are not pickable because they are not visible.
-            guard window.isOnScreen else { return false }
-            guard window.layer == 0 else { return false }
-            return window.frame.width >= minimumSize.width
-                && window.frame.height >= minimumSize.height
+    /// Window layers the picker offers.
+    ///
+    /// Not layer 0 alone, which is what this used to be. An ordinary app's
+    /// floating panel sits at `NSWindow.Level.floating` (3) — a translator
+    /// popup, an inspector palette, a mini player — and those are exactly the
+    /// things someone reaches for a window screenshot to capture. Measured
+    /// 2026-07-30: DuoTranslator's popup was at layer 3, on screen, 480×457, and
+    /// the frontmost window on the display; the picker refused to see it and
+    /// highlighted the window behind instead.
+    ///
+    /// `.modalPanel` (8) is the upper bound because it stops short of the system
+    /// chrome, which is what the filter is actually for: the Dock is 20,
+    /// Notification Center 21, the menu bar 24, Control Center's status items 25,
+    /// and menus and tooltips 101. Negative layers are the desktop and its icons.
+    private let pickableLayers = 0...Int(NSWindow.Level.modalPanel.rawValue)
+
+    /// Why a window is not offered to the picker, or nil if it is.
+    ///
+    /// A predicate that explains itself, rather than a chain of `guard`s: every
+    /// one of these rules can drop the window the user is actually pointing at,
+    /// and when that happens the hit-test falls through to whatever is behind it —
+    /// typically a maximized window, so the highlight becomes a full-screen band
+    /// and the pick looks broken. The reason string is what makes that
+    /// diagnosable after the fact instead of a guessing game.
+    private func rejectionReason(for window: WindowInfo) -> String? {
+        // Our own overlay panels would sit topmost over everything and make the
+        // picker useless. They are normally invisible to the enumeration anyway
+        // (sharingType = .none), so this is a second line of defence.
+        if window.bundleID == Bundle.main.bundleIdentifier { return "own window" }
+        // Stage Manager parks windows that are `isActive` but not on screen;
+        // they are not pickable because they are not visible.
+        if !window.isOnScreen { return "isOnScreen == false" }
+        if !pickableLayers.contains(window.layer) { return "layer \(window.layer)" }
+        if window.frame.width < minimumSize.width || window.frame.height < minimumSize.height {
+            return "smaller than \(Int(minimumSize.width))×\(Int(minimumSize.height))"
+        }
+        return nil
+    }
+
+    /// Returns true if the pickable set changed, so a caller re-loading on a
+    /// timer can skip the redraw — and the logging — when nothing moved.
+    @discardableResult
+    func load(_ candidates: [WindowInfo]) -> Bool {
+        let previous = windows.map(\.id)
+        windows = candidates.filter { rejectionReason(for: $0) == nil }
+        guard windows.map(\.id) != previous else { return false }
+        logRejectionsInFront(of: candidates)
+        return true
+    }
+
+    /// Re-reads the window server's z-order and re-sorts. Returns true if the
+    /// order actually moved, so the caller can skip a redraw when it did not.
+    ///
+    /// The list is enumerated once, when the overlay opens — but the *order* it
+    /// captured does not survive the interaction. ⌘-Tab while the picker is up
+    /// raises a different app, and the picker went on ranking by what had been
+    /// frontmost a moment ago. That is not a cosmetic staleness: with a maximized
+    /// window stuck at the head of the list, every point on screen hit-tests to
+    /// it, so the highlight freezes into a full-screen band and *nothing else can
+    /// be picked at all*. Measured 2026-07-30: 21 seconds inside the picker, one
+    /// single hover change logged.
+    ///
+    /// Only the order is refreshed, not the frames or the set of windows — those
+    /// need an SCK re-enumeration, and neither can change here anyway: the
+    /// overlay has the mouse, so no window can be moved or resized behind it.
+    @discardableResult
+    func reRank() -> Bool {
+        let reordered = WindowZOrder.sortedFrontToBack(windows)
+        guard reordered.map(\.id) != windows.map(\.id) else { return false }
+        windows = reordered
+        Log.overlay.debug("""
+            picker re-ranked, now fronted by \
+            \(reordered.first?.displayName ?? "nothing", privacy: .public)
+            """)
+        return true
+    }
+
+    /// Logs every window the list ranks *in front of* the first pickable one,
+    /// with the rule that dropped it.
+    ///
+    /// Debug level, so it costs nothing until someone asks for it with
+    /// `log stream --level debug`. Worth having at all because the picker's state
+    /// is invisible after the fact: the highlight is gone by the time anyone
+    /// writes anything down, and "it highlighted the wrong window" is otherwise
+    /// indistinguishable from "it highlighted the right window, which happens to
+    /// be maximized".
+    private func logRejectionsInFront(of candidates: [WindowInfo]) {
+        Log.overlay.debug("""
+            picker loaded \(self.windows.count, privacy: .public) of \
+            \(candidates.count, privacy: .public): \
+            \(self.windows.prefix(5).map(\.displayName).joined(separator: " | "), privacy: .public)
+            """)
+        guard let firstKept = windows.first,
+              let cut = candidates.firstIndex(where: { $0.id == firstKept.id }), cut > 0
+        else { return }
+        for window in candidates[..<cut] {
+            Log.overlay.debug("""
+                picker dropped (in front of \(firstKept.displayName, privacy: .public)): \
+                \(window.displayName, privacy: .public) \
+                \(self.rejectionReason(for: window) ?? "?", privacy: .public)
+                """)
         }
     }
 
-    /// `SCShareableContent.windows` comes back in front-to-back z-order, so the
-    /// first frame containing the point is the one the user is looking at.
+    /// The first frame containing the point is the one the user is looking at —
+    /// which holds only because `ShareableContentCache` has already sorted the
+    /// list front-to-back. `SCShareableContent.windows` does NOT arrive that way;
+    /// see `WindowZOrder` for the measurement and what it broke.
     func updateHover(atAppKitGlobal point: CGPoint) {
         let pointInCGGlobal = DisplayGeometry.flipped(point)
         let match = windows.first { $0.frame.contains(pointInCGGlobal) }
         guard match?.id != hovered?.id else { return }
         hovered = match
+        Log.overlay.debug("""
+            hover \(pointInCGGlobal.x, privacy: .public),\(pointInCGGlobal.y, privacy: .public) \
+            -> \(match?.displayName ?? "nothing", privacy: .public)
+            """)
         onChange?()
     }
 
