@@ -6,6 +6,13 @@ import Foundation
 /// `nonisolated` and synchronous, like `ImageEncoder`: no isolation boundary, so
 /// the non-Sendable `CGImage` never has to cross one.
 nonisolated enum ImagePadding {
+    // Both are fractions of the margin, so the shadow scales with the padding
+    // instead of being clipped by it. At the extremes the shadow reaches
+    // `drop + blur` = 0.73 of the margin below the window and `blur - drop` =
+    // 0.37 above it, which stays inside the canvas at every padding setting.
+    private static let shadowBlur: CGFloat = 0.55
+    private static let shadowDrop: CGFloat = 0.18
+
     /// Returns `image` inset by `padding` points on every side, over `backdrop`.
     ///
     /// The backdrop is aspect-*filled* into the finished canvas rather than
@@ -57,8 +64,25 @@ nonisolated enum ImagePadding {
         // Drawn over the backdrop, not composited onto a cleared canvas: a
         // window with rounded corners or a translucent titlebar is meant to show
         // the wallpaper through, which is most of the point of this feature.
+        //
+        // The shadow is set on the context rather than drawn, so Core Graphics
+        // traces the ALPHA of the image about to be drawn. That is what makes
+        // this correct without knowing anything about the window: a capture
+        // already carries its own corner shape, and the radius is neither
+        // constant across macOS releases nor across apps — measured 2026-07-30,
+        // 18 pt for WeChat's alert and 24 pt for Claude's window, both with a
+        // clean antialiased ramp from alpha 0 to 255 across the curve. Masking
+        // to a radius of our own would either double-round those corners or
+        // square off a shape that was already right; shadowing the alpha gets
+        // every window, every version, and non-rectangular windows too, for free.
+        context.saveGState()
+        context.setShadow(
+            offset: CGSize(width: 0, height: -CGFloat(inset) * Self.shadowDrop),
+            blur: CGFloat(inset) * Self.shadowBlur,
+            color: CGColor(gray: 0, alpha: 0.38))
         context.draw(image, in: CGRect(
             x: inset, y: inset, width: image.width, height: image.height))
+        context.restoreGState()
 
         return context.makeImage()
     }

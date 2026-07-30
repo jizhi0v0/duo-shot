@@ -57,7 +57,6 @@ final class OverlayController {
 
         mode = initialMode
         model.reset()
-        picker.load(windows)
 
         let refresh: () -> Void = { [weak self] in self?.views.forEach { $0.refresh() } }
         model.onChange = refresh
@@ -82,6 +81,13 @@ final class OverlayController {
             panels.append(panel)
             views.append(view)
         }
+
+        // Loaded after the panels exist, so their window IDs can be kept out of
+        // the picker. The enumeration predates them, so nothing is lost by
+        // waiting — and the poll's re-enumeration definitely runs while they are
+        // on screen.
+        picker.excludedWindowIDs = panelWindowIDs
+        picker.load(windows)
 
         // Seeded before anything is composited, not after. Ordering the panels on
         // screen first and only then filling in the pointer state means the first
@@ -388,6 +394,7 @@ final class OverlayController {
 
     var hoveredWindow: WindowInfo? { picker.hovered }
     var pickableWindowCount: Int { picker.windows.count }
+    var pickableWindowIDs: Set<CGWindowID> { Set(picker.windows.map(\.id)) }
 
     /// Drives the selection without mouse input, for `--selftest-overlay`.
     func forceSelection(_ rectInAppKitGlobal: CGRect, on screen: NSScreen) {

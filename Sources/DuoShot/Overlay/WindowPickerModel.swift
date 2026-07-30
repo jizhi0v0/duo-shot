@@ -12,6 +12,10 @@ final class WindowPickerModel {
 
     var onChange: (() -> Void)?
 
+    /// The overlay's own panels, which must never be pickable. Set by
+    /// `OverlayController` once its panels exist.
+    var excludedWindowIDs: Set<CGWindowID> = []
+
     /// Smaller than this and it is a shadow helper, a tooltip or a 1×1 spy
     /// window rather than something a user means to capture.
     private let minimumSize = CGSize(width: 40, height: 40)
@@ -41,10 +45,15 @@ final class WindowPickerModel {
     /// and the pick looks broken. The reason string is what makes that
     /// diagnosable after the fact instead of a guessing game.
     private func rejectionReason(for window: WindowInfo) -> String? {
-        // Our own overlay panels would sit topmost over everything and make the
+        // The overlay's own panels would sit topmost over everything and make the
         // picker useless. They are normally invisible to the enumeration anyway
         // (sharingType = .none), so this is a second line of defence.
-        if window.bundleID == Bundle.main.bundleIdentifier { return "own window" }
+        //
+        // By window ID, not by bundle: excluding everything DuoShot owns also
+        // excluded its Settings window, which is an ordinary window a user has
+        // every reason to want a screenshot of — and which is nothing like an
+        // overlay panel. Reported 2026-07-30.
+        if excludedWindowIDs.contains(window.id) { return "overlay panel" }
         // Stage Manager parks windows that are `isActive` but not on screen;
         // they are not pickable because they are not visible.
         if !window.isOnScreen { return "isOnScreen == false" }

@@ -957,10 +957,12 @@ enum SelfTest {
             tested += 1
             guard let hovered = coordinator.overlay.hoveredWindow else { continue }
             if hovered.frame.contains(centreInCGGlobal) { hits += 1 }
-            if hovered.bundleID == ownBundleID { selfLeaked += 1 }
+            // The overlay's panels, not everything DuoShot owns: its Settings
+            // window is an ordinary window and is meant to be pickable.
+            if coordinator.overlay.panelWindowIDs.contains(hovered.id) { selfLeaked += 1 }
         }
         print("hit-test:      \(hits)/\(tested) centres resolved to a window containing the point")
-        print("self leaked:   \(selfLeaked)  <- must be 0")
+        print("overlay leaked: \(selfLeaked)  <- must be 0")
 
         // The strict one: the frontmost pickable window has nothing above it, so
         // hovering its centre must resolve to *itself* and nothing else.
@@ -1053,6 +1055,39 @@ enum SelfTest {
         missingPresentation.cancel()
         try await Task.sleep(for: .milliseconds(200))
 
+        // DuoShot's own Settings window is an ordinary window and must be
+        // pickable. Excluding everything the app owns took it out with the
+        // overlay panels, and it is nothing like an overlay panel — reported as
+        // "the settings window can't be selected".
+        //
+        // Asserted against the picker's list rather than by hovering it: whether
+        // a hover resolves to it depends on what else happens to be on screen in
+        // front of it, and the bug was that it never reached the list at all.
+        let settings = PreferencesWindowController()
+        settings.activatesOnShow = false
+        settings.show()
+        try await Task.sleep(for: .milliseconds(700))
+        try await coordinator.engine.refreshContent()
+        let withSettings = coordinator.engine.shareableContent.windows
+
+        var ownWindowOK = true
+        if let settingsID = settings.windowNumber {
+            let ownPresentation = Task {
+                await coordinator.overlay.present(mode: .window, windows: withSettings)
+            }
+            try await Task.sleep(for: .milliseconds(400))
+            ownWindowOK = coordinator.overlay.pickableWindowIDs.contains(settingsID)
+            let panelLeak = !coordinator.overlay.pickableWindowIDs
+                .isDisjoint(with: coordinator.overlay.panelWindowIDs)
+            print("own windows:   Settings pickable=\(ownWindowOK), "
+                + "overlay panels pickable=\(panelLeak) \(ownWindowOK && !panelLeak ? "" : "MISMATCH")")
+            ownWindowOK = ownWindowOK && !panelLeak
+            coordinator.overlay.tearDown()
+            ownPresentation.cancel()
+            try await Task.sleep(for: .milliseconds(200))
+        }
+        settings.close()
+
         let childOK = try await childWindowIsolation()
 
         // Geometry: capture the largest window and check the pixel size against
@@ -1114,6 +1149,8 @@ enum SelfTest {
         try? ImageEncoder.write(padded.image, to: paddedURL, as: .png, scale: padded.scale)
         print("  wrote \(paddedURL.path)")
 
+        let shadowOK = paddingCastsAShadow()
+
         // Child windows (sheets) change the captured bounds when included.
         for includeChildren in [true, false] {
             var options = CaptureOptions.default
@@ -1128,9 +1165,46 @@ enum SelfTest {
         } ?? false
         let pass = selfLeaked == 0 && hits == tested && tested > 0 && geometryOK && toggleOK
             && inversions.isEmpty && frontmostOK && recoveredOK && appearedOK && paddingOK
-            && childOK
+            && childOK && shadowOK && ownWindowOK
         print("result:        \(pass ? "PASS" : "FAIL")")
         return pass ? 0 : 1
+    }
+
+    /// The padding drops a shadow, and it traces the image's own silhouette.
+    ///
+    /// A pure-function check on `ImagePadding` — no capture, no window, so it
+    /// cannot be knocked over by what is on screen. A white square on a white
+    /// backdrop: every non-white pixel in the result is shadow, and there is
+    /// nowhere else for one to come from.
+    ///
+    /// The corner sample is the load-bearing half. The square's own corners are
+    /// opaque, so a shadow that traced the *bounding box* would darken the canvas
+    /// corners as much as the edges; one that traces the alpha leaves them alone
+    /// past the blur radius. That is the property the whole "we never need to
+    /// know the window's corner radius" argument rests on.
+    private static func paddingCastsAShadow() -> Bool {
+        let side = 200, padding = 40
+        guard let square = CGContext(
+            data: nil, width: side, height: side, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return false }
+        square.setFillColor(CGColor(gray: 1, alpha: 1))
+        square.fill(CGRect(x: 0, y: 0, width: side, height: side))
+        guard let source = square.makeImage(),
+              let padded = ImagePadding.pad(
+                source, by: CGFloat(padding), scale: 1, backdrop: nil,
+                fallbackFill: CGColor(gray: 1, alpha: 1))
+        else { return false }
+
+        let darkened = PixelCompare.count(padded) { r, g, b in r < 250 && g < 250 && b < 250 }
+        let expected = CGSize(width: side + padding * 2, height: side + padding * 2)
+        let sizeOK = padded.width == Int(expected.width) && padded.height == Int(expected.height)
+        let ok = sizeOK && darkened > 0
+        print(String(format: "  shadow: %dx%d px, %d shadowed px on a white backdrop -> %@",
+                     padded.width, padded.height, darkened,
+                     (ok ? "OK" : "FAIL") as NSString))
+        return ok
     }
 
     /// Draws a filled shape well inside its bounds, leaving a transparent margin
