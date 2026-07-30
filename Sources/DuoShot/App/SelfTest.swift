@@ -1149,7 +1149,22 @@ enum SelfTest {
         try? ImageEncoder.write(padded.image, to: paddedURL, as: .png, scale: padded.scale)
         print("  wrote \(paddedURL.path)")
 
+        // The padding backdrop must not carry the menu bar. Excluding every
+        // application does not exclude it — it belongs to none of them — and
+        // `SCContentFilter.includeMenuBar` defaults to true, so this has to be
+        // turned off by hand. Asserted on the filter rather than on pixels
+        // because whether the leak is *visible* depends on the aspect ratio of
+        // the capture: the backdrop is aspect-filled, so a tall one keeps the
+        // wallpaper's top edge and a wide one crops it away. That is what made
+        // it look intermittent, and it is exactly what a pixel test would miss.
+        let backdropFilter = coordinator.engine.shareableContent
+            .wallpaperFilter(for: padded.sourceDisplayID)
+        let menuBarOK = backdropFilter?.includeMenuBar == false
+        print("backdrop:      menu bar excluded=\(menuBarOK) "
+            + "\(backdropFilter == nil ? "(no filter — cannot tell)" : "")")
+
         let shadowOK = paddingCastsAShadow()
+        let cardOK = paddingFollowsTheWindowCurve()
 
         // Child windows (sheets) change the captured bounds when included.
         for includeChildren in [true, false] {
@@ -1165,7 +1180,7 @@ enum SelfTest {
         } ?? false
         let pass = selfLeaked == 0 && hits == tested && tested > 0 && geometryOK && toggleOK
             && inversions.isEmpty && frontmostOK && recoveredOK && appearedOK && paddingOK
-            && childOK && shadowOK && ownWindowOK
+            && childOK && shadowOK && ownWindowOK && cardOK && menuBarOK
         print("result:        \(pass ? "PASS" : "FAIL")")
         return pass ? 0 : 1
     }
@@ -1204,6 +1219,51 @@ enum SelfTest {
         print(String(format: "  shadow: %dx%d px, %d shadowed px on a white backdrop -> %@",
                      padded.width, padded.height, darkened,
                      (ok ? "OK" : "FAIL") as NSString))
+        return ok
+    }
+
+    /// The padded card's corner radius tracks the window's own.
+    ///
+    /// Synthetic, so the radius is known rather than measured off whatever is on
+    /// screen: a rounded rect of a chosen radius on a transparent canvas, which
+    /// is exactly the shape a window capture has.
+    ///
+    /// Three things are checked, and the third is the one that matters. That the
+    /// radius is read back correctly. That the card's corner is transparent, so
+    /// the outer edge is rounded at all. And that the *midpoint* of the top edge
+    /// is opaque — without it, a clip that swallowed the whole canvas would pass
+    /// the first two.
+    private static func paddingFollowsTheWindowCurve() -> Bool {
+        let side = 240, radius = 40, padding = 32
+        guard let context = CGContext(
+            data: nil, width: side, height: side, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return false }
+        context.setFillColor(CGColor(gray: 1, alpha: 1))
+        context.addPath(CGPath(
+            roundedRect: CGRect(x: 0, y: 0, width: side, height: side),
+            cornerWidth: CGFloat(radius), cornerHeight: CGFloat(radius), transform: nil))
+        context.fillPath()
+
+        guard let source = context.makeImage() else { return false }
+        let measured = ImagePadding.cornerRadius(of: source)
+        // Antialiasing puts the first fully opaque pixel a hair inside the ideal
+        // corner, so this is a tolerance, not an equality.
+        let radiusOK = measured.map { abs($0 - CGFloat(radius)) <= 3 } ?? false
+
+        guard let padded = ImagePadding.pad(
+            source, by: CGFloat(padding), scale: 1, backdrop: nil,
+            fallbackFill: CGColor(gray: 0.5, alpha: 1))
+        else { return false }
+
+        let cornerAlpha = PixelCompare.alpha(padded, atX: 1, y: 1) ?? 255
+        let edgeAlpha = PixelCompare.alpha(padded, atX: padded.width / 2, y: 1) ?? 0
+        let ok = radiusOK && cornerAlpha == 0 && edgeAlpha > 250
+        print(String(format: "  card corner: window radius %@ px (drawn %d), "
+                     + "card corner alpha %d, top edge alpha %d -> %@",
+                     measured.map { String(format: "%.0f", $0) } as NSString? ?? "none",
+                     radius, cornerAlpha, edgeAlpha, (ok ? "OK" : "FAIL") as NSString))
         return ok
     }
 

@@ -57,10 +57,19 @@ final class ShareableContentCache {
     /// so what is left to render is the wallpaper. See `DesktopWallpaper`.
     func wallpaperFilter(for displayID: CGDirectDisplayID) -> SCContentFilter? {
         guard let content, let display = scDisplay(for: displayID) else { return nil }
-        return SCContentFilter(
+        let filter = SCContentFilter(
             display: display,
             excludingApplications: content.applications,
             exceptingWindows: [])
+        // The menu bar belongs to no application, so excluding every application
+        // does not exclude it — and `includeMenuBar` defaults to true, measured.
+        // It leaked into the padding backdrop, where it showed up as a strip of
+        // some other app's menus across the top of the card, but only sometimes:
+        // the backdrop is aspect-filled, so a tall capture keeps the wallpaper's
+        // top edge while a wide one crops it away. Reported as "why does a window
+        // screenshot occasionally have a menu in the top-left".
+        filter.includeMenuBar = false
+        return filter
     }
 
     var displayIDs: [CGDirectDisplayID] {

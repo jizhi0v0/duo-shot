@@ -54,6 +54,19 @@ nonisolated enum ImagePadding {
         let canvas = CGRect(x: 0, y: 0, width: width, height: height)
         context.interpolationQuality = .high
 
+        // The outer edge follows the window's own curve at a constant distance:
+        // `radius + inset` is the one value that keeps the two arcs concentric,
+        // so the margin is the same width at the corners as along the sides.
+        // Anything less and the gap pinches at the corners; anything more and it
+        // bulges. A square window gets a square card, which is also right.
+        let outerRadius = cornerRadius(of: image).map { $0 + CGFloat(inset) } ?? 0
+        if outerRadius > 0 {
+            context.addPath(CGPath(
+                roundedRect: canvas, cornerWidth: outerRadius, cornerHeight: outerRadius,
+                transform: nil))
+            context.clip()
+        }
+
         if let backdrop {
             context.draw(backdrop, in: aspectFill(backdrop, into: canvas))
         } else {
@@ -85,6 +98,46 @@ nonisolated enum ImagePadding {
         context.restoreGState()
 
         return context.makeImage()
+    }
+
+    /// The window's own corner radius in pixels, read off its alpha channel.
+    ///
+    /// This is the answer to "can you get the window's corner radius", and it is
+    /// yes — just not by asking anyone. The top row of a rounded window is
+    /// transparent until the curve ends, so the first fully opaque pixel along
+    /// it *is* the radius. Measured 2026-07-30: 36 px for WeChat's alert, 48 px
+    /// for Claude's window and DuoTranslator's popup — 18 pt against 24 pt on
+    /// the same display, on the same OS, in the same minute. No constant could
+    /// have covered those, and the next macOS will not make it easier.
+    ///
+    /// Nil for a square window, and also for one whose top row stays transparent
+    /// implausibly far in: a square card is a better answer than one wrapped
+    /// around a radius that has nothing to do with the window.
+    static func cornerRadius(of image: CGImage) -> CGFloat? {
+        let limit = min(image.width / 4, 256)
+        guard limit > 1 else { return nil }
+
+        var row = [UInt8](repeating: 0, count: limit * 4)
+        let read = row.withUnsafeMutableBytes { raw -> Bool in
+            guard let context = CGContext(
+                data: raw.baseAddress, width: limit, height: 1, bitsPerComponent: 8,
+                bytesPerRow: limit * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return false }
+            // One row tall, and the context is bottom-up, so the image is drawn
+            // with its top edge on that row and everything below it clipped away.
+            context.draw(image, in: CGRect(
+                x: 0, y: 1 - CGFloat(image.height),
+                width: CGFloat(image.width), height: CGFloat(image.height)))
+            return true
+        }
+        guard read else { return nil }
+
+        for x in 0..<limit where row[x * 4 + 3] > 250 {
+            return x > 0 ? CGFloat(x) : nil
+        }
+        return nil
     }
 
     private static func aspectFill(_ image: CGImage, into canvas: CGRect) -> CGRect {

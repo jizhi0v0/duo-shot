@@ -157,6 +157,18 @@ enum PixelCompare {
         return sum / Double(pixels.count / 4)
     }
 
+    /// Alpha at one pixel, 0–255, with the origin at the **top** left.
+    ///
+    /// `normalized` draws into a bottom-up context, so its first row is the
+    /// image's last one; the flip happens here rather than at every call site.
+    static func alpha(_ image: CGImage, atX x: Int, y: Int) -> Int? {
+        guard (0..<image.width).contains(x), (0..<image.height).contains(y),
+              let pixels = normalized(image)
+        else { return nil }
+        let row = image.height - 1 - y
+        return Int(pixels[(row * image.width + x) * 4 + 3])
+    }
+
     private static func normalized(_ image: CGImage) -> [UInt8]? {
         let width = image.width
         let height = image.height

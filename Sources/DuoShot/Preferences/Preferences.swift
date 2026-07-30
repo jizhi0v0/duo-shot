@@ -82,9 +82,13 @@ final class Preferences {
     var includeChildWindows: Bool {
         didSet { defaults.set(includeChildWindows, forKey: Key.includeChildWindows) }
     }
-    /// Points of wallpaper margin around a window capture. 0 is off, and is the
-    /// default: this changes every window screenshot that comes out of the app,
-    /// so it is opt-in rather than something a user discovers after the fact.
+    /// Points of wallpaper margin around a window capture. 0 is off.
+    ///
+    /// On by default at 32 pt. This does change the dimensions of every window
+    /// screenshot the app produces, which is why it started at 0 — but a bare
+    /// window capture has hard edges against whatever it is pasted into, and the
+    /// padded one carries its own backdrop and shadow. The slider's left stop is
+    /// labelled "Off", so turning it back off is one drag.
     var windowPadding: Double {
         didSet { defaults.set(windowPadding, forKey: Key.windowPadding) }
     }
@@ -117,7 +121,7 @@ final class Preferences {
             Key.showsCursor: false,
             Key.includeMenuBar: true,
             Key.includeChildWindows: false,
-            Key.windowPadding: 0.0,
+            Key.windowPadding: 32.0,
             Key.filenameTemplate: FilenameFormatter.defaultTemplate,
         ])
 
