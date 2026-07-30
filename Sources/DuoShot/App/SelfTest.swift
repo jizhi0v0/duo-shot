@@ -1339,10 +1339,27 @@ enum SelfTest {
         let result = try await coordinator.engine.capture(.window(dock.id))
         let expected = CGSize(width: (dock.pickFrame.width * result.scale).rounded(),
                               height: (dock.pickFrame.height * result.scale).rounded())
-        let cropOK = result.pixelSize == expected
+        let sizeOK = result.pixelSize == expected
+
+        // And it must have been taken against the desktop, not in isolation. The
+        // Dock is a glass surface: with nothing behind it to sample it falls back
+        // to a flat tint, which is what "why did the dock background disappear"
+        // was. The tell is the corners — the strip runs the full width while the
+        // dock itself is centred, so in an isolated capture the ends are empty
+        // and transparent, and in a region capture they are wallpaper.
+        let corners = [
+            (1, 1), (Int(result.pixelSize.width) - 2, 1),
+            (1, Int(result.pixelSize.height) - 2),
+            (Int(result.pixelSize.width) - 2, Int(result.pixelSize.height) - 2),
+        ]
+        let opaqueCorners = corners.filter {
+            (PixelCompare.alpha(result.image, atX: $0.0, y: $0.1) ?? 0) > 250
+        }.count
+        let glassOK = opaqueCorners == corners.count
         print("dock capture:  \(Int(result.pixelSize.width))x\(Int(result.pixelSize.height)) px "
-            + "(expected \(Int(expected.width))x\(Int(expected.height))) -> \(cropOK ? "OK" : "FAIL")")
-        return ok && cropOK
+            + "(expected \(Int(expected.width))x\(Int(expected.height))), "
+            + "\(opaqueCorners)/4 corners opaque -> \(sizeOK && glassOK ? "OK" : "FAIL")")
+        return ok && sizeOK && glassOK
     }
 
     /// The padded card's corner radius tracks the window's own.

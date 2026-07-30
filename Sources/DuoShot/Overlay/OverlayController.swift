@@ -310,23 +310,17 @@ final class OverlayController {
     }
 
     private func confirmWindow(_ id: CGWindowID) {
-        // Window capture uses SCContentFilter(desktopIndependentWindow:), which
-        // only ever contains that one window — our panels cannot get in. So
-        // unlike the area path there is nothing to exclude, and tearing down
-        // first avoids photographing the dim if the window is translucent.
+        // Left standing, exactly like the area path, and for the same reason.
         //
-        // The continuation is taken BEFORE the tear-down and resumed after it.
-        // `tearDown()` resumes any pending continuation with `.cancelled` (its
-        // never-hang guarantee), so calling it first threw this outcome away:
-        // `resume(with: .window(id))` then found a nil continuation and did
-        // nothing, and EVERY window capture came back `.cancelled`. Measured
-        // 2026-07-30: five `fired captureWindow` log lines, not one `captured
-        // window` — which is also why window mode produced no floating preview
-        // and never reached the clipboard.
-        let pending = continuation
-        continuation = nil
-        tearDown()
-        pending?.resume(returning: .window(id))
+        // This used to tear down first, on the grounds that a window filter
+        // contains one window and our panels therefore cannot get into the shot.
+        // That is still true of an ordinary window — but not of the Dock, which
+        // is captured as a region of the desktop so that its glass has something
+        // to sample, and a region capture will happily photograph the dim.
+        // Ordering the panels out and capturing immediately races the window
+        // server's next composite; keeping them up and excluding them by ID does
+        // not. The caller tears down after it has the image.
+        resume(with: .window(id))
     }
 
     private func dismiss(resumingWith outcome: Outcome) {

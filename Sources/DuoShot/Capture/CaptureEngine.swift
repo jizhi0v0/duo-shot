@@ -135,25 +135,32 @@ final class CaptureEngine {
         guard let window = content.scWindow(for: windowID) else {
             throw CaptureError.windowNotFound(windowID)
         }
-        let filter = SCContentFilter(desktopIndependentWindow: window)
-        let scale = CGFloat(filter.pointPixelScale)
-        let configuration = configuration(for: filter.contentRect, scale: scale, options: options)
-
-        let output = try await SCKBridge.captureScreenshot(filter: filter, configuration: configuration)
-        guard let image = output.image else { throw CaptureError.noImageProduced }
-
         let displayID = ScreenIndex
             .screen(containingAppKitGlobal: DisplayGeometry.flipped(window.frame).origin)
             .flatMap(ScreenIndex.displayID(of:))
             ?? CGMainDisplayID()
-
         let info = content.windows.first { $0.id == windowID }
-        let (cropped, croppedSize) = crop(
-            image, of: filter.contentRect, to: info?.visibleFrame, scale: scale)
+
+        let image: CGImage
+        let size: CGSize
+        let scale: CGFloat
+        if let region = info?.visibleFrame {
+            (image, size, scale) = try await captureRegion(
+                region, on: displayID, options: options)
+        } else {
+            let filter = SCContentFilter(desktopIndependentWindow: window)
+            scale = CGFloat(filter.pointPixelScale)
+            let configuration = configuration(
+                for: filter.contentRect, scale: scale, options: options)
+            let output = try await SCKBridge.captureScreenshot(
+                filter: filter, configuration: configuration)
+            guard let captured = output.image else { throw CaptureError.noImageProduced }
+            image = captured
+            size = filter.contentRect.size
+        }
 
         let (padded, pointSize) = await pad(
-            cropped, size: croppedSize, scale: scale,
-            on: displayID, options: options)
+            image, size: size, scale: scale, on: displayID, options: options)
         return CaptureResult(
             image: padded,
             pointSize: pointSize,
@@ -164,36 +171,37 @@ final class CaptureEngine {
         )
     }
 
-    /// Narrows a window capture to the part of the window that is really there.
+    /// Captures a window that is really a region of the screen, as that region.
     ///
-    /// Only the Dock uses this, and it has to: its window is the whole display
-    /// while the dock is a strip along one edge, so an uncropped capture is a
-    /// screen-sized image that is transparent almost everywhere. The rect is the
-    /// same one the picker outlined, which is what keeps the highlight and the
-    /// file agreeing.
+    /// The Dock is the case, and it needs both halves of this. Its window is the
+    /// whole display, so the rect has to come from `visibleFrame` — the same one
+    /// the picker outlined, which is what keeps the highlight and the file
+    /// agreeing.
     ///
-    /// Both rects are CG global points and `CGImage.cropping` is top-left
-    /// origin, so this is a plain subtraction — no flip.
-    private func crop(
-        _ image: CGImage, of contentRect: CGRect, to visibleFrame: CGRect?, scale: CGFloat
-    ) -> (CGImage, CGSize) {
-        guard let visibleFrame, visibleFrame != contentRect else {
-            return (image, contentRect.size)
+    /// And it has to be captured against the desktop rather than in isolation.
+    /// A `desktopIndependentWindow` filter contains one window and nothing else,
+    /// so a translucent surface has no backdrop left to sample and falls back to
+    /// its base tint: measured 2026-07-30, the Dock's liquid glass came out flat
+    /// black, while the same strip taken as a screen region shows the wallpaper
+    /// through it. Isolation is the right default for an ordinary window and
+    /// exactly wrong for a piece of the desktop.
+    private func captureRegion(
+        _ regionInCGGlobal: CGRect, on displayID: CGDirectDisplayID, options: CaptureOptions
+    ) async throws -> (CGImage, CGSize, CGFloat) {
+        guard let display = content.scDisplay(for: displayID) else {
+            throw CaptureError.displayNotFound(displayID)
         }
-        let region = CGRect(
-            x: ((visibleFrame.minX - contentRect.minX) * scale).rounded(),
-            y: ((visibleFrame.minY - contentRect.minY) * scale).rounded(),
-            width: (visibleFrame.width * scale).rounded(),
-            height: (visibleFrame.height * scale).rounded()
-        ).intersection(CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        let filter = try await displayFilter(display, options: options)
+        let scale = CGFloat(filter.pointPixelScale)
+        let sourceRect = DisplayGeometry.displayLocal(regionInCGGlobal, on: displayID)
 
-        guard !region.isNull, region.width >= 1, region.height >= 1,
-              let cropped = image.cropping(to: region)
-        else {
-            Log.capture.error("could not crop to the visible frame; keeping the whole window")
-            return (image, contentRect.size)
-        }
-        return (cropped, CGSize(width: region.width / scale, height: region.height / scale))
+        let configuration = configuration(for: sourceRect, scale: scale, options: options)
+        configuration.sourceRect = sourceRect
+
+        let output = try await SCKBridge.captureScreenshot(
+            filter: filter, configuration: configuration)
+        guard let image = output.image else { throw CaptureError.noImageProduced }
+        return (image, sourceRect.size, scale)
     }
 
     /// Applies `options.windowPadding`, returning the image and its new point size.

@@ -72,10 +72,14 @@ final class CaptureCoordinator {
                 .area(displayID: displayID, rectInAppKitGlobal: rect), options: options)
 
         case .window(let windowID):
-            // The overlay has already torn itself down: a window filter contains
-            // only that window, so there is nothing of ours to exclude.
+            // The panels are still on screen, as in the area case above. A window
+            // filter contains only its window and cannot pick them up — but the
+            // Dock is captured as a region of the desktop, so that its glass has
+            // a backdrop to sample, and a region capture would photograph the dim.
             var options = Preferences.shared.captureOptions
-            options.excludedWindowIDs = additionalExcludedWindowIDs()
+            options.excludedWindowIDs = overlay.panelWindowIDs
+                .union(additionalExcludedWindowIDs())
+            defer { overlay.tearDown() }
             return await perform(.window(windowID), options: options)
         }
     }
