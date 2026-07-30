@@ -1088,6 +1088,8 @@ enum SelfTest {
         }
         settings.close()
 
+        let furnitureOK = try await systemFurnitureIsPickable(coordinator, all)
+
         let childOK = try await childWindowIsolation()
 
         // Geometry: capture the largest window and check the pixel size against
@@ -1180,7 +1182,7 @@ enum SelfTest {
         } ?? false
         let pass = selfLeaked == 0 && hits == tested && tested > 0 && geometryOK && toggleOK
             && inversions.isEmpty && frontmostOK && recoveredOK && appearedOK && paddingOK
-            && childOK && shadowOK && ownWindowOK && cardOK && menuBarOK
+            && childOK && shadowOK && ownWindowOK && cardOK && menuBarOK && furnitureOK
         print("result:        \(pass ? "PASS" : "FAIL")")
         return pass ? 0 : 1
     }
@@ -1220,6 +1222,62 @@ enum SelfTest {
                      padded.width, padded.height, darkened,
                      (ok ? "OK" : "FAIL") as NSString))
         return ok
+    }
+
+    /// The menu bar and the Dock are pickable, and the Dock is cut down to size.
+    ///
+    /// Both are ordinary screenshot targets that the picker used to refuse. The
+    /// menu bar only needed the filters widened — its frame is honest. The Dock
+    /// did not: its window is the entire display, so offering it as-is would put
+    /// a full-screen window in front of everything and every hover anywhere would
+    /// land on it, which is the frozen-picker failure all over again. It is
+    /// offered against the strip it reserves instead, and the capture is cut to
+    /// the same rect so the outline and the file cannot disagree.
+    private static func systemFurnitureIsPickable(
+        _ coordinator: CaptureCoordinator, _ all: [WindowInfo]
+    ) async throws -> Bool {
+        let menuBar = all.first { $0.layer == WindowInfo.menuBarLayer && $0.isOnScreen }
+        let dock = all.first { $0.layer == WindowInfo.dockLayer && $0.isOnScreen }
+
+        let presentation = Task {
+            await coordinator.overlay.present(mode: .window, windows: all)
+        }
+        try await Task.sleep(for: .milliseconds(400))
+        let pickable = coordinator.overlay.pickableWindowIDs
+        coordinator.overlay.tearDown()
+        presentation.cancel()
+        try await Task.sleep(for: .milliseconds(200))
+
+        var ok = true
+        if let menuBar {
+            let offered = pickable.contains(menuBar.id)
+            print("menu bar:      \(rectString(menuBar.frame)) pickable=\(offered) "
+                + "\(offered ? "" : "MISMATCH")")
+            ok = ok && offered
+        } else {
+            print("menu bar:      not enumerated — cannot tell")
+        }
+
+        guard let dock else {
+            print("dock:          not enumerated — cannot tell")
+            return ok
+        }
+        let offered = pickable.contains(dock.id)
+        // The whole point: what it is offered as must be a strip, not a display.
+        let narrowed = dock.pickFrame != dock.frame
+            && dock.pickFrame.height < dock.frame.height / 2
+        print("dock:          window \(rectString(dock.frame)) "
+            + "offered as \(rectString(dock.pickFrame)) pickable=\(offered)")
+        ok = ok && offered && narrowed
+
+        // And the capture follows the outline rather than the window.
+        let result = try await coordinator.engine.capture(.window(dock.id))
+        let expected = CGSize(width: (dock.pickFrame.width * result.scale).rounded(),
+                              height: (dock.pickFrame.height * result.scale).rounded())
+        let cropOK = result.pixelSize == expected
+        print("dock capture:  \(Int(result.pixelSize.width))x\(Int(result.pixelSize.height)) px "
+            + "(expected \(Int(expected.width))x\(Int(expected.height))) -> \(cropOK ? "OK" : "FAIL")")
+        return ok && cropOK
     }
 
     /// The padded card's corner radius tracks the window's own.

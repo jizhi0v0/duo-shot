@@ -20,21 +20,35 @@ final class WindowPickerModel {
     /// window rather than something a user means to capture.
     private let minimumSize = CGSize(width: 40, height: 40)
 
-    /// Window layers the picker offers.
+    /// Whether the picker offers windows at this layer.
     ///
-    /// Not layer 0 alone, which is what this used to be. An ordinary app's
-    /// floating panel sits at `NSWindow.Level.floating` (3) — a translator
-    /// popup, an inspector palette, a mini player — and those are exactly the
-    /// things someone reaches for a window screenshot to capture. Measured
-    /// 2026-07-30: DuoTranslator's popup was at layer 3, on screen, 480×457, and
-    /// the frontmost window on the display; the picker refused to see it and
-    /// highlighted the window behind instead.
+    /// Ordinary app windows run from 0 to `.modalPanel` (8), and that range is
+    /// not optional: an app's floating panel sits at `.floating` (3) — a
+    /// translator popup, an inspector palette, a mini player — and those are
+    /// exactly what someone reaches for a window screenshot to capture.
     ///
-    /// `.modalPanel` (8) is the upper bound because it stops short of the system
-    /// chrome, which is what the filter is actually for: the Dock is 20,
-    /// Notification Center 21, the menu bar 24, Control Center's status items 25,
-    /// and menus and tooltips 101. Negative layers are the desktop and its icons.
-    private let pickableLayers = 0...Int(NSWindow.Level.modalPanel.rawValue)
+    /// Then two pieces of system furniture, because people screenshot those too:
+    /// the Dock (20) and the menu bar (24). Deliberately *not* everything in
+    /// between or above — Notification Center (21) is a full-screen window that
+    /// would swallow the display, Control Center's status items (25) are a
+    /// couple of dozen 32×30 tiles, and menus and tooltips live at 101. Negative
+    /// layers are the desktop and its icons.
+    private func isPickable(layer: Int) -> Bool {
+        (0...WindowInfo.topAppLayer).contains(layer)
+            || layer == WindowInfo.dockLayer
+            || layer == WindowInfo.menuBarLayer
+    }
+
+    /// Below this and it is a shadow helper, a tooltip or a 1×1 spy window.
+    ///
+    /// Either dimension may be under the minimum as long as the surface is
+    /// plainly real, which is what lets the menu bar through: it is 1920×30, so
+    /// a height rule excludes it, while Control Center's 32×30 status items —
+    /// which must stay out — are two orders of magnitude smaller by area.
+    private func isPickable(size frame: CGRect) -> Bool {
+        (frame.width >= minimumSize.width && frame.height >= minimumSize.height)
+            || frame.width * frame.height >= 20_000
+    }
 
     /// Why a window is not offered to the picker, or nil if it is.
     ///
@@ -57,8 +71,15 @@ final class WindowPickerModel {
         // Stage Manager parks windows that are `isActive` but not on screen;
         // they are not pickable because they are not visible.
         if !window.isOnScreen { return "isOnScreen == false" }
-        if !pickableLayers.contains(window.layer) { return "layer \(window.layer)" }
-        if window.frame.width < minimumSize.width || window.frame.height < minimumSize.height {
+        if !isPickable(layer: window.layer) { return "layer \(window.layer)" }
+        // The Dock's window is the whole screen, so it is only usable once
+        // `ScreenIndex` has told us where the dock itself actually is. An
+        // auto-hidden Dock reserves nothing, and offering a full-screen window
+        // that hit-tests over everything would be far worse than not offering it.
+        if window.layer == WindowInfo.dockLayer, window.visibleFrame == nil {
+            return "dock strip unknown"
+        }
+        if !isPickable(size: window.pickFrame) {
             return "smaller than \(Int(minimumSize.width))×\(Int(minimumSize.height))"
         }
         return nil
@@ -135,7 +156,7 @@ final class WindowPickerModel {
     /// see `WindowZOrder` for the measurement and what it broke.
     func updateHover(atAppKitGlobal point: CGPoint) {
         let pointInCGGlobal = DisplayGeometry.flipped(point)
-        let match = windows.first { $0.frame.contains(pointInCGGlobal) }
+        let match = windows.first { $0.pickFrame.contains(pointInCGGlobal) }
         guard match?.id != hovered?.id else { return }
         hovered = match
         Log.overlay.debug("""
@@ -147,7 +168,7 @@ final class WindowPickerModel {
 
     /// The hovered window's frame in **AppKit global** points, for drawing.
     var hoveredFrameInAppKitGlobal: CGRect? {
-        hovered.map { DisplayGeometry.flipped($0.frame) }
+        hovered.map { DisplayGeometry.flipped($0.pickFrame) }
     }
 
     func reset() {

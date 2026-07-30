@@ -28,6 +28,39 @@ enum ScreenIndex {
         screen(containingAppKitGlobal: NSEvent.mouseLocation) ?? NSScreen.main
     }
 
+    /// The strip the Dock reserves, in **CG global** points, or nil when it is
+    /// hidden.
+    ///
+    /// The Dock's own window is the whole screen — measured 1920×1080 for a
+    /// dock 90 pt tall — so its frame says nothing about where it actually is.
+    /// What does say is the difference between `frame` and `visibleFrame`: macOS
+    /// reserves exactly the Dock's strip out of the latter. The top difference
+    /// is the menu bar, never the Dock, so it is not a candidate.
+    static func dockStripInCGGlobal() -> CGRect? {
+        for screen in NSScreen.screens {
+            let full = screen.frame
+            let visible = screen.visibleFrame
+            let strip: CGRect? =
+                if visible.minY > full.minY {
+                    CGRect(x: full.minX, y: full.minY,
+                           width: full.width, height: visible.minY - full.minY)
+                } else if visible.minX > full.minX {
+                    CGRect(x: full.minX, y: visible.minY,
+                           width: visible.minX - full.minX, height: visible.height)
+                } else if visible.maxX < full.maxX {
+                    CGRect(x: visible.maxX, y: visible.minY,
+                           width: full.maxX - visible.maxX, height: visible.height)
+                } else {
+                    nil
+                }
+            // An auto-hidden Dock leaves a few points behind rather than none.
+            if let strip, strip.width >= 16, strip.height >= 16 {
+                return DisplayGeometry.flipped(strip)
+            }
+        }
+        return nil
+    }
+
     /// Describes a display for logging: both coordinate spaces plus the scale,
     /// because nearly every geometry bug is visible in this one line.
     static func describe(_ screen: NSScreen) -> String {

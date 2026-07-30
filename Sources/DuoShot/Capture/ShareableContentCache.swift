@@ -11,12 +11,27 @@ nonisolated struct WindowInfo: Sendable, Identifiable, Hashable {
     let bundleID: String?
     let layer: Int
     let isOnScreen: Bool
+    /// The part of `frame` the window actually occupies, when the two differ.
+    ///
+    /// Only the Dock needs this today, and it needs it badly: its window is the
+    /// entire screen while the dock itself is a strip along one edge. Left as
+    /// the whole frame, it would rank in front of every ordinary window and
+    /// swallow every hover on the display.
+    ///
+    /// Whatever is set here governs both the highlight and the capture, so the
+    /// two can never disagree about what was picked.
+    let visibleFrame: CGRect?
+
+    /// What the picker hit-tests and outlines.
+    var pickFrame: CGRect { visibleFrame ?? frame }
 
     var displayName: String {
         switch (appName, title) {
-        case let (app?, title?) where !title.isEmpty: "\(app) — \(title)"
-        case let (app?, _): app
-        case let (_, title?): title
+        // `title != app` because the Dock reports both as "Dock", and "Dock —
+        // Dock" reads like a bug. Same for WeChat and a few others.
+        case let (app?, title?) where !title.isEmpty && title != app: "\(app) — \(title)"
+        case let (app?, _) where !app.isEmpty: app
+        case let (_, title?) where !title.isEmpty: title
         default: "Window \(id)"
         }
     }
@@ -42,7 +57,9 @@ final class ShareableContentCache {
             excludingDesktopWindows: true, onScreenWindowsOnly: onScreenOnly
         ).value
         content = fetched
-        windows = WindowZOrder.sortedFrontToBack(fetched.windows.map(WindowInfo.init(_:)))
+        let dockStrip = ScreenIndex.dockStripInCGGlobal()
+        windows = WindowZOrder.sortedFrontToBack(
+            fetched.windows.map { WindowInfo($0, dockStrip: dockStrip) })
     }
 
     func scWindow(for id: CGWindowID) -> SCWindow? {
@@ -93,7 +110,18 @@ final class ShareableContentCache {
 }
 
 extension WindowInfo {
-    fileprivate init(_ window: SCWindow) {
+    static let dockBundleID = "com.apple.dock"
+    /// `NSWindow.Level.dock` and `.mainMenu` are deprecated; the CoreGraphics
+    /// keys are the current spelling of the same window-server numbers, and the
+    /// window server is what `SCWindow.windowLayer` reports.
+    /// The top of the range ordinary app windows use.
+    static let topAppLayer = Int(CGWindowLevelForKey(.modalPanelWindow))
+    static let dockLayer = Int(CGWindowLevelForKey(.dockWindow))
+    static let menuBarLayer = Int(CGWindowLevelForKey(.mainMenuWindow))
+
+    fileprivate init(_ window: SCWindow, dockStrip: CGRect?) {
+        let isDock = window.owningApplication?.bundleIdentifier == Self.dockBundleID
+            && window.windowLayer == Self.dockLayer
         self.init(
             id: window.windowID,
             frame: window.frame,
@@ -101,7 +129,8 @@ extension WindowInfo {
             appName: window.owningApplication?.applicationName,
             bundleID: window.owningApplication?.bundleIdentifier,
             layer: window.windowLayer,
-            isOnScreen: window.isOnScreen
+            isOnScreen: window.isOnScreen,
+            visibleFrame: isDock ? dockStrip : nil
         )
     }
 }

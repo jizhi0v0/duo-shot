@@ -147,11 +147,13 @@ final class CaptureEngine {
             .flatMap(ScreenIndex.displayID(of:))
             ?? CGMainDisplayID()
 
-        let (padded, pointSize) = await pad(
-            image, size: filter.contentRect.size, scale: scale,
-            on: displayID, options: options)
-
         let info = content.windows.first { $0.id == windowID }
+        let (cropped, croppedSize) = crop(
+            image, of: filter.contentRect, to: info?.visibleFrame, scale: scale)
+
+        let (padded, pointSize) = await pad(
+            cropped, size: croppedSize, scale: scale,
+            on: displayID, options: options)
         return CaptureResult(
             image: padded,
             pointSize: pointSize,
@@ -160,6 +162,38 @@ final class CaptureEngine {
             sourceDescription: info?.displayName ?? "Window",
             capturedAt: .now
         )
+    }
+
+    /// Narrows a window capture to the part of the window that is really there.
+    ///
+    /// Only the Dock uses this, and it has to: its window is the whole display
+    /// while the dock is a strip along one edge, so an uncropped capture is a
+    /// screen-sized image that is transparent almost everywhere. The rect is the
+    /// same one the picker outlined, which is what keeps the highlight and the
+    /// file agreeing.
+    ///
+    /// Both rects are CG global points and `CGImage.cropping` is top-left
+    /// origin, so this is a plain subtraction — no flip.
+    private func crop(
+        _ image: CGImage, of contentRect: CGRect, to visibleFrame: CGRect?, scale: CGFloat
+    ) -> (CGImage, CGSize) {
+        guard let visibleFrame, visibleFrame != contentRect else {
+            return (image, contentRect.size)
+        }
+        let region = CGRect(
+            x: ((visibleFrame.minX - contentRect.minX) * scale).rounded(),
+            y: ((visibleFrame.minY - contentRect.minY) * scale).rounded(),
+            width: (visibleFrame.width * scale).rounded(),
+            height: (visibleFrame.height * scale).rounded()
+        ).intersection(CGRect(x: 0, y: 0, width: image.width, height: image.height))
+
+        guard !region.isNull, region.width >= 1, region.height >= 1,
+              let cropped = image.cropping(to: region)
+        else {
+            Log.capture.error("could not crop to the visible frame; keeping the whole window")
+            return (image, contentRect.size)
+        }
+        return (cropped, CGSize(width: region.width / scale, height: region.height / scale))
     }
 
     /// Applies `options.windowPadding`, returning the image and its new point size.
