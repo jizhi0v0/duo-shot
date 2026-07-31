@@ -218,6 +218,7 @@ test: verify
 	run "settings tab resize"    --selftest-settings-resize; \
 	run "overlay lifecycle"      --selftest-lifecycle 10; \
 	run "selection toolbar"      --selftest-selection-toolbar; \
+	run "overlay sharing"        --selftest-overlay-sharing; \
 	run "hud appearance"         --selftest-hud-appearance $(TEST_OUT); \
 	run "preview stack + scroll" --selftest-preview-stack $(TEST_OUT) --count 14; \
 	run "recording area"         --selftest-record $(TEST_OUT) --seconds 2 --rect 400,300,640,400; \

@@ -48,7 +48,7 @@ final class PreferencesWindowController {
         /// generous: these never clip, they just leave dead space at the bottom.
         var fallbackHeight: CGFloat {
             switch self {
-            case .general: 320
+            case .general: 420
             case .capture: 360
             case .recording: 420
             case .saving: 420

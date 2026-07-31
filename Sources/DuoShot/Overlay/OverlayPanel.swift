@@ -25,7 +25,7 @@ final class OverlayPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 
-    init(screen: NSScreen, view: NSView) {
+    init(screen: NSScreen, view: NSView, hiddenFromCapture: Bool = true) {
         super.init(
             contentRect: screen.frame,
             // `.nonactivatingPanel` is the load-bearing flag. The naive approach
@@ -74,7 +74,11 @@ final class OverlayPanel: NSPanel {
         // Belt alongside SCContentFilter(display:excludingWindows:). Historically
         // this excludes a window from screen captures; both mechanisms are used,
         // neither is relied on alone.
-        sharingType = Self.usesSharingTypeNone ? .none : .readOnly
+        // Two independent reasons to be capturable, and both must agree before
+        // the panel hides: the self-tests force `.readOnly` to prove exclusion
+        // works without it, and the user can ask for the overlay to be visible
+        // to screen sharing.
+        sharingType = (Self.usesSharingTypeNone && hiddenFromCapture) ? .none : .readOnly
 
         contentView = view
         setFrame(screen.frame, display: false)

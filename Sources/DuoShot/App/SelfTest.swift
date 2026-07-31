@@ -50,6 +50,7 @@ enum SelfTest {
         /// double-resumed continuation and leaked panels.
         case lifecycle(iterations: Int)
         case selectionToolbar
+        case overlaySharing
         case hudAppearance(directory: URL)
         /// Repeated captures through the whole pipeline, watching memory and the
         /// staging store.
@@ -115,6 +116,8 @@ enum SelfTest {
                 SelectionToolbarPanel.usesSharingTypeNone = false
                 self = .hudAppearance(
                     directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
+            case "--selftest-overlay-sharing":
+                self = .overlaySharing
             case "--selftest-selection-toolbar":
                 self = .selectionToolbar
             case "--selftest-lifecycle":
@@ -227,6 +230,7 @@ enum SelfTest {
             case .settingsResize: return try await settingsResize()
             case .lifecycle(let iterations): return try await lifecycle(iterations: iterations)
             case .selectionToolbar: return try await selectionToolbar()
+            case .overlaySharing: return try await overlaySharing()
             case .hudAppearance(let d): return try await hudAppearance(into: d)
             case .soak(let iterations, let directory):
                 return try await soak(iterations: iterations, into: directory)
@@ -1881,6 +1885,61 @@ enum SelfTest {
         print("placement:     anchor \(rectString(anchor))")
         print("               toolbar \(rectString(bar))")
         print("               hud starting \(rectString(starting)) running \(rectString(running))")
+        print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.joined(separator: "; "))")")
+        return failures.isEmpty ? 0 : 1
+    }
+
+    /// What the selection overlay tells ScreenCaptureKit, in all four states.
+    ///
+    /// The property that matters is the third row: with the preference on, a
+    /// take being written must still force the overlay back to `.none`. A
+    /// `.readOnly` overlay raised during a recording lands in the video and
+    /// cannot be excluded afterwards — `SCContentFilter` is fixed when the
+    /// stream starts and the panel does not exist yet at that point. That is
+    /// the one combination where the convenience would cost the user a ruined
+    /// recording, so it is asserted rather than trusted.
+    private static func overlaySharing() async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+        if let hint = LoginSession.noDisplaysHint {
+            FileHandle.standardError.write(Data("error: \(hint)\n".utf8))
+            return 2
+        }
+        let coordinator = CaptureCoordinator()
+        let overlay = coordinator.overlay
+        let preferences = Preferences.shared
+        let restore = preferences.overlayVisibleToScreenSharing
+        defer { preferences.overlayVisibleToScreenSharing = restore }
+
+        var failures: [String] = []
+
+        func check(visible: Bool, recording: Bool, expected: NSWindow.SharingType) async {
+            preferences.overlayVisibleToScreenSharing = visible
+            overlay.isRecordingActive = { recording }
+            let flag = CompletionFlag()
+            Task {
+                _ = await overlay.present(mode: .area, windows: [])
+                flag.markDone()
+            }
+            try? await Task.sleep(for: .milliseconds(160))
+            let actual = overlay.sharingTypesForTest
+            overlay.tearDown()
+            _ = await flag.wait(upTo: .seconds(2))
+            try? await Task.sleep(for: .milliseconds(120))
+
+            let ok = !actual.isEmpty && actual.allSatisfy { $0 == expected }
+            let names = actual.map { $0 == NSWindow.SharingType.none ? "none" : "readOnly" }
+            print("  \(ok ? "ok  " : "FAIL") preference=\(visible ? "visible" : "hidden") "
+                + "recording=\(recording) -> \(names.joined(separator: ",")) "
+                + "(want \(expected == NSWindow.SharingType.none ? "none" : "readOnly"))")
+            if !ok { failures.append("visible=\(visible) recording=\(recording)") }
+        }
+
+        await check(visible: false, recording: false, expected: .none)
+        await check(visible: false, recording: true, expected: .none)
+        await check(visible: true, recording: false, expected: .readOnly)
+        // The one that protects a take in progress.
+        await check(visible: true, recording: true, expected: .none)
+
         print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.joined(separator: "; "))")")
         return failures.isEmpty ? 0 : 1
     }

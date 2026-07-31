@@ -43,6 +43,8 @@ final class OverlayController {
     /// — so it gets a step where the selection is final but nothing has begun.
     private var requiresConfirmation = false
     private var isArmed = false
+    /// What `hidesOverlayFromCapture` said when this presentation began.
+    private var hidden = true
 
     /// Re-enumerates the pickable windows while the overlay is up.
     ///
@@ -50,6 +52,27 @@ final class OverlayController {
     /// engine — and because the self-tests need to drive the picker from a fixed
     /// list, which they do by leaving this nil.
     var refreshWindows: (() async -> [WindowInfo])?
+
+    /// Whether a recording is being written right now.
+    ///
+    /// Injected because this type owns no recorder. It decides one thing: a
+    /// `.readOnly` overlay raised *during* a take would be recorded, and could
+    /// not be excluded after the fact — `SCContentFilter` is fixed when the
+    /// stream starts, and this panel does not exist yet at that moment. So the
+    /// overlay goes back to `.none` for the length of a take, whatever the
+    /// preference says.
+    ///
+    /// The overlay raised *before* a take is a different case and stays
+    /// visible: a recording's own selection happens while no stream is running,
+    /// and the panels are torn down before one is built.
+    var isRecordingActive: (() -> Bool)?
+
+    /// `.none`, unless the user has asked for the selection UI to be visible to
+    /// screen sharing and no take is currently being written.
+    private var hidesOverlayFromCapture: Bool {
+        guard Preferences.shared.overlayVisibleToScreenSharing else { return true }
+        return isRecordingActive?() ?? false
+    }
 
     var isPresenting: Bool { !panels.isEmpty }
 
@@ -102,12 +125,16 @@ final class OverlayController {
             selectionRestarted: { [weak self] in self?.disarm() }
         )
 
+        // Sampled once for the whole presentation, so every screen's panel
+        // agrees and a take starting mid-selection cannot leave a mixed set.
+        hidden = hidesOverlayFromCapture
         for screen in NSScreen.screens {
             let view = OverlayView(
                 screen: screen, model: model, picker: picker, callbacks: callbacks)
             view.mode = mode
             view.allowsWindowMode = allowsWindowMode
-            let panel = OverlayPanel(screen: screen, view: view)
+            let panel = OverlayPanel(
+                screen: screen, view: view, hiddenFromCapture: hidden)
             // Registered BEFORE it goes on screen. Ordering a window can throw
             // (see `ordering`), and an exception here must not leave a panel that
             // AppKit knows about and this controller does not — that panel would
@@ -362,7 +389,7 @@ final class OverlayController {
         isArmed = true
         views.forEach { $0.isArmed = true }
         guard let screen = ScreenIndex.screen(for: displayID) ?? NSScreen.main else { return }
-        toolbar.show(under: rect, on: screen)
+        toolbar.show(under: rect, on: screen, hiddenFromCapture: hidden)
         Log.overlay.notice("selection armed \(self.rectString(rect), privacy: .public)")
     }
 
@@ -514,6 +541,9 @@ final class OverlayController {
     var isArmedForTest: Bool { isArmed }
     var toolbarIsVisibleForTest: Bool { toolbar.isVisible }
     var toolbarFrameForTest: CGRect? { toolbar.frameForTest }
+
+    /// What every overlay panel is currently telling ScreenCaptureKit.
+    var sharingTypesForTest: [NSWindow.SharingType] { panels.map(\.sharingType) }
 
     /// Begins a fresh drag the way `mouseDown` does, without a mouse. The point
     /// of the hook is the disarm side effect, which is otherwise only reachable

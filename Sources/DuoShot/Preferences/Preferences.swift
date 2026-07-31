@@ -39,6 +39,7 @@ final class Preferences {
         static let recordingSystemAudio = "recordingSystemAudio"
         static let recordingMicrophone = "recordingMicrophone"
         static let recordingMicrophoneDevice = "recordingMicrophoneDevice"
+        static let overlayVisibleToScreenSharing = "overlayVisibleToScreenSharing"
         static let recordingShowsCursor = "recordingShowsCursor"
         static let recordingShowsClicks = "recordingShowsClicks"
         static let recordingFrameRate = "recordingFrameRate"
@@ -130,6 +131,25 @@ final class Preferences {
             defaults.set(recordingMicrophoneDeviceID, forKey: Key.recordingMicrophoneDevice)
         }
     }
+    /// Lets the selection UI be seen by screen sharing and remote desktop.
+    ///
+    /// Off by default, and the default is the safe one: the overlay, its
+    /// marching ants and the toolbar all ship `sharingType = .none`, which hides
+    /// them from every ScreenCaptureKit path — including the one a remote-desktop
+    /// app uses to send the screen. Measured 2026-07-31 over UU Remote: the
+    /// pointer changed to a crosshair (cursors travel separately) and nothing
+    /// else appeared, so the selection was being made blind while the captures
+    /// themselves succeeded.
+    ///
+    /// Turning this on trades that away: any app recording the screen — Zoom,
+    /// OBS, the remote-desktop tool itself — will see the selection UI. Our own
+    /// screenshots still exclude it by window ID, which
+    /// `--selftest-overlay --sharing-default` proves every run.
+    var overlayVisibleToScreenSharing: Bool {
+        didSet {
+            defaults.set(overlayVisibleToScreenSharing, forKey: Key.overlayVisibleToScreenSharing)
+        }
+    }
     /// On, unlike the screenshot default. A recording with no pointer is
     /// unreadable; a screenshot with one is noise.
     var recordingShowsCursor: Bool {
@@ -171,6 +191,7 @@ final class Preferences {
             Key.filenameTemplate: FilenameFormatter.defaultTemplate,
             Key.recordingSystemAudio: true,
             Key.recordingMicrophone: false,
+            Key.overlayVisibleToScreenSharing: false,
             Key.recordingShowsCursor: true,
             Key.recordingShowsClicks: true,
             Key.recordingFrameRate: 60,
@@ -199,6 +220,7 @@ final class Preferences {
         windowPadding = defaults.double(forKey: Key.windowPadding)
         recordingSystemAudio = defaults.bool(forKey: Key.recordingSystemAudio)
         recordingMicrophone = defaults.bool(forKey: Key.recordingMicrophone)
+        overlayVisibleToScreenSharing = defaults.bool(forKey: Key.overlayVisibleToScreenSharing)
         recordingMicrophoneDeviceID = defaults.string(forKey: Key.recordingMicrophoneDevice) ?? ""
         recordingShowsCursor = defaults.bool(forKey: Key.recordingShowsCursor)
         recordingShowsClicks = defaults.bool(forKey: Key.recordingShowsClicks)

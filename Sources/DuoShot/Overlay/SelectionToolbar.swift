@@ -15,7 +15,7 @@ final class SelectionToolbarPanel: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 
-    init(contentRect: CGRect, view: NSView) {
+    init(contentRect: CGRect, view: NSView, hiddenFromCapture: Bool = true) {
         super.init(
             contentRect: contentRect,
             styleMask: [.borderless, .nonactivatingPanel],
@@ -38,7 +38,7 @@ final class SelectionToolbarPanel: NSPanel {
         worksWhenModal = true
         isReleasedWhenClosed = false
         animationBehavior = .none
-        sharingType = Self.usesSharingTypeNone ? .none : .readOnly
+        sharingType = (Self.usesSharingTypeNone && hiddenFromCapture) ? .none : .readOnly
 
         contentView = view
     }
@@ -294,13 +294,15 @@ final class SelectionToolbar {
     /// Places the bar under `selection`, or above it when there is no room
     /// below — a selection dragged to the bottom of the screen is the common
     /// case, not an edge case.
-    func show(under selection: CGRect, on screen: NSScreen) {
+    /// `hiddenFromCapture` is decided per presentation by `OverlayController`.
+    func show(under selection: CGRect, on screen: NSScreen, hiddenFromCapture: Bool = true) {
         if panel == nil {
             var callbacks = SelectionToolbarView.Callbacks()
             callbacks.start = { [weak self] in self?.onStart() }
             callbacks.resized = { [weak self] in self?.applySize() }
             let view = SelectionToolbarView(callbacks: callbacks)
-            let created = SelectionToolbarPanel(contentRect: view.frame, view: view)
+            let created = SelectionToolbarPanel(
+                contentRect: view.frame, view: view, hiddenFromCapture: hiddenFromCapture)
             created.orderFrontRegardless()
             panel = created
             self.view = view

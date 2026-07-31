@@ -47,6 +47,21 @@ struct GeneralSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            Section {
+                Toggle("Show the selection UI to screen sharing",
+                       isOn: $preferences.overlayVisibleToScreenSharing)
+            } header: {
+                Text("Screen sharing")
+            } footer: {
+                Text("""
+                    Off, the dimming, the selection outline and the recording toolbar are invisible to every kind of screen capture — including the one a remote-desktop app uses to send you the screen, which leaves you selecting an area you cannot see.
+
+                    On, they become visible to it, and to anything else recording your screen. DuoShot's own screenshots still leave them out. They are hidden again for the length of a recording, where they could not be excluded from the video.
+                    """)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
         // Approving a login item — or switching it back off — happens in System

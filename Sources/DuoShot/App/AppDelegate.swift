@@ -53,6 +53,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return [] }
             return self.previews.panelWindowIDs.union(self.recorder.excludedWindowIDs)
         }
+        // The overlay must know whether a take is being written; see
+        // `OverlayController.isRecordingActive`.
+        coordinator.overlay.isRecordingActive = { [weak self] in
+            self?.recorder.isRecording ?? false
+        }
         statusItem.onOpenSettings = { [weak self] in self?.settings.show() }
         coordinator.onAuthorisationLost = { [weak self] in
             Task { await self?.handleAuthorisationLost() }
