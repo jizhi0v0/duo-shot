@@ -316,21 +316,7 @@ final class SelectionToolbar {
     private func applySize() {
         guard let panel, let view, let anchor else { return }
         let size = view.frame.size
-        let gap: CGFloat = 10
-        let visible = anchor.screen.visibleFrame
-
-        var origin = CGPoint(
-            x: anchor.selection.midX - size.width / 2,
-            y: anchor.selection.minY - gap - size.height)
-        if origin.y < visible.minY + 8 {
-            origin.y = anchor.selection.maxY + gap
-        }
-        // Still off? The selection is taller than the screen's usable height, so
-        // put the bar inside it rather than off-screen entirely.
-        if origin.y + size.height > visible.maxY - 8 {
-            origin.y = max(visible.minY + 8, anchor.selection.minY + gap)
-        }
-        origin.x = min(max(origin.x, visible.minX + 8), visible.maxX - size.width - 8)
+        let origin = HUDPlacement.origin(for: size, under: anchor.selection, on: anchor.screen)
         panel.setFrame(CGRect(origin: origin, size: size), display: true)
     }
 

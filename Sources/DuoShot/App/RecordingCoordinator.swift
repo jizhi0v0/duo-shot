@@ -150,11 +150,14 @@ final class RecordingCoordinator {
         // at 3.8–4.3 s on this machine, and showing the HUD only once it
         // returned left the screen with the selection gone and nothing in its
         // place for that whole time.
-        hud.showStarting(on: ScreenIndex.screen(for: request.displayID))
+        // Anchored to the region for an area take, so the bar stays where the
+        // toolbar just was instead of jumping to the bottom of the screen.
+        let region: CGRect? = if case .area(_, let rect) = request { rect } else { nil }
+        hud.showStarting(on: ScreenIndex.screen(for: request.displayID), under: region)
         // Only for an area take. On a fullscreen one the answer to "what is
         // being recorded" is the whole screen, and a border round the edge of it
         // would be noise.
-        if case .area(_, let rect) = request { regionOutline.show(around: rect) }
+        if let region { regionOutline.show(around: region) }
 
         do {
             let recording = try await engine.start(request, options: options, to: url)

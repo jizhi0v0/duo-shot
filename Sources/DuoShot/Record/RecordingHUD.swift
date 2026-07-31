@@ -279,6 +279,10 @@ final class RecordingHUD {
     private var view: RecordingHUDView?
     private var ticker: Timer?
     private var elapsedProvider: (() -> TimeInterval)?
+    /// The recorded region, when there is one. The bar hangs off it exactly as
+    /// the selection toolbar did, so starting a take does not teleport it to the
+    /// bottom of the screen.
+    private var anchor: (rect: CGRect, screen: NSScreen)?
 
     var onStop: () -> Void = {}
     var onDiscard: () -> Void = {}
@@ -290,8 +294,14 @@ final class RecordingHUD {
     /// see `RecordingHUDView.Phase`. The panel is `sharingType = .none`, so
     /// existing before the `SCContentFilter` is built costs nothing: it is
     /// invisible to the stream either way.
-    func showStarting(on screen: NSScreen?) {
+    /// `under` is the recorded region for an area take, and nil for a whole
+    /// display — where there is no anchor and the bottom of the screen is the
+    /// only sensible home.
+    func showStarting(on screen: NSScreen?, under region: CGRect? = nil) {
         show(on: screen, elapsed: nil)
+        if let region, let screen = panel?.screen ?? screen {
+            anchor = (region, screen)
+        }
         view?.setPhase(.starting)
         resize(to: .starting)
     }
@@ -309,13 +319,17 @@ final class RecordingHUD {
     /// from the middle rather than sliding sideways.
     private func resize(to phase: RecordingHUDView.Phase) {
         guard let panel else { return }
-        let width = RecordingHUDView.width(for: phase)
-        let frame = CGRect(
-            x: (panel.frame.midX - width / 2).rounded(),
-            y: panel.frame.minY,
-            width: width, height: RecordingHUDView.barSize.height)
-        panel.setFrame(frame, display: true)
-        view?.frame = CGRect(origin: .zero, size: frame.size)
+        let size = CGSize(
+            width: RecordingHUDView.width(for: phase),
+            height: RecordingHUDView.barSize.height)
+        let origin: CGPoint = if let anchor {
+            HUDPlacement.origin(for: size, under: anchor.rect, on: anchor.screen)
+        } else {
+            // No anchor: keep it where it is and grow from the centre.
+            CGPoint(x: (panel.frame.midX - size.width / 2).rounded(), y: panel.frame.minY)
+        }
+        panel.setFrame(CGRect(origin: origin, size: size), display: true)
+        view?.frame = CGRect(origin: .zero, size: size)
     }
 
     /// Bottom-centre of the recording's own screen, which is where the user is
@@ -325,9 +339,7 @@ final class RecordingHUD {
         let screen = screen ?? NSScreen.main ?? NSScreen.screens[0]
         let size = RecordingHUDView.barSize
         let frame = CGRect(
-            x: screen.frame.midX - size.width / 2,
-            y: screen.visibleFrame.minY + 24,
-            width: size.width, height: size.height)
+            origin: HUDPlacement.origin(for: size, atBottomOf: screen), size: size)
 
         var callbacks = RecordingHUDView.Callbacks()
         callbacks.stop = { [weak self] in self?.onStop() }

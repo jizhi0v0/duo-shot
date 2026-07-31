@@ -1818,8 +1818,14 @@ enum SelfTest {
             print("  \(name).png  \(rectString(frame))")
         }
 
+        // The anchor both bars are placed against. They appear here one after
+        // the other during one continuous action, so where they land is part of
+        // whether they read as one bar changing state.
+        let anchor = CGRect(
+            x: screen.frame.midX - 200, y: screen.frame.midY, width: 400, height: 300)
+
         let hud = RecordingHUD()
-        hud.showStarting(on: screen)
+        hud.showStarting(on: screen, under: anchor)
         guard let starting = hud.frameForTest else { return 1 }
         try await shoot("hud-starting", frame: starting)
 
@@ -1830,19 +1836,34 @@ enum SelfTest {
         hud.hide()
 
         let toolbar = SelectionToolbar()
-        let anchor = CGRect(x: screen.frame.midX - 200, y: screen.frame.midY, width: 400, height: 300)
         toolbar.show(under: anchor, on: screen)
         guard let bar = toolbar.frameForTest else { return 1 }
         try await shoot("toolbar", frame: bar)
         toolbar.hide()
 
-        // The two are meant to read as one bar changing state, so the thing
-        // worth asserting is that they agree on height. Width legitimately
-        // differs; a HUD as wide as the toolbar would be padding.
-        let sameHeight = abs(starting.height - bar.height) < 0.5
-        print("heights:       hud \(Int(starting.height)) vs toolbar \(Int(bar.height))")
-        print("result:        \(sameHeight ? "PASS" : "FAIL — the two bars are different heights")")
-        return sameHeight ? 0 : 1
+        // The two are meant to read as one bar changing state, so what is worth
+        // asserting is that they agree on height and on where they sit against
+        // the same anchor. Width legitimately differs; a HUD as wide as the
+        // toolbar would be padding.
+        var failures: [String] = []
+        if abs(starting.height - bar.height) >= 0.5 {
+            failures.append("different heights: hud \(Int(starting.height)) vs toolbar \(Int(bar.height))")
+        }
+        // Same top edge against the same anchor. Centres cannot be compared —
+        // the widths differ on purpose — and the top edge is the one the eye
+        // tracks as the contents change.
+        if abs(starting.maxY - bar.maxY) >= 0.5 {
+            failures.append("different top edges: hud \(Int(starting.maxY)) vs toolbar \(Int(bar.maxY))")
+        }
+        if abs(running.maxY - bar.maxY) >= 0.5 {
+            failures.append("the bar moved when the take started: "
+                + "\(Int(bar.maxY)) -> \(Int(running.maxY))")
+        }
+        print("placement:     anchor \(rectString(anchor))")
+        print("               toolbar \(rectString(bar))")
+        print("               hud starting \(rectString(starting)) running \(rectString(running))")
+        print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.joined(separator: "; "))")")
+        return failures.isEmpty ? 0 : 1
     }
 
     /// The confirmation step: mouse-up arms the selection instead of committing

@@ -49,6 +49,46 @@ enum HUDMetrics {
     }
 }
 
+/// Where a floating bar goes.
+///
+/// Shared because the toolbar and the HUD appear in the same place one after
+/// the other, and the illusion that they are one bar changing state survives
+/// exactly as long as they agree on position. They did not: the toolbar sat
+/// under the selection and the HUD jumped to the bottom of the screen the
+/// moment recording began.
+enum HUDPlacement {
+    private static let gap: CGFloat = 10
+    private static let edgeInset: CGFloat = 8
+
+    /// Just below `anchor`, or just above it when there is no room below — a
+    /// selection dragged to the bottom of the screen is the common case, not an
+    /// edge case. Always clamped inside the visible frame.
+    static func origin(for size: CGSize, under anchor: CGRect, on screen: NSScreen) -> CGPoint {
+        let visible = screen.visibleFrame
+        var origin = CGPoint(
+            x: anchor.midX - size.width / 2,
+            y: anchor.minY - gap - size.height)
+        if origin.y < visible.minY + edgeInset {
+            origin.y = anchor.maxY + gap
+        }
+        // Still off? The anchor is taller than the screen's usable height, so
+        // put the bar inside it rather than off-screen entirely.
+        if origin.y + size.height > visible.maxY - edgeInset {
+            origin.y = max(visible.minY + edgeInset, anchor.minY + gap)
+        }
+        origin.x = min(max(origin.x, visible.minX + edgeInset),
+                       visible.maxX - size.width - edgeInset)
+        return CGPoint(x: origin.x.rounded(), y: origin.y.rounded())
+    }
+
+    /// Bottom-centre, for a take with no anchor to speak of — a whole display.
+    static func origin(for size: CGSize, atBottomOf screen: NSScreen) -> CGPoint {
+        CGPoint(
+            x: (screen.frame.midX - size.width / 2).rounded(),
+            y: (screen.visibleFrame.minY + 24).rounded())
+    }
+}
+
 /// A filled action button carrying a mark and a word — Record, then Stop.
 ///
 /// Hand-drawn rather than an `NSButton`. Getting predictable padding out of a
