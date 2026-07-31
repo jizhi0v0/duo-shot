@@ -3413,6 +3413,26 @@ enum SelfTest {
         if (audio || microphoneEffective) && audioTracks.isEmpty {
             failures.append("audio was requested but the file has no audio track")
         }
+        // Both sources present means exactly ONE track, not two.
+        //
+        // `SCRecordingOutputConfiguration.mixesAudioWithMicrophone` decides
+        // this, and the engine pins it to true rather than trusting the default.
+        // Two tracks would look fine here and be wrong in the world: many
+        // players choose one audio track instead of summing them, so a viewer
+        // would get the system audio and no narration, or the reverse.
+        //
+        // Only checkable when the microphone is genuinely on, which needs the
+        // grant, which needs a LaunchServices launch — so a shell run reports
+        // rather than asserts instead of pretending to have tested it.
+        if audio && microphoneEffective {
+            if audioTracks.count != 1 {
+                failures.append("system audio + microphone produced \(audioTracks.count) "
+                    + "audio tracks; mixesAudioWithMicrophone should give exactly 1")
+            }
+        } else if audio || microphoneEffective {
+            print("mixing:        not asserted — only one source was active "
+                + "(system=\(audio) microphone=\(microphoneEffective))")
+        }
         // Only asserted for the microphone. System audio is legitimately silent
         // when nothing is playing, so a silent track proves nothing there.
         //

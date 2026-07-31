@@ -152,6 +152,24 @@ final class RecordingEngine {
         recordingConfiguration.outputURL = url
         recordingConfiguration.videoCodecType = options.videoCodec
         recordingConfiguration.outputFileType = options.fileType
+        // Pinned rather than left to the default, for the same reason
+        // `filter.includeMenuBar` is: a default that decides something this
+        // visible should be stated where it can be read.
+        //
+        // YES mixes system audio and the microphone into ONE track. Measured
+        // 2026-07-31 on macOS 27.0, a take with both sources came back as a
+        // single AAC 48 kHz stereo track, which is the behaviour a screen
+        // recorder wants — NO produces one track per source, and many players
+        // pick a single audio track rather than summing them, so narration
+        // would go missing for anyone who did not open it in an editor.
+        //
+        // The property is macOS 27+ and this ships with a 26.0 minimum. What
+        // `SCRecordingOutput` does with two sources on macOS 26 is NOT
+        // established here — untestable on this machine — so the availability
+        // check is a genuine unknown rather than a formality.
+        if #available(macOS 27.0, *) {
+            recordingConfiguration.mixesAudioWithMicrophone = true
+        }
 
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
