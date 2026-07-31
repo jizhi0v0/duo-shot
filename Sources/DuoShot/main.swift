@@ -43,6 +43,12 @@ if let mode = SelfTest.Mode(arguments: arguments) {
           --selftest-preview <dir> [--sharing-default]
           --selftest-window <dir>
           --selftest-fullscreen <dir>
+          --selftest-microphone
+          --selftest-record <dir> [--seconds N] [--rect <x,y,w,h>] [--fps N]
+                                  [--no-audio] [--mic]
+          --selftest-record-flow <dir> [--seconds N]
+          --selftest-record-hud <dir> [--seconds N] [--sharing-none]
+                                  [--hud-first] [--plain-window] [--status-item]
 
         Rects are in AppKit global points (origin bottom-left of the main screen).
 

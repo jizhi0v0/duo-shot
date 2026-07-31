@@ -36,6 +36,11 @@ final class Preferences {
         static let includeChildWindows = "includeChildWindows"
         static let windowPadding = "windowPadding"
         static let filenameTemplate = "filenameTemplate"
+        static let recordingSystemAudio = "recordingSystemAudio"
+        static let recordingMicrophone = "recordingMicrophone"
+        static let recordingShowsCursor = "recordingShowsCursor"
+        static let recordingShowsClicks = "recordingShowsClicks"
+        static let recordingFrameRate = "recordingFrameRate"
         static let hotkeys = "hotkeys.v1"
     }
 
@@ -95,6 +100,32 @@ final class Preferences {
     var filenameTemplate: String {
         didSet { defaults.set(filenameTemplate, forKey: Key.filenameTemplate) }
     }
+
+    // MARK: Recording
+
+    var recordingSystemAudio: Bool {
+        didSet { defaults.set(recordingSystemAudio, forKey: Key.recordingSystemAudio) }
+    }
+    /// Off by default, and it stays off until the microphone grant exists.
+    ///
+    /// `RecordingEngine` drops it rather than letting ScreenCaptureKit meet an
+    /// undecided grant, which hangs `startCapture` outright — so the Settings
+    /// toggle is the only place the prompt can be raised while the app is
+    /// frontmost and TCC will address the dialog to DuoShot.
+    var recordingMicrophone: Bool {
+        didSet { defaults.set(recordingMicrophone, forKey: Key.recordingMicrophone) }
+    }
+    /// On, unlike the screenshot default. A recording with no pointer is
+    /// unreadable; a screenshot with one is noise.
+    var recordingShowsCursor: Bool {
+        didSet { defaults.set(recordingShowsCursor, forKey: Key.recordingShowsCursor) }
+    }
+    var recordingShowsClicks: Bool {
+        didSet { defaults.set(recordingShowsClicks, forKey: Key.recordingShowsClicks) }
+    }
+    var recordingFrameRate: Int {
+        didSet { defaults.set(recordingFrameRate, forKey: Key.recordingFrameRate) }
+    }
     var hotkeys: [HotKeyAction: KeyCombo] {
         didSet {
             guard let data = try? JSONEncoder().encode(hotkeys) else { return }
@@ -123,6 +154,11 @@ final class Preferences {
             Key.includeChildWindows: false,
             Key.windowPadding: 32.0,
             Key.filenameTemplate: FilenameFormatter.defaultTemplate,
+            Key.recordingSystemAudio: true,
+            Key.recordingMicrophone: false,
+            Key.recordingShowsCursor: true,
+            Key.recordingShowsClicks: true,
+            Key.recordingFrameRate: 60,
         ])
 
         let fallbackDirectory = FileManager.default
@@ -146,6 +182,11 @@ final class Preferences {
         includeMenuBar = defaults.bool(forKey: Key.includeMenuBar)
         includeChildWindows = defaults.bool(forKey: Key.includeChildWindows)
         windowPadding = defaults.double(forKey: Key.windowPadding)
+        recordingSystemAudio = defaults.bool(forKey: Key.recordingSystemAudio)
+        recordingMicrophone = defaults.bool(forKey: Key.recordingMicrophone)
+        recordingShowsCursor = defaults.bool(forKey: Key.recordingShowsCursor)
+        recordingShowsClicks = defaults.bool(forKey: Key.recordingShowsClicks)
+        recordingFrameRate = defaults.integer(forKey: Key.recordingFrameRate)
         filenameTemplate = defaults.string(forKey: Key.filenameTemplate)
             .flatMap { $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0 }
             ?? FilenameFormatter.defaultTemplate
@@ -178,6 +219,16 @@ final class Preferences {
         options.includeMenuBar = includeMenuBar
         options.includeChildWindows = includeChildWindows
         options.windowPadding = windowPadding
+        return options
+    }
+
+    var recordingOptions: RecordingOptions {
+        var options = RecordingOptions.default
+        options.capturesSystemAudio = recordingSystemAudio
+        options.capturesMicrophone = recordingMicrophone
+        options.showsCursor = recordingShowsCursor
+        options.showsMouseClicks = recordingShowsClicks
+        options.frameRate = max(1, recordingFrameRate)
         return options
     }
 

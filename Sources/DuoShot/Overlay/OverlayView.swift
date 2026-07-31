@@ -19,6 +19,17 @@ final class OverlayView: NSView {
     /// the SCContentFilter failed.
     static var drawsDebugSelectionBorder = false
 
+    /// Whether Space offers to switch into window mode.
+    ///
+    /// Off for recordings. A window moves, resizes and closes while a take is
+    /// running and none of those have a defined answer yet, so offering the
+    /// mode would be promising something the recorder cannot do. The hint text
+    /// follows this, because a shortcut that silently does nothing is worse
+    /// than one that is not advertised.
+    var allowsWindowMode = true {
+        didSet { if allowsWindowMode != oldValue { refresh() } }
+    }
+
     var mode: SelectionMode = .area {
         didSet { if mode != oldValue { refresh() } }
     }
@@ -147,7 +158,7 @@ final class OverlayView: NSView {
         case kVK_Space:
             // Matches the system screenshot UI, where Space swaps between
             // dragging a region and picking a window.
-            callbacks.toggleMode()
+            if allowsWindowMode { callbacks.toggleMode() }
         case kVK_Return, kVK_ANSI_KeypadEnter:
             confirmFromKeyboard()
         case kVK_Escape:
@@ -255,9 +266,13 @@ final class OverlayView: NSView {
     }
 
     private func drawHint() {
-        let text = mode == .area
-            ? "Drag to select · Space for window · Esc to cancel"
-            : "Click a window · Space for area · Esc to cancel"
+        let text = if mode != .area {
+            "Click a window · Space for area · Esc to cancel"
+        } else if allowsWindowMode {
+            "Drag to select · Space for window · Esc to cancel"
+        } else {
+            "Drag to select an area to record · Esc to cancel"
+        }
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11, weight: .regular),
             .foregroundColor: NSColor(white: 1, alpha: 0.75),

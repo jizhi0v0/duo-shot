@@ -4,7 +4,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let coordinator = CaptureCoordinator()
     private let previews = PreviewStackController()
     private let settings = PreferencesWindowController()
-    private lazy var statusItem = StatusItemController(coordinator: coordinator)
+    /// Shares the capture coordinator's overlay: only one selection can be on
+    /// screen at a time, and two controllers each owning their own panels would
+    /// be two ways to end up with a stranded one.
+    private lazy var recorder = RecordingCoordinator(overlay: coordinator.overlay)
+    private lazy var statusItem = StatusItemController(
+        coordinator: coordinator, recorder: recorder)
     private var isReauthorising = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -15,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             """)
 
         wireCoordinator()
+        wireRecorder()
         wireSettings()
 
         previews.timeout = .seconds(Preferences.shared.previewTimeout)
@@ -37,11 +43,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // A preview left over from the previous capture is on screen; keep it out
         // of the next one.
+        // The recording HUD is on screen for the length of a take, and a
+        // screenshot taken during one would otherwise photograph it. Recordings
+        // do not need this — a stream never renders our own windows (M9) — but
+        // screenshots do.
         coordinator.additionalExcludedWindowIDs = { [weak self] in
-            self?.previews.panelWindowIDs ?? []
+            guard let self else { return [] }
+            return self.previews.panelWindowIDs.union(self.recorder.excludedWindowIDs)
         }
         statusItem.onOpenSettings = { [weak self] in self?.settings.show() }
         coordinator.onAuthorisationLost = { [weak self] in
+            Task { await self?.handleAuthorisationLost() }
+        }
+    }
+
+    private func wireRecorder() {
+        recorder.onStateChanged = { [weak self] in
+            self?.statusItem.refreshRecordingState()
+        }
+        recorder.onResult = { [weak self] output in
+            self?.statusItem.noteRecording(output)
+        }
+        recorder.onAuthorisationLost = { [weak self] in
             Task { await self?.handleAuthorisationLost() }
         }
     }

@@ -10,7 +10,7 @@ MACOS_DIR := $(CONTENTS)/MacOS
 RES_DIR   := $(CONTENTS)/Resources
 EXEC      := $(MACOS_DIR)/$(APP_NAME)
 
-.PHONY: all build bundle sign verify run launch logs selftest install dist clean help
+.PHONY: all build bundle sign verify run launch logs selftest mic-check install dist clean help
 
 all: verify
 
@@ -105,6 +105,22 @@ tcc-check: verify
 		| grep selftest-permission | tail -1 | sed 's/^/  /' \
 		| grep . || echo "  FAIL: no log entry in the last 15s -- the app did not launch"
 
+# The microphone grant, asked for the only way that works.
+#
+# Same attribution rule as tcc-check, and it bites harder here: measured
+# 2026-07-31, a shell-launched request put the prompt in front of the terminal's
+# ancestor process instead of the user, and SCStream.startCapture with
+# captureMicrophone = true then hung forever waiting on an answer nobody could
+# give. Launch via LaunchServices so the prompt says DuoShot.
+mic-check: verify
+	@pkill -f "$(APP_NAME).app/Contents/MacOS/$(APP_NAME)" 2>/dev/null || true
+	@open -n -a "$(CURDIR)/$(APP)" --args --selftest-microphone
+	@echo "  answer the microphone prompt if one appears, then:"
+	@sleep 8
+	@/usr/bin/log show --predicate 'subsystem == "$(BUNDLE_ID)"' --last 20s --info --debug --style compact 2>/dev/null \
+		| grep selftest-microphone | tail -1 | sed 's/^/  /' \
+		| grep . || echo "  FAIL: no log entry in the last 20s -- the app did not launch"
+
 selftest: verify
 	@"$(EXEC)" --selftest-permission || true
 	@"$(EXEC)" --selftest-capture build/selftest-fullscreen.png
@@ -145,6 +161,12 @@ test: verify
 	run "settings tab resize"    --selftest-settings-resize; \
 	run "overlay lifecycle"      --selftest-lifecycle 10; \
 	run "preview stack + scroll" --selftest-preview-stack $(TEST_OUT) --count 14; \
+	run "recording area"         --selftest-record $(TEST_OUT) --seconds 2 --rect 400,300,640,400; \
+	run "recording fullscreen"   --selftest-record $(TEST_OUT) --seconds 2; \
+	run "recording hud absent"   --selftest-record-hud $(TEST_OUT) --seconds 2; \
+	run "recording hud (plain)"  --selftest-record-hud $(TEST_OUT) --seconds 2 --plain-window --hud-first; \
+	run "recording menu-bar item" --selftest-record-hud $(TEST_OUT) --seconds 2 --status-item --hud-first; \
+	run "recording flow"         --selftest-record-flow $(TEST_OUT) --seconds 2; \
 	printf '  %-26s ' "exclusion negative control"; \
 	if "$(EXEC)" --selftest-overlay 400,300,640,400 --sharing-default --no-exclude >/dev/null 2>&1; \
 		then echo "BROKEN — the control passed, so the exclusion test cannot fail"; fail=1; \

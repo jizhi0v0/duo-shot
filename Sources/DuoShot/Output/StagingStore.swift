@@ -34,6 +34,19 @@ final class StagingStore {
         return url
     }
 
+    /// Reserves a staging path for a file that does not exist yet.
+    ///
+    /// A recording is written *by ScreenCaptureKit*, straight into staging, so
+    /// unlike a screenshot there is nothing to encode and hand over — the path
+    /// has to exist before the take starts. Everything after that is identical:
+    /// one file, and "save" is a move.
+    func reserve(fileExtension: String, at date: Date = .now) -> URL {
+        let name = FilenameFormatter.filename(
+            date: date, template: Preferences.shared.filenameTemplate,
+            fileExtension: fileExtension)
+        return uniqueURL(for: name)
+    }
+
     /// "Save" is a move, not a re-encode: atomic and instant.
     func move(_ url: URL, to directory: URL) throws -> URL {
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -89,6 +102,19 @@ enum FilenameFormatter {
         for result: CaptureResult, template: String, contentType: UTType
     ) -> String {
         format(template: template, date: result.capturedAt, contentType: contentType)
+    }
+
+    /// A name for an output that is not a screenshot, so has no `UTType` in the
+    /// project's image-format sense.
+    static func filename(date: Date, template: String, fileExtension: String) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = strftimeToUnicode(template)
+        var stem = formatter.string(from: date)
+        if stem.trimmingCharacters(in: .whitespaces).isEmpty {
+            formatter.dateFormat = strftimeToUnicode(defaultTemplate)
+            stem = formatter.string(from: date)
+        }
+        return "\(stem).\(fileExtension)"
     }
 
     /// What the Settings window shows under the template field.

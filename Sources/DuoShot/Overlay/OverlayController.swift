@@ -33,6 +33,7 @@ final class OverlayController {
     private var ticksSinceEnumeration = 0
     private var isEnumerating = false
     private var mode: SelectionMode = .area
+    private var allowsWindowMode = true
 
     /// Re-enumerates the pickable windows while the overlay is up.
     ///
@@ -50,12 +51,15 @@ final class OverlayController {
         Set(panels.map { CGWindowID($0.windowNumber) })
     }
 
-    func present(mode initialMode: SelectionMode, windows: [WindowInfo]) async -> Outcome {
+    func present(
+        mode initialMode: SelectionMode, windows: [WindowInfo], allowsWindowMode: Bool = true
+    ) async -> Outcome {
         if isPresenting { dismiss(resumingWith: .cancelled) }
 
         let frontmostBefore = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
 
         mode = initialMode
+        self.allowsWindowMode = allowsWindowMode
         model.reset()
 
         let refresh: () -> Void = { [weak self] in self?.views.forEach { $0.refresh() } }
@@ -73,6 +77,7 @@ final class OverlayController {
             let view = OverlayView(
                 screen: screen, model: model, picker: picker, callbacks: callbacks)
             view.mode = mode
+            view.allowsWindowMode = allowsWindowMode
             let panel = OverlayPanel(screen: screen, view: view)
             // Registered BEFORE it goes on screen. Ordering a window can throw
             // (see `ordering`), and an exception here must not leave a panel that
@@ -166,6 +171,7 @@ final class OverlayController {
     // MARK: - Mode
 
     private func toggleMode() {
+        guard allowsWindowMode else { return }
         mode = mode.toggled
         model.reset()
         picker.reset()

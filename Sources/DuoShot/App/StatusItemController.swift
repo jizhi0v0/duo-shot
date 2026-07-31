@@ -4,12 +4,16 @@ import AppKit
 final class StatusItemController: NSObject, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private let coordinator: CaptureCoordinator
+    private let recorder: RecordingCoordinator
     private var lastOutput: OutputPipeline.Output?
+    private var lastRecording: OutputPipeline.RecordingOutput?
+    private var recordingTicker: Timer?
 
     var onOpenSettings: () -> Void = {}
 
-    init(coordinator: CaptureCoordinator) {
+    init(coordinator: CaptureCoordinator, recorder: RecordingCoordinator) {
         self.coordinator = coordinator
+        self.recorder = recorder
         super.init()
     }
 
@@ -33,14 +37,76 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         statusItem?.menu = buildMenu()
     }
 
+    func noteRecording(_ output: OutputPipeline.RecordingOutput) {
+        lastRecording = output
+        statusItem?.menu = buildMenu()
+    }
+
+    /// Reflects the recorder's state in the menu bar.
+    ///
+    /// Safe to show a live timer up here: measured (M9), a stream never renders
+    /// the capturing process's own windows, and the status item is one of ours —
+    /// so a running clock does not end up inside a fullscreen recording.
+    func refreshRecordingState() {
+        recordingTicker?.invalidate()
+        recordingTicker = nil
+        guard let button = statusItem?.button else { return }
+
+        if recorder.isRecording {
+            button.image = NSImage(
+                systemSymbolName: "stop.circle.fill", accessibilityDescription: "Stop recording")
+            button.image?.isTemplate = true
+            updateRecordingTitle()
+            let ticker = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.updateRecordingTitle() }
+            }
+            // `.common`, or the clock freezes whenever a menu is open or a
+            // window is being dragged — constantly, during a screen recording.
+            RunLoop.main.add(ticker, forMode: .common)
+            recordingTicker = ticker
+        } else {
+            button.image = NSImage(
+                systemSymbolName: "camera.viewfinder", accessibilityDescription: "DuoShot")
+            button.image?.isTemplate = true
+            button.title = ""
+        }
+        statusItem?.menu = buildMenu()
+    }
+
+    private func updateRecordingTitle() {
+        let total = Int(recorder.elapsed)
+        statusItem?.button?.title = String(format: " %d:%02d", total / 60, total % 60)
+    }
+
     // MARK: - Menu
 
     private func buildMenu() -> NSMenu {
         let menu = NSMenu()
         menu.delegate = self
 
+        // While a take is running the only thing worth offering is ending it.
+        // A menu full of capture actions that all silently refuse is worse than
+        // a short menu.
+        if recorder.isRecording {
+            let stop = NSMenuItem(
+                title: "Stop Recording", action: #selector(stopRecording), keyEquivalent: "")
+            stop.target = self
+            menu.addItem(stop)
+            let discard = NSMenuItem(
+                title: "Discard Recording", action: #selector(discardRecording), keyEquivalent: "")
+            discard.target = self
+            menu.addItem(discard)
+            menu.addItem(.separator())
+            let quit = NSMenuItem(
+                title: "Quit DuoShot", action: #selector(NSApplication.terminate(_:)),
+                keyEquivalent: "q")
+            menu.addItem(quit)
+            return menu
+        }
+
         var actions: [HotKeyAction] = [.captureArea, .captureWindow, .captureFullscreen]
         if coordinator.hasPreviousArea { actions.append(.captureLastArea) }
+        actions.append(contentsOf: [.recordArea, .recordFullscreen])
         for action in actions {
             let item = NSMenuItem(
                 title: action.title, action: #selector(trigger(_:)), keyEquivalent: "")
@@ -55,6 +121,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
+
+        if let lastRecording {
+            let reveal = NSMenuItem(
+                title: "Show \"\(lastRecording.url.lastPathComponent)\" in Finder",
+                action: #selector(revealLastRecording), keyEquivalent: "")
+            reveal.target = self
+            menu.addItem(reveal)
+            menu.addItem(.separator())
+        }
 
         if let lastOutput {
             let reveal = NSMenuItem(
@@ -100,7 +175,22 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             await coordinator.captureDisplay()
         case .captureLastArea:
             await coordinator.captureLastArea()
+        case .recordArea, .recordFullscreen:
+            await recorder.perform(action)
         }
+    }
+
+    @objc private func stopRecording() {
+        Task { await self.recorder.stop() }
+    }
+
+    @objc private func discardRecording() {
+        Task { await self.recorder.discard() }
+    }
+
+    @objc private func revealLastRecording() {
+        guard let lastRecording else { return }
+        OutputPipeline.shared.reveal(lastRecording.url)
     }
 
     @objc private func revealLast() {

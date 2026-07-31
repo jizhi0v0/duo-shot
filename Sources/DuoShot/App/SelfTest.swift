@@ -52,6 +52,28 @@ enum SelfTest {
         /// Repeated captures through the whole pipeline, watching memory and the
         /// staging store.
         case soak(iterations: Int, directory: URL)
+        /// Reports the microphone grant and, if undecided, asks for it.
+        ///
+        /// Separate from `record` and meant to be run through LaunchServices,
+        /// for the same reason `--selftest-permission` is: TCC addresses its
+        /// prompt to the *responsible* process, so a shell-launched request is
+        /// attributed to the terminal's ancestor and the dialog never reaches
+        /// the user. See `make mic-check`.
+        case microphone
+        /// The recording pipeline end to end, headless: SCStream + SCRecordingOutput
+        /// write a real file, a stream's `sourceRect` crops where we think, and
+        /// the audio tracks asked for are the ones that show up.
+        case record(
+            directory: URL, seconds: Double, rect: CGRect?,
+            audio: Bool, microphone: Bool, fps: Int)
+        /// The whole recording flow through the coordinator: toggle semantics,
+        /// the state machine, the HUD's lifetime, and the discard path.
+        case recordFlow(directory: URL, seconds: Double)
+        /// Whether the recording HUD — a window that appears *after* the stream
+        /// is already running — ends up inside the recording.
+        case recordHUD(
+            directory: URL, seconds: Double, sharingNone: Bool, hudFirst: Bool,
+            plainWindow: Bool, statusItem: Bool)
 
         init?(arguments: [String]) {
             let rest = arguments.dropFirst()
@@ -92,6 +114,50 @@ enum SelfTest {
                 self = .soak(
                     iterations: positional().flatMap(Int.init) ?? 100,
                     directory: URL(fileURLWithPath: value(for: "--out") ?? "build/soak"))
+            case "--selftest-record-flow":
+                self = .recordFlow(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"),
+                    seconds: value(for: "--seconds").flatMap(Double.init) ?? 2)
+            case "--selftest-record-hud":
+                // NOTE the default: `.readOnly`, not the shipping `.none`.
+                //
+                // `.none` makes a window invisible to ScreenCaptureKit outright
+                // (M2), which blinds the screenshot this test uses as its
+                // control — and a test whose control cannot see the target is a
+                // test that cannot fail. So the harder configuration is the
+                // default here: leave the window fully capturable and assert it
+                // still never reaches the video. `--sharing-none` runs the
+                // shipping configuration, which is necessarily INCONCLUSIVE.
+                self = .recordHUD(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"),
+                    seconds: value(for: "--seconds").flatMap(Double.init) ?? 3,
+                    sharingNone: rest.contains("--sharing-none"),
+                    // Shows the HUD *before* the stream is built, which is the
+                    // A/B for "does a display filter see windows that did not
+                    // exist when it was created".
+                    hudFirst: rest.contains("--hud-first"),
+                    // Swaps the HUD for the most ordinary window AppKit can
+                    // make: titled, .normal level, default everything. Tells
+                    // "our panel is configured oddly" apart from "a stream does
+                    // not render the capturing process's own windows".
+                    plainWindow: rest.contains("--plain-window"),
+                    // The menu-bar item is our window too. If a stream drops
+                    // every window this process owns, our own status item
+                    // vanishes from a fullscreen recording — which decides
+                    // whether a running timer can live up there.
+                    statusItem: rest.contains("--status-item"))
+            case "--selftest-microphone":
+                self = .microphone
+            case "--selftest-record":
+                self = .record(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"),
+                    seconds: value(for: "--seconds").flatMap(Double.init) ?? 3,
+                    // No --rect means the whole display, which is the other mode
+                    // rather than a degenerate case of this one.
+                    rect: value(for: "--rect").flatMap(Self.parseRect),
+                    audio: !rest.contains("--no-audio"),
+                    microphone: rest.contains("--mic"),
+                    fps: value(for: "--fps").flatMap(Int.init) ?? 60)
             case "--selftest-settings-resize":
                 self = .settingsResize
             case "--selftest-settings-window":
@@ -155,6 +221,17 @@ enum SelfTest {
             case .lifecycle(let iterations): return try await lifecycle(iterations: iterations)
             case .soak(let iterations, let directory):
                 return try await soak(iterations: iterations, into: directory)
+            case .microphone: return await microphoneCheck()
+            case .recordFlow(let directory, let seconds):
+                return try await recordFlow(into: directory, seconds: seconds)
+            case .recordHUD(let d, let seconds, let sharingNone, let hudFirst, let plain, let status):
+                return try await recordHUD(
+                    into: d, seconds: seconds, sharingNone: sharingNone,
+                    hudFirst: hudFirst, plainWindow: plain, statusItem: status)
+            case .record(let directory, let seconds, let rect, let audio, let microphone, let fps):
+                return try await recordCheck(
+                    into: directory, seconds: seconds, rect: rect,
+                    audio: audio, microphone: microphone, fps: fps)
             }
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? "\(error)"
@@ -2422,6 +2499,704 @@ enum SelfTest {
                 at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         }
         return try await SCKBridge.captureScreenshot(filter: filter, configuration: configuration)
+    }
+
+    // MARK: - Microphone
+
+    /// Peak and RMS of a file's audio track, decoded to float PCM.
+    ///
+    /// Exists because "the file has an audio track" and "the file has audio in
+    /// it" are different claims, and only the second one is the feature. A track
+    /// of digital silence is exactly what a dropped microphone looks like from
+    /// the container's point of view — and a real microphone in a quiet room
+    /// still sits well above zero, so the noise floor is the signal here.
+    private static func audioLevels(
+        of url: URL
+    ) async throws -> (peak: Double, rms: Double, samples: Int)? {
+        let asset = AVURLAsset(url: url)
+        guard let track = try await asset.loadTracks(withMediaType: .audio).first else {
+            return nil
+        }
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(
+            track: track,
+            outputSettings: [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVLinearPCMBitDepthKey: 32,
+                AVLinearPCMIsFloatKey: true,
+                AVLinearPCMIsNonInterleaved: false,
+                AVLinearPCMIsBigEndianKey: false,
+            ])
+        guard reader.canAdd(output) else { return nil }
+        reader.add(output)
+        guard reader.startReading() else { return nil }
+
+        var peak = 0.0
+        var sumOfSquares = 0.0
+        var count = 0
+        while let sample = output.copyNextSampleBuffer() {
+            guard let block = CMSampleBufferGetDataBuffer(sample) else { continue }
+            var length = 0
+            var pointer: UnsafeMutablePointer<CChar>?
+            guard
+                CMBlockBufferGetDataPointer(
+                    block, atOffset: 0, lengthAtOffsetOut: nil,
+                    totalLengthOut: &length, dataPointerOut: &pointer) == noErr,
+                let pointer
+            else { continue }
+            let floats = UnsafeRawPointer(pointer)
+                .bindMemory(to: Float.self, capacity: length / MemoryLayout<Float>.size)
+            for index in 0..<(length / MemoryLayout<Float>.size) {
+                let value = Double(abs(floats[index]))
+                peak = max(peak, value)
+                sumOfSquares += value * value
+                count += 1
+            }
+        }
+        guard count > 0 else { return (0, 0, 0) }
+        return (peak, (sumOfSquares / Double(count)).squareRoot(), count)
+    }
+
+    /// Accumulates audio levels from a realtime tap.
+    ///
+    /// `nonisolated` and lock-guarded because `installTap` calls back on an
+    /// audio render thread, which is nobody's actor.
+    private nonisolated final class LevelMeter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var peak = 0.0
+        private var sumOfSquares = 0.0
+        private var count = 0
+
+        func add(_ buffer: AVAudioPCMBuffer) {
+            guard let channels = buffer.floatChannelData else { return }
+            let frames = Int(buffer.frameLength)
+            var localPeak = 0.0
+            var localSum = 0.0
+            var localCount = 0
+            for channel in 0..<Int(buffer.format.channelCount) {
+                let samples = channels[channel]
+                for frame in 0..<frames {
+                    let value = Double(abs(samples[frame]))
+                    localPeak = max(localPeak, value)
+                    localSum += value * value
+                    localCount += 1
+                }
+            }
+            lock.withLock {
+                peak = max(peak, localPeak)
+                sumOfSquares += localSum
+                count += localCount
+            }
+        }
+
+        var snapshot: (peak: Double, rms: Double, samples: Int) {
+            lock.withLock {
+                guard count > 0 else { return (0, 0, 0) }
+                return (peak, (sumOfSquares / Double(count)).squareRoot(), count)
+            }
+        }
+    }
+
+    /// Measures the default input device through AVAudioEngine — a path that
+    /// does not involve ScreenCaptureKit at all.
+    ///
+    /// This is the control for the microphone question. A silent track inside a
+    /// recording has two possible causes, and only one of them is a bug in our
+    /// code: ScreenCaptureKit dropped the microphone, or the microphone itself
+    /// is producing silence (a wireless receiver with its transmitter switched
+    /// off presents as a perfectly healthy input device and sends zeros). One
+    /// number from outside SCK tells the two apart.
+    private static func inputDeviceLevels(seconds: Double) async -> (peak: Double, rms: Double, samples: Int) {
+        let engine = AVAudioEngine()
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else { return (0, 0, 0) }
+
+        let meter = LevelMeter()
+        // The tap block MUST be spelled `@Sendable`, and this is not a formality.
+        // `AVAudioNodeTapBlock` carries no Sendable annotation in the SDK, so
+        // under the module's MainActor default isolation an inline closure is
+        // inferred MainActor-isolated and the compiler plants an executor check
+        // in it — which then fires on the audio render thread:
+        //
+        //   BUG IN CLIENT OF LIBDISPATCH: Assertion failed:
+        //   Block was expected to execute on queue [com.apple.main-thread]
+        //
+        // Third time this project has met the same shape: an AppKit/AVF callback
+        // that is documented to arrive on some other thread, silently adopting
+        // MainActor because nothing in the header says otherwise.
+        let tap: @Sendable (AVAudioPCMBuffer, AVAudioTime) -> Void = { buffer, _ in
+            meter.add(buffer)
+        }
+        input.installTap(onBus: 0, bufferSize: 4096, format: format, block: tap)
+        do {
+            try engine.start()
+        } catch {
+            print("input-device:  could not start the audio engine: \(error.localizedDescription)")
+            return (0, 0, 0)
+        }
+        try? await Task.sleep(for: .seconds(seconds))
+        engine.stop()
+        input.removeTap(onBus: 0)
+        return meter.snapshot
+    }
+
+    private static func microphoneCheck() async -> Int32 {
+        let before = MicrophonePermission.statusDescription
+        print("microphone:    \(before)")
+        print("usage-string:  "
+            + (Bundle.main.object(forInfoDictionaryKey: "NSMicrophoneUsageDescription") != nil
+                ? "present" : "MISSING — the process is killed, not denied, on first use"))
+        print("parent:        \(parentProcessName())")
+
+        let granted = await MicrophonePermission.request()
+        let after = MicrophonePermission.statusDescription
+        print("after request: \(after)")
+
+        if granted {
+            let device = AVCaptureDevice.default(for: .audio)
+            print("input-device:  \(device?.localizedName ?? "<none>")")
+            let levels = await inputDeviceLevels(seconds: 3)
+            print(String(
+                format: "input-levels:  peak %.5f  rms %.5f  (%d samples) -> %@",
+                levels.peak, levels.rms, levels.samples,
+                levels.rms < 0.00003
+                    ? "SILENT — this device is sending zeros, so a silent recording is not SCK's doing"
+                    : "has signal"))
+        }
+        if getppid() != 1 {
+            print("""
+                WARNING:       launched from a shell, so TCC attributes the prompt to an ancestor
+                               process — measured 2026-07-31, a request made this way was addressed
+                               to the terminal's parent app and never reached the user, leaving
+                               SCStream.startCapture hanging forever. Use `make mic-check`.
+                """)
+        }
+
+        // To os_log as well: a LaunchServices launch is the only one that proves
+        // the attribution, and it has no stdout to read.
+        Log.record.notice("""
+            selftest-microphone: before=\(before, privacy: .public) \
+            after=\(after, privacy: .public) parent=\(parentProcessName(), privacy: .public)
+            """)
+        return granted ? 0 : 1
+    }
+
+    // MARK: - Recording flow
+
+    /// Drives `RecordingCoordinator` the way the hotkey does, and checks the
+    /// things a human would otherwise have to notice: that the same binding
+    /// stops what it started, that the HUD lives exactly as long as the take,
+    /// and that discarding leaves nothing behind.
+    private static func recordFlow(into directory: URL, seconds: Double) async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+        if let hint = LoginSession.noDisplaysHint {
+            FileHandle.standardError.write(Data("error: \(hint)\n".utf8))
+            return 2
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        // The test must not reach into the user's session. Their clipboard is
+        // theirs, and a shutter sound from a background self-test is the kind of
+        // thing that makes a test suite unrunnable.
+        let preferences = Preferences.shared
+        let savedClipboard = preferences.copyToClipboard
+        let savedSound = preferences.playsSound
+        preferences.copyToClipboard = false
+        preferences.playsSound = false
+        defer {
+            preferences.copyToClipboard = savedClipboard
+            preferences.playsSound = savedSound
+        }
+
+        let recorder = RecordingCoordinator(overlay: OverlayController())
+        recorder.saveDirectoryOverride = directory
+        var outputs: [OutputPipeline.RecordingOutput] = []
+        recorder.onResult = { outputs.append($0) }
+
+        var failures: [String] = []
+        func check(_ condition: Bool, _ description: String) {
+            print("  \(condition ? "ok  " : "FAIL") \(description)")
+            if !condition { failures.append(description) }
+        }
+
+        // --- the toggle ---------------------------------------------------
+        await recorder.perform(.recordFullscreen)
+        check(recorder.isRecording, "the binding started a recording")
+        check(recorder.hudIsVisibleForTest, "the HUD is on screen while recording")
+        let staged = recorder.stagedURLForTest
+        check(staged?.deletingLastPathComponent() == StagingStore.shared.directory,
+              "the take is being written into staging, not straight to the save folder")
+
+        try await Task.sleep(for: .seconds(seconds))
+
+        // The same action again: this is what makes it a toggle rather than a
+        // way to end up with two streams.
+        await recorder.perform(.recordFullscreen)
+        check(!recorder.isRecording, "the same binding stopped it")
+        check(!recorder.hudIsVisibleForTest, "the HUD came down with it")
+        check(outputs.count == 1, "exactly one output was produced (got \(outputs.count))")
+
+        if let output = outputs.first {
+            let exists = FileManager.default.fileExists(atPath: output.url.path)
+            check(exists, "the file exists at \(output.url.lastPathComponent)")
+            check(output.url.deletingLastPathComponent().standardizedFileURL
+                    == directory.standardizedFileURL,
+                  "it was moved to the save directory")
+            check(!FileManager.default.fileExists(atPath: staged?.path ?? ""),
+                  "staging no longer holds a copy")
+            let asset = AVURLAsset(url: output.url)
+            let duration = (try? await asset.load(.duration))?.seconds ?? 0
+            let tracks = (try? await asset.loadTracks(withMediaType: .video)) ?? []
+            check(duration >= seconds * 0.5,
+                  String(format: "it is %.2fs long (asked for %.1fs)", duration, seconds))
+            check(!tracks.isEmpty, "it has a video track")
+        }
+
+        // --- discard ------------------------------------------------------
+        await recorder.perform(.recordFullscreen)
+        check(recorder.isRecording, "a second recording started")
+        let discarded = recorder.stagedURLForTest
+        try await Task.sleep(for: .seconds(1))
+        await recorder.discard()
+        check(!recorder.isRecording, "discard ended it")
+        check(!recorder.hudIsVisibleForTest, "discard took the HUD down")
+        check(outputs.count == 1, "discard produced no output (still \(outputs.count))")
+        check(!FileManager.default.fileExists(atPath: discarded?.path ?? "/nonexistent"),
+              "discard deleted the file")
+
+        print("result:        \(failures.isEmpty ? "PASS" : "FAIL — " + failures.joined(separator: "; "))")
+        return failures.isEmpty ? 0 : 1
+    }
+
+    // MARK: - HUD exclusion
+
+    /// Whether our own on-screen controls end up inside the recording.
+    ///
+    /// **This is not the same question the screenshot tests answered.** There,
+    /// exclusion rests on `SCContentFilter(display:excludingWindows:)`, and the
+    /// filter is fixed when the capture is made — the panels are already on
+    /// screen and already in the list. A recording's filter is fixed when the
+    /// *stream starts*, and the HUD appears afterwards, so it can never be in
+    /// that list. Whether `sharingType = .none` covers a window created after a
+    /// stream is running is a genuinely different claim, and M2 did not test it.
+    ///
+    /// Method as in M2: the HUD paints itself flat magenta, the recording is
+    /// sampled, and the frame is counted for magenta. `--sharing-default` is the
+    /// negative control — with it the HUD *must* show up, or a clean run proves
+    /// nothing at all.
+    /// A plain magenta window, as ordinary as AppKit allows.
+    private static func makePlainMagentaWindow(on screen: NSScreen?) -> NSWindow {
+        let size = RecordingHUDView.barSize
+        let target = screen ?? NSScreen.main ?? NSScreen.screens[0]
+        let window = NSWindow(
+            contentRect: CGRect(
+                x: target.frame.midX - size.width / 2,
+                y: target.visibleFrame.minY + 24,
+                width: size.width, height: size.height),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false)
+        let view = NSView(frame: CGRect(origin: .zero, size: size))
+        view.wantsLayer = true
+        view.layer?.backgroundColor = NSColor.magenta.cgColor
+        window.contentView = view
+        window.backgroundColor = .magenta
+        window.orderFrontRegardless()
+        return window
+    }
+
+    private static func recordHUD(
+        into directory: URL, seconds: Double, sharingNone: Bool, hudFirst: Bool,
+        plainWindow: Bool, statusItem useStatusItem: Bool
+    ) async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+        if let hint = LoginSession.noDisplaysHint {
+            FileHandle.standardError.write(Data("error: \(hint)\n".utf8))
+            return 2
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        RecordingHUDPanel.usesSharingTypeNone = sharingNone
+        RecordingHUDView.debugFillsMagenta = true
+
+        let displayID = ScreenIndex.screenUnderMouse().flatMap(ScreenIndex.displayID(of:))
+            ?? CGMainDisplayID()
+        let screen = ScreenIndex.screen(for: displayID)
+
+        var options = RecordingOptions.default
+        options.capturesSystemAudio = false
+        options.capturesMicrophone = false
+
+        let url = directory.appendingPathComponent("record-hud.mp4")
+        try? FileManager.default.removeItem(at: url)
+
+        let engine = RecordingEngine()
+        let hud = RecordingHUD()
+
+        // Default order is HUD *after* the stream is running, because that is
+        // what the app will actually do and it is the case `excludingWindows`
+        // cannot cover. `--hud-first` flips it, which is how the two are told
+        // apart when the control refuses to respond.
+        var recording: ActiveRecording?
+        var plain: NSWindow?
+        var status: NSStatusItem?
+        func showSurface() {
+            if useStatusItem {
+                let item = NSStatusBar.system.statusItem(withLength: 44)
+                let swatch = NSImage(size: NSSize(width: 40, height: 18), flipped: false) { rect in
+                    NSColor.magenta.setFill()
+                    rect.fill()
+                    return true
+                }
+                // Templates are recoloured by AppKit; this one has to keep the
+                // exact magenta the counter is looking for.
+                swatch.isTemplate = false
+                item.button?.image = swatch
+                status = item
+            } else if plainWindow {
+                plain = makePlainMagentaWindow(on: screen)
+            } else {
+                // The bar is in magenta debug mode, where `update` is a no-op,
+                // so there is nothing for the ticker to read.
+                hud.show(on: screen, elapsed: { 0 })
+            }
+        }
+        if hudFirst {
+            showSurface()
+            try await Task.sleep(for: .milliseconds(400))
+            recording = try await engine.start(.display(displayID), options: options, to: url)
+        } else {
+            recording = try await engine.start(.display(displayID), options: options, to: url)
+            showSurface()
+        }
+        guard recording != nil else { return 1 }
+        let hudFrame = status?.button?.window?.frame ?? plain?.frame ?? hud.frameForTest ?? .zero
+        let surfaceName =
+            if useStatusItem { "NSStatusItem (menu bar, our process's window)" }
+            else if plainWindow { "plain NSWindow (.normal level, titled)" }
+            else { "RecordingHUDPanel (.statusBar, nonactivating)" }
+        print("surface:       \(surfaceName)")
+        print("order:         HUD shown \(hudFirst ? "BEFORE" : "AFTER") the stream started")
+        print("hud:           \(rectString(hudFrame)) sharingType=\(sharingNone ? "none" : "readOnly")")
+
+        // Cross-check through the screenshot path before judging the video.
+        // "No magenta in the frame" has two causes and only one is about
+        // exclusion: the HUD may simply not be painting. A still capture, taken
+        // with the already-proven pipeline and nothing excluded, separates them
+        // — and without it a negative control that fails to respond is
+        // indistinguishable from one that responds correctly.
+        try await Task.sleep(for: .milliseconds(600))
+        let capture = CaptureEngine()
+        try await capture.refreshContent()
+        var stillOptions = CaptureOptions.default
+        stillOptions.excludedWindowIDs = []
+        let still = try await capture.capture(.display(displayID), options: stillOptions)
+        let stillMagenta = PixelCompare.count(still.image, matching: PixelCompare.isDebugMagenta)
+        try? ImageEncoder.write(
+            still.image,
+            to: directory.appendingPathComponent(
+                "record-hud-still-\(sharingNone ? "sharing-none" : "readonly").png"),
+            as: .png, scale: still.scale)
+        print("still capture: \(stillMagenta) px magenta "
+            + "(is the HUD painting at all, and does a *screenshot* see it)")
+
+        // Let the window server actually composite it. A fixed sleep here was
+        // the flaky part of the M2 overlay test; the recording is long enough
+        // that a generous settle is cheaper than a poll.
+        try await Task.sleep(for: .seconds(seconds))
+        let result = try await engine.stop()
+        hud.hide()
+        plain?.orderOut(nil)
+        plain = nil
+        if let status { NSStatusBar.system.removeStatusItem(status) }
+        status = nil
+
+        let asset = AVURLAsset(url: url)
+        let duration = try await asset.load(.duration)
+        guard duration.seconds > 0 else {
+            print("result:        FAIL — the recording has no duration")
+            return 1
+        }
+
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        let (frame, actual) = try await generator.image(
+            at: CMTime(seconds: duration.seconds * 0.6, preferredTimescale: 600))
+        let framePath = directory.appendingPathComponent(
+            "record-hud-\(sharingNone ? "sharing-none" : "readonly").png")
+        try? ImageEncoder.write(frame, to: framePath, as: .png, scale: result.scale)
+
+        // What is in the video where the surface is? "No magenta" alone cannot
+        // distinguish "the window was excluded and we see the desktop behind
+        // it" from "the frame is broken". The luminance of that exact rect
+        // answers it: desktop content is mid-grey, a broken frame is black, and
+        // flat magenta is ~73 (Rec. 709 luma of 255,0,255).
+        let surfaceInPixels = DisplayGeometry.flipped(hudFrame)
+            .applying(CGAffineTransform(scaleX: result.scale, y: result.scale))
+        let videoLuma = PixelCompare.meanLuminance(frame, in: surfaceInPixels)
+        let stillLuma = PixelCompare.meanLuminance(still.image, in: surfaceInPixels)
+        print(String(
+            format: "surface rect:  luminance in video %.1f vs in screenshot %.1f (flat magenta measures 72.6)",
+            videoLuma ?? -1, stillLuma ?? -1))
+
+        let magenta = PixelCompare.count(frame, matching: PixelCompare.isDebugMagenta)
+        // How much magenta a fully visible HUD is worth, so "0" can be read
+        // against something rather than admired on its own.
+        let expected = Int(hudFrame.width * hudFrame.height * result.scale * result.scale)
+        print("frame:         t=\(String(format: "%.2f", actual.seconds))s "
+            + "\(frame.width)x\(frame.height) px -> \(framePath.lastPathComponent)")
+        print("magenta:       \(magenta) px in the video, \(stillMagenta) px in the screenshot "
+            + "(window rect would hold ~\(expected) px)")
+
+        // The control is the still capture, NOT `sharingType`.
+        //
+        // The first version of this test used `--sharing-default` as the
+        // negative control, on the assumption that `sharingType = .none` was
+        // what kept the HUD out — the mechanism M2 established for screenshots.
+        // It is not: measured 2026-07-31, a plain titled `.normal`-level window
+        // with the default `.readOnly` sharing is absent from the recording too,
+        // and the video shows the desktop behind it. A stream does not render
+        // the capturing process's own windows at all, so toggling `sharingType`
+        // can never make this test respond and a control built on it is dead.
+        //
+        // What does control it: the same magenta, the same counter, the same
+        // instant, through the screenshot path. If the still sees the surface
+        // and the video does not, the difference is the stream.
+        // The control sets the expectation, not an estimate from the window
+        // rect. A status item paints a 40x18 pt swatch inside a wider window, so
+        // an area-derived threshold called a perfectly good measurement
+        // inconclusive. What the screenshot actually found is the number the
+        // video has to be judged against.
+        let surfaceIsOnScreen = stillMagenta > 500
+        let leaked = magenta > max(stillMagenta / 20, 100)
+        guard surfaceIsOnScreen else {
+            // With `.none` this is the expected, correct outcome and not a
+            // defect: the window is invisible to every ScreenCaptureKit path,
+            // screenshot included, so there is nothing left to compare.
+            print("result:        INCONCLUSIVE — the surface is not visible to ScreenCaptureKit at all "
+                + "(\(stillMagenta) px in the screenshot)"
+                + (sharingNone ? ", which is what sharingType = .none means" : ""))
+            return sharingNone ? 0 : 1
+        }
+        print("result:        \(leaked ? "FAIL" : "PASS") — "
+            + (leaked
+                ? "the surface was recorded"
+                : "on screen (\(stillMagenta) px in the screenshot) and absent from the recording"))
+        return leaked ? 1 : 0
+    }
+
+    // MARK: - Recording
+
+    /// The recording equivalent of `--selftest-rect`, and the first thing worth
+    /// writing for phase 2: it settles, with no UI at all, whether
+    /// `SCStream` + `SCRecordingOutput` produces a real file, what a stream's
+    /// `sourceRect` actually crops, and how long start and finalisation take.
+    ///
+    /// The geometry claim is made **relatively**, against a deliberately offset
+    /// control, rather than against an absolute threshold. H.264 is lossy, so a
+    /// correctly aligned frame will never match a PNG screenshot the way two
+    /// screenshots match each other — an absolute bound would be a number picked
+    /// to make the test pass. A wrong `sourceRect` has to look like the offset
+    /// control, and that comparison stays honest whatever the bitrate.
+    private static func recordCheck(
+        into directory: URL, seconds: Double, rect: CGRect?,
+        audio: Bool, microphone: Bool, fps: Int
+    ) async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+        if let hint = LoginSession.noDisplaysHint {
+            FileHandle.standardError.write(Data("error: \(hint)\n".utf8))
+            return 2
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let capture = CaptureEngine()
+        try await capture.refreshContent()
+        let displayID = ScreenIndex.screenUnderMouse().flatMap(ScreenIndex.displayID(of:))
+            ?? CGMainDisplayID()
+
+        // The engine silently drops the microphone when the grant is undecided,
+        // because letting SCK meet that state hangs `startCapture` outright. The
+        // test has to know which of the two it is measuring, or a downgraded run
+        // reads as "audio is broken".
+        let microphoneEffective = microphone && MicrophonePermission.isGranted
+        if microphone {
+            print("microphone:    grant is \(MicrophonePermission.statusDescription)"
+                + (microphoneEffective ? "" : " — recording without it"))
+        }
+
+        var options = RecordingOptions.default
+        options.capturesSystemAudio = audio
+        options.capturesMicrophone = microphone
+        options.frameRate = fps
+
+        let request: RecordingRequest = rect.map {
+            .area(displayID: displayID, rectInAppKitGlobal: $0)
+        } ?? .display(displayID)
+        let url = directory.appendingPathComponent("record-\(request.kind).\(options.fileExtension)")
+        try? FileManager.default.removeItem(at: url)
+
+        print("display:       \(ScreenIndex.describe(ScreenIndex.screen(for: displayID) ?? .main!))")
+        print("request:       \(request.kind)\(rect.map { " " + rectString($0) } ?? "")")
+
+        let engine = RecordingEngine()
+        let startClock = ContinuousClock.now
+        let recording = try await engine.start(request, options: options, to: url)
+        let startLatency = startClock.duration(to: .now)
+        print("start:         \(milliseconds(startLatency)) ms to first written frame")
+        print("expected:      \(Int(recording.pixelSize.width))x\(Int(recording.pixelSize.height)) px "
+            + "from \(Int(recording.pointSize.width))x\(Int(recording.pointSize.height)) pt "
+            + "@\(recording.scale)x")
+
+        // Halfway through, photograph the same region through the already-proven
+        // screenshot path, twice, ~120 ms apart. Two shots because comparing a
+        // video frame against live screen content is only meaningful if the
+        // content was not moving — the same sandwich `--selftest-rect` uses.
+        let recordingStart = ContinuousClock.now
+        try await Task.sleep(for: .seconds(seconds / 2))
+
+        let probeRect = rect ?? DisplayGeometry.flipped(CGDisplayBounds(displayID))
+        let offsetRect = probeRect.offsetBy(dx: 0, dy: min(200, probeRect.height))
+        let probeOffset = recordingStart.duration(to: .now).seconds
+
+        let aligned = try await capture.capture(
+            .area(displayID: displayID, rectInAppKitGlobal: probeRect))
+        try await Task.sleep(for: .milliseconds(120))
+        let alignedAgain = try await capture.capture(
+            .area(displayID: displayID, rectInAppKitGlobal: probeRect))
+        let control = try await capture.capture(
+            .area(displayID: displayID, rectInAppKitGlobal: offsetRect))
+
+        try await Task.sleep(for: .seconds(max(0.2, seconds / 2)))
+
+        let stopClock = ContinuousClock.now
+        let result = try await engine.stop()
+        print("stop:          \(milliseconds(stopClock.duration(to: .now))) ms to finalise")
+        print("file:          \(result.url.lastPathComponent) "
+            + "\(byteCount(of: result.url)) duration=\(String(format: "%.2f", result.duration))s")
+
+        // MARK: what the container actually says
+
+        let asset = AVURLAsset(url: result.url)
+        let assetDuration = try await asset.load(.duration)
+        let videoTracks = try await asset.loadTracks(withMediaType: .video)
+        let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+        print("asset:         duration=\(String(format: "%.2f", assetDuration.seconds))s "
+            + "video-tracks=\(videoTracks.count) audio-tracks=\(audioTracks.count)")
+
+        var encodedSize = CGSize.zero
+        var nominalRate: Float = 0
+        if let track = videoTracks.first {
+            encodedSize = try await track.load(.naturalSize)
+            nominalRate = try await track.load(.nominalFrameRate)
+            print("video-track:   \(Int(encodedSize.width))x\(Int(encodedSize.height)) px "
+                + "@\(String(format: "%.1f", nominalRate)) fps nominal")
+        }
+        var audioIsSilent = false
+        if audio || microphoneEffective {
+            print("audio-request: system=\(audio) microphone=\(microphoneEffective) -> "
+                + "\(audioTracks.count) track(s) in the file")
+            if let levels = try await audioLevels(of: result.url) {
+                // -90 dBFS is below any real microphone's noise floor and above
+                // literal zero, so it separates "captured a quiet room" from
+                // "captured nothing".
+                audioIsSilent = levels.rms < 0.00003
+                print(String(
+                    format: "  levels:      peak %.5f  rms %.5f  (%d samples) -> %@",
+                    levels.peak, levels.rms, levels.samples,
+                    audioIsSilent ? "SILENT" : "has signal"))
+            }
+        }
+
+        // MARK: does the frame show the region we asked for
+
+        var geometry = "SKIPPED"
+        var geometryPassed = true
+        if let track = videoTracks.first, assetDuration.seconds > 0 {
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            // Zero tolerance, or the generator is free to hand back a keyframe
+            // from somewhere else entirely and the comparison means nothing.
+            generator.requestedTimeToleranceBefore = .zero
+            generator.requestedTimeToleranceAfter = .zero
+            _ = track
+            let time = CMTime(
+                seconds: min(probeOffset, max(0, assetDuration.seconds - 0.1)),
+                preferredTimescale: 600)
+            let (frame, actual) = try await generator.image(at: time)
+            let framePath = directory.appendingPathComponent("record-frame.png")
+            try? ImageEncoder.write(frame, to: framePath, as: .png, scale: recording.scale)
+            print("frame:         t=\(String(format: "%.2f", actual.seconds))s "
+                + "\(frame.width)x\(frame.height) px -> \(framePath.lastPathComponent)")
+
+            let crop = CGRect(x: 0, y: 0, width: frame.width, height: frame.height)
+            let liveDrift = PixelCompare.compare(
+                aligned.image.cropping(to: crop) ?? aligned.image,
+                alignedAgain.image.cropping(to: crop) ?? alignedAgain.image)
+            let match = PixelCompare.compare(frame, aligned.image.cropping(to: crop) ?? aligned.image)
+            let offset = PixelCompare.compare(frame, control.image.cropping(to: crop) ?? control.image)
+
+            print(String(format: "  live drift:  mean abs diff %.3f (two screenshots 120 ms apart)",
+                         liveDrift.meanAbsoluteDifference))
+            print(String(format: "  aligned:     mean abs diff %.3f  (%.1f%% of pixels)",
+                         match.meanAbsoluteDifference, match.differingFraction * 100))
+            print(String(format: "  offset ctrl: mean abs diff %.3f  (%.1f%% of pixels)",
+                         offset.meanAbsoluteDifference, offset.differingFraction * 100))
+
+            if liveDrift.meanAbsoluteDifference > 4.0 {
+                geometry = "INCONCLUSIVE — the region was repainting during the take"
+            } else if offset.meanAbsoluteDifference < 2.0 {
+                geometry = "INCONCLUSIVE — the offset control matches too, so the region is featureless"
+            } else if match.meanAbsoluteDifference < offset.meanAbsoluteDifference / 3 {
+                geometry = "PASS — the frame is the requested region, not the offset one"
+            } else {
+                geometry = "FAIL — the frame does not favour the requested region"
+                geometryPassed = false
+            }
+            print("  verdict:     \(geometry)")
+        }
+
+        // MARK: verdict
+
+        var failures: [String] = []
+        if videoTracks.isEmpty { failures.append("no video track") }
+        if result.fileSize <= 0 { failures.append("empty file") }
+        if assetDuration.seconds < seconds * 0.5 {
+            failures.append(String(format: "duration %.2fs is far short of the requested %.2fs",
+                                   assetDuration.seconds, seconds))
+        }
+        if !videoTracks.isEmpty, encodedSize != recording.pixelSize {
+            failures.append("encoded \(Int(encodedSize.width))x\(Int(encodedSize.height)) px "
+                + "≠ requested \(Int(recording.pixelSize.width))x\(Int(recording.pixelSize.height)) px")
+        }
+        if (audio || microphoneEffective) && audioTracks.isEmpty {
+            failures.append("audio was requested but the file has no audio track")
+        }
+        // Only asserted for the microphone. System audio is legitimately silent
+        // when nothing is playing, so a silent track proves nothing there.
+        //
+        // And even for the microphone the assertion has to be qualified against
+        // the device itself: measured 2026-07-31, the default input was a
+        // wireless receiver with no transmitter powered on, which presents as a
+        // healthy 48 kHz stereo device and sends nothing but zeros. Blaming SCK
+        // for that would be blaming the wrong layer, so the control decides
+        // between FAIL and INCONCLUSIVE.
+        if microphoneEffective && audioIsSilent {
+            let device = await inputDeviceLevels(seconds: 1)
+            if device.rms < 0.00003 {
+                print("  microphone:  INCONCLUSIVE — \(AVCaptureDevice.default(for: .audio)?.localizedName ?? "the input device")"
+                    + " is itself sending digital silence (rms \(String(format: "%.5f", device.rms)))")
+            } else {
+                failures.append(
+                    "the input device has signal but the recorded microphone track is silence")
+            }
+        }
+        if !geometryPassed { failures.append("geometry") }
+
+        print("result:        \(failures.isEmpty ? "PASS" : "FAIL — " + failures.joined(separator: "; "))")
+        return failures.isEmpty ? 0 : 1
     }
 
     // MARK: - Reporting helpers

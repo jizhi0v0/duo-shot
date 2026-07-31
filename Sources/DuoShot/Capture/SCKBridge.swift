@@ -1,4 +1,5 @@
 import CoreGraphics
+import CoreMedia
 import Foundation
 import ScreenCaptureKit
 
@@ -7,8 +8,9 @@ import ScreenCaptureKit
 //
 // ScreenCaptureKit ships almost no Sendable annotations: `SCScreenshotConfiguration`
 // is NS_SWIFT_SENDABLE, but `SCScreenshotOutput`, `SCContentFilter`, `SCWindow`,
-// `SCDisplay`, `SCRunningApplication` and `SCShareableContent` are not (verified
-// against the macOS 27.0 SDK headers; there are no .apinotes adding them).
+// `SCDisplay`, `SCRunningApplication`, `SCShareableContent`, `SCStream` and
+// `SCRecordingOutput` are not (verified against the macOS 26.5 SDK headers;
+// there are no .apinotes adding them).
 //
 // We deliberately wrap the *completion-handler* variants rather than calling the
 // auto-generated `async` ones. That puts the isolation boundary somewhere we
@@ -27,6 +29,7 @@ nonisolated enum CaptureError: Error, LocalizedError {
     case windowNotFound(CGWindowID)
     case noImageProduced
     case encodingFailed(String)
+    case recordingStartTimedOut(Double)
 
     var errorDescription: String? {
         switch self {
@@ -42,6 +45,8 @@ nonisolated enum CaptureError: Error, LocalizedError {
             "Capture succeeded but produced no image."
         case .encodingFailed(let why):
             "Image encoding failed: \(why)."
+        case .recordingStartTimedOut(let seconds):
+            "ScreenCaptureKit never answered startCapture within \(seconds)s."
         }
     }
 }
@@ -162,5 +167,253 @@ enum SCKBridge {
                 }
             }
         }
+    }
+}
+
+// =============================================================================
+// MARK: - Recording
+//
+// A screenshot is one call with one completion handler. A recording is a live
+// session with two delegate protocols reporting on queues we do not choose, and
+// it has to be startable, stoppable and observable from MainActor code. That is
+// a different shape, and it lives here for the same reason the rest does: this
+// is where SCK's missing Sendability is allowed to be dealt with.
+// =============================================================================
+
+/// A one-shot flag an async caller can wait on.
+///
+/// **Polled, not parked on a continuation, and that is the whole point.** SCK
+/// may simply never fire `recordingOutputDidFinishRecording:`; a continuation
+/// waiting on it would hang forever, and `await`-ing such a continuation cannot
+/// be cancelled out of by a racing timeout task. This is the same lesson the
+/// overlay lifecycle test learned the hard way — a flag you can poll survives
+/// the callback not happening, a continuation does not.
+nonisolated final class SCKLatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isSignalled = false
+    private var failure: (any Error)?
+
+    var signalled: Bool { lock.withLock { isSignalled } }
+    var error: (any Error)? { lock.withLock { failure } }
+
+    /// First call wins: a failure arriving after a success is not allowed to
+    /// rewrite history, and vice versa.
+    func signal(_ error: (any Error)? = nil) {
+        lock.withLock {
+            guard !isSignalled else { return }
+            isSignalled = true
+            failure = error
+        }
+    }
+
+    /// Returns true if the latch opened before the deadline. Throws if it opened
+    /// with an error.
+    @discardableResult
+    func wait(timeout: Duration, poll: Duration = .milliseconds(20)) async throws -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while true {
+            let (opened, failure) = lock.withLock { (isSignalled, self.failure) }
+            if opened {
+                if let failure { throw failure }
+                return true
+            }
+            guard ContinuousClock.now < deadline else { return false }
+            try? await Task.sleep(for: poll)
+        }
+    }
+}
+
+/// One recording: an `SCStream` plus the `SCRecordingOutput` writing it to disk.
+///
+/// `@unchecked Sendable` is honest here in the narrow sense the rest of this
+/// file uses it: every mutable field is behind `lock`, and the two SCK objects
+/// are only ever handed back to SCK.
+nonisolated final class SCKRecordingSession: NSObject, @unchecked Sendable,
+    SCStreamDelegate, SCRecordingOutputDelegate
+{
+    nonisolated struct Stats: Sendable {
+        let duration: TimeInterval
+        let fileSize: Int
+    }
+
+    let outputURL: URL
+
+    /// Opened by `recordingOutputDidStartRecording:` — the writer is live.
+    let writerStarted = SCKLatch()
+    /// Opened by `recordingOutputDidFinishRecording:` — the file is finalised
+    /// and playable. **Not** the same event as the stream stopping: the stream
+    /// stops delivering frames, then the writer flushes and closes the file.
+    let writerFinished = SCKLatch()
+
+    private let lock = NSLock()
+    private var stream: SCStream?
+    private var recordingOutput: SCRecordingOutput?
+    private var isStopping = false
+    /// Last non-zero counters. `SCRecordingOutput` has no documented behaviour
+    /// after finalisation, so the running total is kept rather than trusted to
+    /// still be readable at the end.
+    private var lastStats = Stats(duration: 0, fileSize: 0)
+    private var unexpectedStop: (@Sendable (any Error) -> Void)?
+
+    init(outputURL: URL) {
+        self.outputURL = outputURL
+        super.init()
+    }
+
+    /// Called when the stream or the writer dies on its own — display
+    /// disconnected, disk full, Screen Recording revoked mid-recording.
+    func onUnexpectedStop(_ handler: @escaping @Sendable (any Error) -> Void) {
+        lock.withLock { unexpectedStop = handler }
+    }
+
+    /// Builds the stream, attaches the writer, and starts capturing.
+    ///
+    /// `nonisolated` under NonisolatedNonsendingByDefault, so it runs on the
+    /// caller's executor: the non-Sendable `SCContentFilter` never leaves the
+    /// MainActor region it was built in. Same trick as `captureScreenshot`.
+    ///
+    /// **`startCapture` is given a deadline, and that is not defensive
+    /// programming.** Measured 2026-07-31: with `captureMicrophone = true` and
+    /// the microphone grant still undecided, the completion handler is never
+    /// called at all — not late, never — while the stream itself starts, the
+    /// writer opens the file and frames flow. `replayd` sits waiting on a TCC
+    /// prompt nobody answered. Awaiting that continuation is an unbounded hang
+    /// with a recording running behind it and no way for the user to stop it.
+    func start(
+        filter: SCContentFilter,
+        configuration: SCStreamConfiguration,
+        recording: SCRecordingOutputConfiguration,
+        timeout: Duration = .seconds(10)
+    ) async throws {
+        let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
+        let output = SCRecordingOutput(configuration: recording, delegate: self)
+        // Throws before the stream is running, which is the good case: a bad
+        // output URL or codec fails here rather than half a second into a take.
+        try stream.addRecordingOutput(output)
+        lock.withLock {
+            self.stream = stream
+            self.recordingOutput = output
+        }
+
+        let started = SCKLatch()
+        stream.startCapture { error in started.signal(error) }
+
+        guard try await started.wait(timeout: timeout) else {
+            // Tear the half-started stream down, or it keeps writing to a file
+            // nobody is holding a handle to.
+            lock.withLock { isStopping = true }
+            stream.stopCapture { _ in }
+            lock.withLock {
+                self.stream = nil
+                self.recordingOutput = nil
+            }
+            throw CaptureError.recordingStartTimedOut(timeout.seconds)
+        }
+    }
+
+    /// Live counters, safe to poll from the HUD's timer.
+    var stats: Stats {
+        lock.withLock {
+            guard let recordingOutput else { return lastStats }
+            let time = recordingOutput.recordedDuration
+            let seconds = time.isNumeric ? time.seconds : lastStats.duration
+            let size = recordingOutput.recordedFileSize
+            // Monotonic on purpose: see `lastStats`.
+            let stats = Stats(
+                duration: max(seconds, lastStats.duration),
+                fileSize: max(size, lastStats.fileSize))
+            lastStats = stats
+            return stats
+        }
+    }
+
+    /// Stops the stream and waits for the writer to finalise the file.
+    ///
+    /// The counters are sampled *before* stopping, because the only moment the
+    /// writer is guaranteed to still be able to answer is while it is running.
+    @discardableResult
+    func stop(finaliseTimeout: Duration = .seconds(15)) async throws -> Stats {
+        let stream: SCStream? = lock.withLock {
+            guard !isStopping else { return nil }
+            isStopping = true
+            return self.stream
+        }
+        guard let stream else { return stats }
+
+        let sampled = stats
+
+        do {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                stream.stopCapture { error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
+                }
+            }
+        } catch {
+            // `attemptToStopStreamState` means it had already stopped — which is
+            // exactly the case where the file still needs to be finalised, so
+            // this is logged and stepped over rather than thrown.
+            Log.record.notice(
+                "stopCapture reported \(error.localizedDescription, privacy: .public); continuing to finalise")
+        }
+
+        let finalised = try await writerFinished.wait(timeout: finaliseTimeout)
+        if !finalised {
+            Log.record.error(
+                "writer never reported finishing after \(finaliseTimeout.seconds, privacy: .public)s")
+        }
+        lock.withLock {
+            self.stream = nil
+            self.recordingOutput = nil
+        }
+        return sampled
+    }
+
+    // MARK: - SCRecordingOutputDelegate
+
+    func recordingOutputDidStartRecording(_ recordingOutput: SCRecordingOutput) {
+        Log.record.notice("writer started -> \(self.outputURL.lastPathComponent, privacy: .public)")
+        writerStarted.signal()
+    }
+
+    func recordingOutputDidFinishRecording(_ recordingOutput: SCRecordingOutput) {
+        Log.record.notice("writer finished -> \(self.outputURL.lastPathComponent, privacy: .public)")
+        writerFinished.signal()
+    }
+
+    func recordingOutput(_ recordingOutput: SCRecordingOutput, didFailWithError error: any Error) {
+        Log.record.error("writer failed: \(error.localizedDescription, privacy: .public)")
+        // Both latches, so a failure before the writer ever started does not
+        // leave `start()` waiting out its whole timeout for a start that will
+        // never come.
+        writerStarted.signal(error)
+        writerFinished.signal(error)
+        reportUnexpectedStop(error)
+    }
+
+    // MARK: - SCStreamDelegate
+
+    func stream(_ stream: SCStream, didStopWithError error: any Error) {
+        Log.record.error("stream stopped: \(error.localizedDescription, privacy: .public)")
+        reportUnexpectedStop(error)
+    }
+
+    private func reportUnexpectedStop(_ error: any Error) {
+        let handler: (@Sendable (any Error) -> Void)? = lock.withLock {
+            guard !isStopping else { return nil }
+            return unexpectedStop
+        }
+        handler?(error)
+    }
+}
+
+extension Duration {
+    /// For log lines that want a number rather than "1.5 seconds".
+    nonisolated var seconds: Double {
+        let (whole, atto) = components
+        return Double(whole) + Double(atto) / 1e18
     }
 }

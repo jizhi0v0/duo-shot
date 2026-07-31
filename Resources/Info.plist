@@ -36,10 +36,16 @@
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 Bo Li. All rights reserved.</string>
 	<!--
+	  Microphone IS a usage-string service, unlike Screen Recording: this string
+	  is shown verbatim in the prompt, and an app that touches the microphone
+	  without the key is killed rather than denied.
+	-->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>DuoShot records your microphone when you turn on voice-over for a screen recording.</string>
+	<!--
 	  Deliberately NOT present: NSScreenCaptureUsageDescription.
 	  Screen Recording is not a usage-string TCC service; the prompt copy is
 	  entirely system-supplied. Adding the key does nothing.
-	  NSMicrophoneUsageDescription belongs here only once recording lands (phase 2).
 	-->
 </dict>
 </plist>
