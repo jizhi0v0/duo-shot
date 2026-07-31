@@ -42,6 +42,10 @@ enum SelfTest {
         /// Pure geometry of the armed selection's grab zones. Headless: no screen,
         /// no capture, so it runs where the interactive tests cannot.
         case selectionZones
+        /// Pointer position -> pixel in a backdrop frame, including the offsets a
+        /// second display introduces. Headless, and the only way to test them on
+        /// a one-screen machine.
+        case pixelMapping
         /// Opens the real Settings window and captures it, so the SwiftUI layout
         /// can actually be looked at.
         case settingsWindow(directory: URL)
@@ -121,6 +125,8 @@ enum SelfTest {
                 self = .preferences
             case "--selftest-selection-zones":
                 self = .selectionZones
+            case "--selftest-pixel-mapping":
+                self = .pixelMapping
             case "--selftest-hud-appearance":
                 FloatingBarPanel.usesSharingTypeNone = false
                 self = .hudAppearance(
@@ -263,6 +269,7 @@ enum SelfTest {
             case .fullscreen(let directory): return try await fullscreenMode(into: directory)
             case .preferences: return preferencesCheck()
             case .selectionZones: return selectionZonesCheck()
+            case .pixelMapping: return pixelMappingCheck()
             case .settingsWindow(let directory): return try await settingsWindow(into: directory)
             case .settingsResize: return try await settingsResize()
             case .lifecycle(let iterations): return try await lifecycle(iterations: iterations)
@@ -2025,6 +2032,80 @@ enum SelfTest {
         }
 
         print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.joined(separator: "; "))")")
+        return failures.isEmpty ? 0 : 1
+    }
+
+    // MARK: - Pixel mapping
+
+    /// Where a pointer position lands inside a backdrop frame.
+    ///
+    /// This is the one piece of the loupe that a single-display machine cannot
+    /// test for real, and it is also the piece most likely to be wrong. The flip
+    /// is against the *covered rect's* own maxY, not the primary screen's height,
+    /// and on one screen at the origin those are the same number — so the classic
+    /// mistake produces identical results here and garbage on anyone's second
+    /// monitor. Feeding synthetic geometry in is the only honest substitute for
+    /// the hardware:
+    ///
+    ///   - a primary screen at the origin, 1x and 2x;
+    ///   - a screen to the *left* of it, so x is negative;
+    ///   - a screen *above* it, so y runs past the primary's height — the case
+    ///     the wrong pivot gets wrong by exactly the offset between them;
+    ///   - a 160 pt patch, which is what the loupe actually reads most of the
+    ///     time and has an offset on every machine.
+    private static func pixelMappingCheck() -> Int32 {
+        var failures: [String] = []
+        func check(_ expected: CGPoint, _ got: CGPoint, _ description: String) {
+            let ok = abs(expected.x - got.x) < 0.01 && abs(expected.y - got.y) < 0.01
+            print("  \(ok ? "ok  " : "FAIL") \(description)"
+                + (ok ? "" : " — expected \(Int(expected.x)),\(Int(expected.y))"
+                    + " got \(Int(got.x)),\(Int(got.y))"))
+            if !ok { failures.append(description) }
+        }
+
+        func pixel(_ point: CGPoint, in covered: CGRect, scale: CGFloat) -> CGPoint {
+            DisplayGeometry.pixel(ofAppKitGlobal: point, in: covered, scale: scale)
+        }
+
+        // Primary, 1x: the top-left of the image is the top-left of the screen.
+        let primary = CGRect(x: 0, y: 0, width: 1600, height: 1000)
+        check(CGPoint(x: 0, y: 0), pixel(CGPoint(x: 0, y: 1000), in: primary, scale: 1),
+              "the screen's top-left corner is pixel 0,0")
+        check(CGPoint(x: 0, y: 1000), pixel(CGPoint(x: 0, y: 0), in: primary, scale: 1),
+              "and its bottom-left corner is the last row")
+        check(CGPoint(x: 100, y: 250), pixel(CGPoint(x: 100, y: 750), in: primary, scale: 1),
+              "a point 250 pt below the top is 250 px down")
+
+        // Primary, 2x: everything doubles, nothing else changes.
+        check(CGPoint(x: 200, y: 500), pixel(CGPoint(x: 100, y: 750), in: primary, scale: 2),
+              "the same point at 2x is twice as far in")
+
+        // A screen to the left: x is negative in global space, never in the image.
+        let left = CGRect(x: -1440, y: 0, width: 1440, height: 900)
+        check(CGPoint(x: 0, y: 0), pixel(CGPoint(x: -1440, y: 900), in: left, scale: 2),
+              "a screen left of the origin still starts at pixel 0,0")
+        check(CGPoint(x: 80, y: 100), pixel(CGPoint(x: -1400, y: 850), in: left, scale: 2),
+              "and offsets come off its own minX")
+
+        // A screen above: y runs past the primary's height. Flipping against the
+        // primary's 1000 pt instead of this screen's own maxY would put every
+        // pixel 900 pt out — the bug this exists for.
+        let above = CGRect(x: 0, y: 1000, width: 1600, height: 900)
+        check(CGPoint(x: 0, y: 0), pixel(CGPoint(x: 0, y: 1900), in: above, scale: 1),
+              "a screen above the origin maps its own top edge to row 0")
+        check(CGPoint(x: 0, y: 900), pixel(CGPoint(x: 0, y: 1000), in: above, scale: 1),
+              "and its own bottom edge to its last row")
+        check(CGPoint(x: 0, y: 450), pixel(CGPoint(x: 0, y: 1450), in: above, scale: 1),
+              "a point halfway up it is halfway down the image")
+
+        // A patch: same arithmetic, a covered rect that is not a screen at all.
+        let patch = CGRect(x: 784, y: 479, width: 160, height: 160)
+        check(CGPoint(x: 160, y: 160), pixel(CGPoint(x: 864, y: 559), in: patch, scale: 2),
+              "the centre of a 160 pt patch is the centre of its image")
+        check(CGPoint(x: 0, y: 0), pixel(CGPoint(x: 784, y: 639), in: patch, scale: 2),
+              "and its top-left corner is pixel 0,0")
+
+        print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.count) of the above")")
         return failures.isEmpty ? 0 : 1
     }
 
