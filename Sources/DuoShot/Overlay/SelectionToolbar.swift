@@ -323,11 +323,34 @@ final class SelectionToolbar {
         panel.setFrame(CGRect(origin: origin, size: size), display: true)
     }
 
+    /// The frame it last occupied, kept after it goes away.
+    ///
+    /// The HUD grows out of this, so the bar the user clicked Record on and the
+    /// bar that appears while the stream starts are one moving object rather
+    /// than two windows swapping.
+    private(set) var lastFrame: CGRect?
+
+    private var isDismissing = false
+
+    /// Fades rather than vanishing. A hard `orderOut` is what made the handover
+    /// read as a window closing and another opening.
     func hide() {
-        panel?.orderOut(nil)
-        panel = nil
-        view = nil
+        guard let panel, !isDismissing else { return }
+        isDismissing = true
+        lastFrame = panel.frame
+        self.panel = nil
+        self.view = nil
         anchor = nil
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.16
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel.animator().alphaValue = 0
+        } completionHandler: { [weak self] in
+            MainActor.assumeIsolated {
+                panel.orderOut(nil)
+                self?.isDismissing = false
+            }
+        }
     }
 
     var frameForTest: CGRect? { panel?.frame }

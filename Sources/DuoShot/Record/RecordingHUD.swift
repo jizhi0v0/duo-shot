@@ -301,27 +301,40 @@ final class RecordingHUD {
     /// `under` is the recorded region for an area take, and nil for a whole
     /// display — where there is no anchor and the bottom of the screen is the
     /// only sensible home.
-    func showStarting(on screen: NSScreen?, under region: CGRect? = nil) {
+    /// `morphingFrom` is the outgoing toolbar's frame. Given one, the bar starts
+    /// there and moves into place instead of appearing — the two are the same
+    /// object as far as the user is concerned, and a cut between them is the
+    /// thing that made starting a recording feel like three separate windows.
+    func showStarting(
+        on screen: NSScreen?, under region: CGRect? = nil, morphingFrom: CGRect? = nil
+    ) {
         show(on: screen, elapsed: nil)
         if let region, let screen = panel?.screen ?? screen {
             anchor = (region, screen)
         }
         view?.setPhase(.starting)
-        resize(to: .starting)
+        if let morphingFrom, let panel {
+            panel.setFrame(morphingFrom, display: false)
+            view?.frame = CGRect(origin: .zero, size: morphingFrom.size)
+            panel.alphaValue = 0
+        }
+        resize(to: .starting, animated: morphingFrom != nil, fadingIn: morphingFrom != nil)
     }
 
     /// Switches the bar to its running state and starts the clock. The panel is
     /// already up by now; nothing moves, the contents change.
     func beginRecording(elapsed: @escaping () -> TimeInterval) {
         view?.setPhase(.recording)
-        resize(to: .recording)
+        resize(to: .recording, animated: true)
         elapsedProvider = elapsed
         startTicker()
     }
 
     /// Keeps the bar centred on its screen as it changes width, so it grows
     /// from the middle rather than sliding sideways.
-    private func resize(to phase: RecordingHUDView.Phase) {
+    private func resize(
+        to phase: RecordingHUDView.Phase, animated: Bool = false, fadingIn: Bool = false
+    ) {
         guard let panel else { return }
         let size = CGSize(
             width: RecordingHUDView.width(for: phase),
@@ -332,8 +345,23 @@ final class RecordingHUD {
             // No anchor: keep it where it is and grow from the centre.
             CGPoint(x: (panel.frame.midX - size.width / 2).rounded(), y: panel.frame.minY)
         }
-        panel.setFrame(CGRect(origin: origin, size: size), display: true)
+        let frame = CGRect(origin: origin, size: size)
+        guard animated else {
+            panel.setFrame(frame, display: true)
+            view?.frame = CGRect(origin: .zero, size: size)
+            return
+        }
+        // The contents are laid out at the final size immediately and the window
+        // animates around them. Animating the subview frames too would mean two
+        // animations of the same thing at slightly different rates, which reads
+        // as the controls swimming inside the bar.
         view?.frame = CGRect(origin: .zero, size: size)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.22
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel.animator().setFrame(frame, display: true)
+            if fadingIn { panel.animator().alphaValue = 1 }
+        }
     }
 
     /// Bottom-centre of the recording's own screen, which is where the user is

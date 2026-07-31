@@ -113,6 +113,8 @@ final class RecordingCoordinator {
         overlay.tearDown()
 
         guard case .area(let displayID, let rect) = outcome else { return }
+        // Read before the overlay is gone for good; the HUD grows out of it.
+        morphOrigin = overlay.lastToolbarFrame
         retriesLeft = 1
         await begin(.area(displayID: displayID, rectInAppKitGlobal: rect))
     }
@@ -137,6 +139,8 @@ final class RecordingCoordinator {
     /// Reset for each trigger, so one bad take never uses up a later one's
     /// retry. Decremented only by the start path below.
     private var retriesLeft = 0
+    /// The toolbar's parting frame, carried from the selection to the HUD.
+    private var morphOrigin: CGRect?
 
     private func begin(_ request: RecordingRequest) async {
         let options = Preferences.shared.recordingOptions
@@ -153,7 +157,10 @@ final class RecordingCoordinator {
         // Anchored to the region for an area take, so the bar stays where the
         // toolbar just was instead of jumping to the bottom of the screen.
         let region: CGRect? = if case .area(_, let rect) = request { rect } else { nil }
-        hud.showStarting(on: ScreenIndex.screen(for: request.displayID), under: region)
+        hud.showStarting(
+            on: ScreenIndex.screen(for: request.displayID), under: region,
+            morphingFrom: morphOrigin)
+        morphOrigin = nil
         // Only for an area take. On a fullscreen one the answer to "what is
         // being recorded" is the whole screen, and a border round the edge of it
         // would be noise.

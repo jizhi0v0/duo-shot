@@ -1845,6 +1845,10 @@ enum SelfTest {
         try await shoot("hud-starting", frame: starting)
 
         hud.beginRecording(elapsed: { 754 })
+        // The bar animates into its running size now, and `frameForTest` reads
+        // the live frame — sampling it immediately would photograph a rect the
+        // window is still moving out of.
+        try await Task.sleep(for: .milliseconds(350))
         guard let running = hud.frameForTest else { return 1 }
         try await shoot("hud-recording", frame: running)
         for line in hud.debugSubviewFrames { print("    hud: \(line)") }

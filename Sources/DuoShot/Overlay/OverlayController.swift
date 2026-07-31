@@ -53,6 +53,10 @@ final class OverlayController {
 
     var isPresenting: Bool { !panels.isEmpty }
 
+    /// Where the confirmation toolbar was when it went away, so whatever takes
+    /// its place can start from there instead of appearing somewhere else.
+    var lastToolbarFrame: CGRect? { toolbar.lastFrame }
+
     /// The CGWindowIDs of our panels, for `SCContentFilter(display:excludingWindows:)`.
     ///
     /// `NSWindow.windowNumber` *is* the `CGWindowID` — that is the join key.
