@@ -50,6 +50,12 @@ final class OverlayView: NSView {
     /// never visited.
     var backdrop: BackdropCache.Frame? {
         didSet {
+            // Re-published on every pointer move, and usually unchanged: while the
+            // pointer stays inside the current patch, the cache keeps handing back
+            // the same frame. Redrawing a screen-sized view and rebuilding the
+            // marching ants for that would be a second invalidation per move, on
+            // top of the one the move itself already causes.
+            guard backdrop != oldValue else { return }
             loupe.backdrop = backdrop
             // Fades in rather than appearing. It lands 30–60 ms after the overlay
             // does, and at that distance a hard cut reads as a glitch in a UI the

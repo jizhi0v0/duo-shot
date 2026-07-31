@@ -37,7 +37,16 @@ import AppKit
 @MainActor
 final class BackdropCache {
     /// A photograph, with everything needed to map a global point into it.
-    struct Frame {
+    ///
+    /// `Equatable` so the overlay can tell a genuinely new frame from the same one
+    /// being handed to it again, which happens on every pointer move that stays
+    /// inside the current patch. `CGImage` has no `==`, and does not need one
+    /// here: two frames are the same frame when they are the same object.
+    struct Frame: Equatable {
+        static func == (lhs: Frame, rhs: Frame) -> Bool {
+            lhs.image === rhs.image && lhs.scale == rhs.scale && lhs.covers == rhs.covers
+        }
+
         let image: CGImage
         /// Pixels per point, from the capture itself rather than from
         /// `NSScreen.backingScaleFactor` — on mixed-DPI setups only the capture
