@@ -53,6 +53,8 @@ enum SelfTest {
         case overlaySharing
         case previewInRecording(directory: URL, seconds: Double, excludes: Bool)
         case hudAppearance(directory: URL)
+        /// The lit border, photographed and measured over black and over white.
+        case regionOutline(directory: URL)
         /// Repeated captures through the whole pipeline, watching memory and the
         /// staging store.
         case soak(iterations: Int, directory: URL)
@@ -115,6 +117,12 @@ enum SelfTest {
             case "--selftest-hud-appearance":
                 FloatingBarPanel.usesSharingTypeNone = false
                 self = .hudAppearance(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
+            case "--selftest-region-outline":
+                // The border ships invisible to ScreenCaptureKit, so a capture of
+                // it would come back showing the backdrop and nothing else.
+                RecordingRegionOutlinePanel.usesSharingTypeNone = false
+                self = .regionOutline(
                     directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-preview-in-recording":
                 // `.readOnly`, or the card is invisible to ScreenCaptureKit
@@ -249,6 +257,7 @@ enum SelfTest {
             case .previewInRecording(let d, let seconds, let excludes):
                 return try await previewInRecording(into: d, seconds: seconds, excludes: excludes)
             case .hudAppearance(let d): return try await hudAppearance(into: d)
+            case .regionOutline(let d): return try await regionOutline(into: d)
             case .soak(let iterations, let directory):
                 return try await soak(iterations: iterations, into: directory)
             case .microphone: return await microphoneCheck()
@@ -2002,6 +2011,139 @@ enum SelfTest {
 
         print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.joined(separator: "; "))")")
         return failures.isEmpty ? 0 : 1
+    }
+
+    // MARK: - Recording border
+
+    /// Photographs the border of an area take over black and over white, and
+    /// measures how far its light carries on each.
+    ///
+    /// This border has been wrong twice, both times for one reason: it was
+    /// designed against one background and then met another. A solid red line
+    /// vanished on red content. Warm light on its own would vanish on a white
+    /// document — which is exactly what the shade beyond the glow is for. So this
+    /// does not only take a picture. It samples the luminance profile outward
+    /// from the edge and requires that *something* separates the region from its
+    /// surroundings at both extremes.
+    private static func regionOutline(into directory: URL) async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+        if let hint = LoginSession.noDisplaysHint {
+            FileHandle.standardError.write(Data("error: \(hint)\n".utf8))
+            return 2
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        guard let screen = NSScreen.main,
+              let displayID = ScreenIndex.displayID(of: screen)
+        else { throw CaptureError.noDisplays }
+
+        let engine = CaptureEngine()
+        try await engine.refreshContent()
+
+        let region = CGRect(
+            x: (screen.frame.midX - 260).rounded(), y: (screen.frame.midY - 180).rounded(),
+            width: 520, height: 360)
+        let reach = RecordingRegionOutlineView.outset
+        // The backdrop has to be wider than the light reaches, or the profile
+        // would be measured half against a known colour and half against
+        // whatever is on the desktop.
+        let stage = region.insetBy(dx: -(reach + 26), dy: -(reach + 26))
+
+        /// Distance outward from the recorded edge, in points.
+        let bands: [(name: String, from: CGFloat, to: CGFloat)] = [
+            ("edge  1-5pt", 1, 5),
+            ("near  6-12pt", 6, 12),
+            ("far  13-20pt", 13, 20),
+        ]
+        let referenceBand: (from: CGFloat, to: CGFloat) = (32, 42)
+
+        var failures: [String] = []
+        print("region:        \(rectString(region))  light reaches \(Int(reach))pt")
+
+        for (name, backdrop) in [("black", NSColor.black), ("white", NSColor.white)] {
+            let backing = plainWindow(colour: backdrop, frame: stage)
+            let outline = RecordingRegionOutline()
+            outline.show(around: region)
+            try await Task.sleep(for: .milliseconds(450))
+
+            let shot = try await engine.capture(
+                .area(displayID: displayID, rectInAppKitGlobal: stage))
+            try? ImageEncoder.write(
+                shot.image, to: directory.appendingPathComponent("outline-on-\(name).png"),
+                as: .png, scale: shot.scale)
+
+            /// A strip of the captured image, `from`–`to` points above the
+            /// region's top edge, kept clear of the corners where two edges' light
+            /// adds up. Image coordinates run downward from the top of `stage`.
+            func strip(from: CGFloat, to: CGFloat) -> CGRect {
+                let scale = shot.scale
+                let top = (stage.maxY - (region.maxY + to)) * scale
+                let bottom = (stage.maxY - (region.maxY + from)) * scale
+                return CGRect(
+                    x: (region.minX - stage.minX + 80) * scale, y: top,
+                    width: (region.width - 160) * scale, height: bottom - top)
+            }
+
+            guard let reference = PixelCompare.meanLuminance(
+                shot.image, in: strip(from: referenceBand.from, to: referenceBand.to))
+            else {
+                failures.append("could not sample the \(name) backdrop")
+                outline.hide()
+                backing.orderOut(nil)
+                continue
+            }
+
+            var strongest = 0.0
+            var profile: [String] = []
+            for band in bands {
+                guard let mean = PixelCompare.meanLuminance(
+                    shot.image, in: strip(from: band.from, to: band.to))
+                else { continue }
+                let delta = mean - reference
+                strongest = max(strongest, abs(delta))
+                profile.append(String(format: "%@ %+.0f", band.name, delta))
+            }
+            print("on \(name):\(String(repeating: " ", count: max(1, 9 - name.count)))"
+                + "backdrop \(Int(reference))  →  \(profile.joined(separator: "   "))")
+
+            // 12 is about where a band stops being arguable in a screenshot. The
+            // sign is deliberately not checked: on black the light does the work
+            // and the deltas are positive, on white the shade does and they are
+            // negative, and requiring a particular direction on a particular
+            // backdrop would be writing the current design into the test rather
+            // than the requirement.
+            if strongest < 12 {
+                failures.append(String(
+                    format: "the border is invisible on %@: strongest band differs by only %.1f",
+                    name, strongest))
+            }
+
+            outline.hide()
+            backing.orderOut(nil)
+            try await Task.sleep(for: .milliseconds(200))
+        }
+
+        print("images:        outline-on-black.png, outline-on-white.png in \(directory.path)")
+        print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.joined(separator: "; "))")")
+        return failures.isEmpty ? 0 : 1
+    }
+
+    /// A flat rectangle of colour to put the border against.
+    ///
+    /// `.floating`, so it sits above the desktop and below the border's own
+    /// `.statusBar` panel. `.normal` would belong to a background application and
+    /// anything coming forward would cover it — measured before, on the magenta
+    /// window in `recordHUD`, where it turned into an intermittent failure that
+    /// blamed the wrong thing.
+    private static func plainWindow(colour: NSColor, frame: CGRect) -> NSWindow {
+        let window = NSWindow(
+            contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.backgroundColor = colour
+        window.isOpaque = true
+        window.hasShadow = false
+        window.level = .floating
+        window.ignoresMouseEvents = true
+        window.orderFrontRegardless()
+        return window
     }
 
     /// A preview card that is already on screen when a take starts must not

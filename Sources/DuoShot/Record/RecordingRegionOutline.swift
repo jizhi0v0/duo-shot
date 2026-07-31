@@ -45,40 +45,166 @@ final class RecordingRegionOutlinePanel: NSPanel {
     }
 }
 
+/// The lit edge: warm light spilling outward from the recorded rectangle, the way
+/// a make-up mirror lights what is in front of it.
+///
+/// It replaced a dark/light/dark sandwich of hairlines. That version was correct
+/// and looked like a marquee: three crisp strokes read as a *border around a
+/// screenshot*, not as a region that is live. Light does the same job with none
+/// of that — it says "this rectangle is on" rather than "this rectangle is
+/// selected" — and it stays outside the region entirely, so nothing being
+/// demonstrated is covered or tinted.
+///
+/// Two properties of the old design are deliberately kept.
+///
+/// Nothing is sampled from the background. Picking a contrasting colour is the
+/// obvious answer and does not survive the situation it is for: what is behind
+/// the border is a *recording in progress*, so it changes continuously. A colour
+/// sampled once is wrong as soon as the user scrolls, and re-sampling means a
+/// screen capture on a timer for the length of every take.
+///
+/// And it cannot lose against the content. Warm light alone would vanish on a
+/// white document — the same way the original solid-red border vanished on red —
+/// so the light is backed by a soft shade further out. On dark content the glow
+/// carries the edge; on pale content the shade does. Neither is a line, and
+/// `--selftest-region-outline` measures both.
 final class RecordingRegionOutlineView: NSView {
-    /// Three hairlines: dark, light, dark. The panel is grown by this much on
-    /// every side, so the border brackets the region instead of covering the
-    /// outermost points of what is being demonstrated.
-    static let strokeWidth: CGFloat = 3
+    /// How far the light reaches. The panel is grown by this on every side, so
+    /// the whole effect lives outside the recorded rectangle.
+    ///
+    /// Wider than it needs to be for brightness, and that is the point: the same
+    /// amount of light spread over more distance is diffuse rather than a band.
+    static let outset: CGFloat = 28
 
-    /// Why this is not a single colour chosen from the background.
+    /// Warm white — tungsten pulled back towards daylight. The first version was
+    /// amber enough to read as a colour rather than as light; at these lower
+    /// opacities the hue barely shows anyway, and what is left is warmth.
+    private static let bulb = NSColor(srgbRed: 1.0, green: 0.925, blue: 0.808, alpha: 1)
+
+    /// One point of the falloff: how much of the colour survives `distance`
+    /// points out from the recorded edge.
+    private struct Stop {
+        let distance: CGFloat
+        let alpha: CGFloat
+    }
+
+    /// The light.
     ///
-    /// Sampling what is behind the border and picking a contrasting colour is
-    /// the obvious answer, and it does not survive the situation it is for: the
-    /// content behind the border is a *recording in progress*, so it changes
-    /// continuously. A colour sampled once at the start is wrong as soon as the
-    /// user scrolls, and re-sampling means a screen capture on a timer for the
-    /// length of every take — cost paid the whole time to solve a problem at the
-    /// edges only.
+    /// Deliberately soft at the edge. The first version peaked at 0.95 and halved
+    /// within two points, which put a bright two-point band right on the boundary
+    /// — a neon tube, i.e. the line this was supposed to stop being. The peak is
+    /// down by half and the falloff stretched over the whole reach, so there is
+    /// no distance at which the light has an edge of its own.
+    private static let glow: [Stop] = [
+        Stop(distance: 0, alpha: 0.45),
+        Stop(distance: 3, alpha: 0.34),
+        Stop(distance: 8, alpha: 0.22),
+        Stop(distance: 14, alpha: 0.12),
+        Stop(distance: 21, alpha: 0.05),
+        Stop(distance: outset, alpha: 0),
+    ]
+
+    /// The shade, and the reason the border survives a white document.
     ///
-    /// A dark/light/dark sandwich needs no sampling and cannot lose: whatever is
-    /// behind it, one of the two tones contrasts with it, including the red that
-    /// made the previous solid-red border disappear. It is also quieter than a
-    /// saturated line, which is the other half of the complaint — the border
-    /// marks the region, it is not the point of what is on screen.
+    /// It starts where the light is already fading and peaks well outside it, so
+    /// the two never compete for the same pixels: nothing dark ever touches the
+    /// bright edge. On dark content it is invisible and costs nothing; on pale
+    /// content it is the whole border. Measured, not assumed — the first version
+    /// of this file put the shade too close in and too faint, and
+    /// `--selftest-region-outline` reported it as a difference of 6 luminance
+    /// units against white, i.e. no border at all.
+    private static let shade: [Stop] = [
+        Stop(distance: 0, alpha: 0),
+        Stop(distance: 5, alpha: 0.07),
+        Stop(distance: 11, alpha: 0.17),
+        Stop(distance: 18, alpha: 0.14),
+        Stop(distance: 24, alpha: 0.06),
+        Stop(distance: outset, alpha: 0),
+    ]
+
     override func draw(_ dirtyRect: NSRect) {
-        let tones: [NSColor] = [
-            NSColor(white: 0, alpha: 0.55),
-            NSColor(white: 1, alpha: 0.9),
-            NSColor(white: 0, alpha: 0.55),
-        ]
-        for (index, colour) in tones.enumerated() {
-            let inset = CGFloat(index) + 0.5
-            colour.setStroke()
-            let path = NSBezierPath(rect: bounds.insetBy(dx: inset, dy: inset))
-            path.lineWidth = 1
-            path.stroke()
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        let region = bounds.insetBy(dx: Self.outset, dy: Self.outset)
+        guard region.width > 1, region.height > 1 else { return }
+
+        // Two falloffs and nothing else. There was a hairline of "filament" along
+        // the boundary as well, at 0.8: it was the single most line-like thing
+        // left, and once the glow's peak came down to 0.45 it was also pointless
+        // — a 1 pt stroke fainter than the light either side of it is invisible on
+        // dark content and, being warm, invisible on pale content too. The
+        // boundary is now where the light starts, which is what a lit edge is.
+        halo(context, around: region, colour: Self.bulb, stops: Self.glow)
+        halo(context, around: region, colour: .black, stops: Self.shade)
+    }
+
+    /// Paints one falloff all the way round `region`, outward.
+    ///
+    /// Gradients rather than a blurred rectangle's shadow, which is what this
+    /// started as: a Core Graphics shadow gives no say over the profile, and
+    /// measured, it put nearly all of its energy in the first two points and
+    /// nothing past six — a hairline with a halo, which is the look being
+    /// replaced. Four edges plus four corners is more code and the only way to
+    /// state the curve.
+    private func halo(
+        _ context: CGContext, around region: CGRect, colour: NSColor, stops: [Stop]
+    ) {
+        let reach = Self.outset
+        let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let colours = stops.compactMap {
+            colour.withAlphaComponent($0.alpha).usingColorSpace(.sRGB)?.cgColor
         }
+        guard colours.count == stops.count,
+              let gradient = CGGradient(
+                colorsSpace: space, colors: colours as CFArray,
+                locations: stops.map { $0.distance / reach })
+        else { return }
+
+        // Edges: the gradient runs straight out from each side, clipped to that
+        // side's own strip so it stops where the corner takes over.
+        let edges: [(clip: CGRect, from: CGPoint, to: CGPoint)] = [
+            (CGRect(x: region.minX, y: region.maxY, width: region.width, height: reach),
+             CGPoint(x: region.midX, y: region.maxY), CGPoint(x: region.midX, y: region.maxY + reach)),
+            (CGRect(x: region.minX, y: region.minY - reach, width: region.width, height: reach),
+             CGPoint(x: region.midX, y: region.minY), CGPoint(x: region.midX, y: region.minY - reach)),
+            (CGRect(x: region.minX - reach, y: region.minY, width: reach, height: region.height),
+             CGPoint(x: region.minX, y: region.midY), CGPoint(x: region.minX - reach, y: region.midY)),
+            (CGRect(x: region.maxX, y: region.minY, width: reach, height: region.height),
+             CGPoint(x: region.maxX, y: region.midY), CGPoint(x: region.maxX + reach, y: region.midY)),
+        ]
+        for edge in edges {
+            context.saveGState()
+            context.clip(to: edge.clip)
+            context.drawLinearGradient(gradient, start: edge.from, end: edge.to, options: [])
+            context.restoreGState()
+        }
+
+        // Corners: out there the distance from the region is radial, so a linear
+        // gradient would leave a visible seam along each diagonal.
+        let corners: [(clip: CGRect, centre: CGPoint)] = [
+            (CGRect(x: region.minX - reach, y: region.maxY, width: reach, height: reach),
+             CGPoint(x: region.minX, y: region.maxY)),
+            (CGRect(x: region.maxX, y: region.maxY, width: reach, height: reach),
+             CGPoint(x: region.maxX, y: region.maxY)),
+            (CGRect(x: region.minX - reach, y: region.minY - reach, width: reach, height: reach),
+             CGPoint(x: region.minX, y: region.minY)),
+            (CGRect(x: region.maxX, y: region.minY - reach, width: reach, height: reach),
+             CGPoint(x: region.maxX, y: region.minY)),
+        ]
+        for corner in corners {
+            context.saveGState()
+            context.clip(to: corner.clip)
+            context.drawRadialGradient(
+                gradient, startCenter: corner.centre, startRadius: 0,
+                endCenter: corner.centre, endRadius: reach, options: [])
+            context.restoreGState()
+        }
+    }
+
+    /// Layout changes the geometry every control point is derived from, and a
+    /// layer-backed view is not obliged to redraw on resize by itself.
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        needsDisplay = true
     }
 }
 
@@ -95,13 +221,14 @@ final class RecordingRegionOutline {
     }
 
     /// `rect` is the recorded region in AppKit global points. The panel is grown
-    /// outwards from it so the border brackets the region rather than sitting
-    /// inside it and shaving two points off every edge of what you see.
+    /// outwards from it so the light lives entirely outside the region rather
+    /// than lying over the edges of what is being demonstrated.
     func show(around rect: CGRect, hiddenFromCapture: Bool = true) {
-        let width = RecordingRegionOutlineView.strokeWidth
-        let frame = rect.insetBy(dx: -width, dy: -width)
+        let outset = RecordingRegionOutlineView.outset
+        let frame = rect.insetBy(dx: -outset, dy: -outset)
         if let panel {
             panel.setFrame(frame, display: true)
+            panel.contentView?.needsDisplay = true
             return
         }
         let view = RecordingRegionOutlineView(frame: CGRect(origin: .zero, size: frame.size))
