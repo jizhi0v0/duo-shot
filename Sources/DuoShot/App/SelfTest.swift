@@ -51,6 +51,7 @@ enum SelfTest {
         case lifecycle(iterations: Int)
         case selectionToolbar
         case overlaySharing
+        case previewInRecording(directory: URL, seconds: Double, excludes: Bool)
         case hudAppearance(directory: URL)
         /// Repeated captures through the whole pipeline, watching memory and the
         /// staging store.
@@ -116,6 +117,16 @@ enum SelfTest {
                 SelectionToolbarPanel.usesSharingTypeNone = false
                 self = .hudAppearance(
                     directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
+            case "--selftest-preview-in-recording":
+                // `.readOnly`, or the card is invisible to ScreenCaptureKit
+                // outright and the assertion below could never fail.
+                PreviewPanel.usesSharingTypeNone = false
+                self = .previewInRecording(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"),
+                    seconds: value(for: "--seconds").flatMap(Double.init) ?? 3,
+                    // The negative control. Without it a pass here could mean
+                    // the exclusion works or that the card was never capturable.
+                    excludes: !rest.contains("--no-exclude"))
             case "--selftest-overlay-sharing":
                 self = .overlaySharing
             case "--selftest-selection-toolbar":
@@ -236,6 +247,8 @@ enum SelfTest {
             case .lifecycle(let iterations): return try await lifecycle(iterations: iterations)
             case .selectionToolbar: return try await selectionToolbar()
             case .overlaySharing: return try await overlaySharing()
+            case .previewInRecording(let d, let seconds, let excludes):
+                return try await previewInRecording(into: d, seconds: seconds, excludes: excludes)
             case .hudAppearance(let d): return try await hudAppearance(into: d)
             case .soak(let iterations, let directory):
                 return try await soak(iterations: iterations, into: directory)
@@ -1893,6 +1906,122 @@ enum SelfTest {
         print("               toolbar \(rectString(bar))")
         print("               hud starting \(rectString(starting)) running \(rectString(running))")
         print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.joined(separator: "; "))")")
+        return failures.isEmpty ? 0 : 1
+    }
+
+    /// A preview card that is already on screen when a take starts must not
+    /// reach the video.
+    ///
+    /// This is the half of the screen-sharing change that had no evidence. The
+    /// card is `.readOnly` here — the shipping configuration when the
+    /// preference is on and no take is running — so the only thing keeping it
+    /// out is its window ID in `excludedWindowIDs`, named at the moment the
+    /// filter is built. A card raised *during* a take is the other case and
+    /// stays `.none`; nothing else can reach it.
+    ///
+    /// The card is made detectable by photographing a magenta window into it
+    /// and then closing that window, so the only magenta left anywhere is the
+    /// card itself.
+    private static func previewInRecording(
+        into directory: URL, seconds: Double, excludes: Bool = true
+    ) async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+        if let hint = LoginSession.noDisplaysHint {
+            FileHandle.standardError.write(Data("error: \(hint)\n".utf8))
+            return 2
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let screen = NSScreen.main
+        let displayID = ScreenIndex.screenUnderMouse().flatMap(ScreenIndex.displayID(of:))
+            ?? CGMainDisplayID()
+
+        let coordinator = CaptureCoordinator()
+        try await coordinator.engine.refreshContent()
+        let previews = PreviewStackController()
+        previews.timeout = .seconds(120)
+        // The card must be capturable for this to mean anything; the flag above
+        // has already forced that, and this says the take is not running yet.
+        previews.isRecordingActive = { false }
+
+        // Fill a card with magenta by photographing a magenta window.
+        let marker = makePlainMagentaWindow(on: screen)
+        try await Task.sleep(for: .milliseconds(500))
+        let shot = try await coordinator.engine.capture(
+            .area(displayID: displayID, rectInAppKitGlobal: marker.frame))
+        guard let output = OutputPipeline.shared.process(
+            shot, saveDirectoryOverride: directory) else {
+            print("result:        FAIL — could not stage the marker capture")
+            return 1
+        }
+        previews.present(output)
+        // Closed before recording, so the card is the only magenta on screen.
+        marker.orderOut(nil)
+        try await Task.sleep(for: .milliseconds(600))
+
+        guard let cardFrame = previews.containerFrame else {
+            print("result:        FAIL — no preview panel")
+            return 1
+        }
+        print("card:          \(rectString(cardFrame)) sharingType=readOnly")
+
+        // Control: a screenshot with nothing excluded must see the card. If it
+        // cannot, the card is not really there and the video's silence would
+        // prove nothing.
+        var bare = CaptureOptions.default
+        bare.excludedWindowIDs = []
+        let still = try await coordinator.engine.capture(
+            .display(displayID), options: bare)
+        let stillMagenta = PixelCompare.count(still.image, matching: PixelCompare.isDebugMagenta)
+        print("still capture: \(stillMagenta) px magenta (the card, seen by a screenshot)")
+
+        // Now record, naming the card the way `RecordingCoordinator` does.
+        var options = RecordingOptions.default
+        options.capturesSystemAudio = false
+        options.capturesMicrophone = false
+        options.excludedWindowIDs = excludes ? previews.panelWindowIDs : []
+        print("excluding:     \(excludes ? "the card's window ID" : "NOTHING — negative control")")
+        let url = directory.appendingPathComponent("preview-in-recording.mp4")
+        try? FileManager.default.removeItem(at: url)
+
+        let engine = RecordingEngine()
+        try await engine.refreshContent()
+        _ = try await engine.start(.display(displayID), options: options, to: url)
+        try await Task.sleep(for: .seconds(seconds))
+        let result = try await engine.stop()
+        previews.dismissAll()
+
+        let asset = AVURLAsset(url: result.url)
+        let duration = try await asset.load(.duration)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        let (frame, _) = try await generator.image(
+            at: CMTime(seconds: duration.seconds * 0.6, preferredTimescale: 600))
+        try? ImageEncoder.write(
+            frame, to: directory.appendingPathComponent("preview-in-recording.png"),
+            as: .png, scale: result.scale)
+        let videoMagenta = PixelCompare.count(frame, matching: PixelCompare.isDebugMagenta)
+        print("video:         \(videoMagenta) px magenta in the recording")
+
+        var failures: [String] = []
+        if stillMagenta < 500 {
+            failures.append("the card was not visible to a screenshot (\(stillMagenta) px), "
+                + "so the video proves nothing")
+        }
+        let leaked = videoMagenta > max(stillMagenta / 20, 100)
+        if excludes {
+            if leaked { failures.append("the card reached the video (\(videoMagenta) px)") }
+            print("result:        \(failures.isEmpty ? "PASS — on screen, .readOnly, and excluded from the take" : "FAIL — \(failures.joined(separator: "; "))")")
+            return failures.isEmpty ? 0 : 1
+        }
+        // Negative control: with nothing excluded the card MUST be recorded,
+        // or the positive result above is vacuous.
+        if !leaked {
+            failures.append("nothing excluded and the card still did not reach the video "
+                + "(\(videoMagenta) px) — the assertion above cannot fail")
+        }
+        print("result:        \(failures.isEmpty ? "PASS — recorded, as an unexcluded .readOnly card must be" : "FAIL — \(failures.joined(separator: "; "))")")
         return failures.isEmpty ? 0 : 1
     }
 
