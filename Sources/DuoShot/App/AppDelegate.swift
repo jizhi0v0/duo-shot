@@ -62,7 +62,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.statusItem.refreshRecordingState()
         }
         recorder.onResult = { [weak self] output in
-            self?.statusItem.noteRecording(output)
+            guard let self else { return }
+            statusItem.noteRecording(output)
+            guard Preferences.shared.showsPreviewOverlay else { return }
+            // The poster frame is decoded off disk, so the card arrives a beat
+            // after the take ends rather than with it. That beat is the reason
+            // the preview is not presented synchronously here: blocking the main
+            // actor on a decode would stall the HUD's own teardown.
+            Task { [weak self] in
+                let poster = await VideoPoster.frame(for: output.url)
+                guard let self else { return }
+                previews.timeout = .seconds(Preferences.shared.previewTimeout)
+                previews.present(output, poster: poster ?? VideoPoster.placeholder())
+            }
         }
         recorder.onAuthorisationLost = { [weak self] in
             Task { await self?.handleAuthorisationLost() }

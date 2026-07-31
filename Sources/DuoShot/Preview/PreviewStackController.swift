@@ -10,13 +10,13 @@ import AppKit
 @MainActor
 final class PreviewStackController {
     private final class Item {
-        let output: OutputPipeline.Output
+        let entry: PreviewEntry
         let card: PreviewCardView
         var dragSource: ImageDragSource?
         var dismissTask: Task<Void, Never>?
 
-        init(output: OutputPipeline.Output, card: PreviewCardView) {
-            self.output = output
+        init(entry: PreviewEntry, card: PreviewCardView) {
+            self.entry = entry
             self.card = card
         }
     }
@@ -53,27 +53,40 @@ final class PreviewStackController {
 
     // MARK: - Presenting
 
+    /// Screenshots. The recording path goes through `present(_:poster:)`.
     func present(_ output: OutputPipeline.Output) {
+        present(PreviewEntry(output))
+    }
+
+    /// Recordings. The poster frame is the caller's job because extracting one
+    /// decodes off disk, and this method cannot be async without every card
+    /// arriving a runloop turn late.
+    func present(_ output: OutputPipeline.RecordingOutput, poster: NSImage) {
+        present(PreviewEntry(output, poster: poster))
+    }
+
+    func present(_ entry: PreviewEntry) {
         var callbacks = PreviewCardView.Callbacks()
-        let card = PreviewCardView(image: output.result.nsImage, callbacks: callbacks)
-        let item = Item(output: output, card: card)
+        let card = PreviewCardView(
+            image: entry.thumbnail, badge: entry.badge, callbacks: callbacks)
+        let item = Item(entry: entry, card: card)
 
         // Every capture of `item` is weak. `item` owns the card, the card owns
         // these callbacks — a strong capture closes that loop and the Item never
         // deallocates, taking a multi-megabyte CGImage with it. Measured: a
         // 300-capture soak grew by 72 MB with strong captures, flat without.
         callbacks.copy = { [weak self, weak item] in
-            Clipboard.write(output.result, fileURL: output.url)
+            entry.copyToClipboard()
             if let item { self?.dismiss(item) }
         }
         callbacks.reveal = { [weak self, weak item] in
-            OutputPipeline.shared.reveal(output.url)
+            OutputPipeline.shared.reveal(entry.url)
             if let item { self?.dismiss(item) }
         }
         callbacks.close = { [weak self, weak item] in
             if let item { self?.dismiss(item) }
         }
-        callbacks.open = { NSWorkspace.shared.open(output.url) }
+        callbacks.open = { NSWorkspace.shared.open(entry.url) }
         callbacks.hoverChanged = { [weak self, weak item] isInside in
             guard let self, let item else { return }
             // Timers pause for the whole stack while the pointer is in the
@@ -89,7 +102,7 @@ final class PreviewStackController {
         callbacks.beginDrag = { [weak self, weak item] event, thumbnail in
             guard let self, let item, let panel = self.panel else { return }
             item.dismissTask?.cancel()
-            let source = ImageDragSource(output: output) { [weak self, weak item] accepted in
+            let source = ImageDragSource(entry: entry) { [weak self, weak item] accepted in
                 guard let self, let item else { return }
                 if accepted { self.dismiss(item) } else { self.scheduleDismiss(item) }
             }
@@ -99,7 +112,7 @@ final class PreviewStackController {
         }
         card.apply(callbacks)
 
-        ensurePanel(on: ScreenIndex.screen(for: output.result.sourceDisplayID) ?? NSScreen.main)
+        ensurePanel(on: ScreenIndex.screen(for: entry.sourceDisplayID) ?? NSScreen.main)
 
         // Trim before adding, never in the middle of installing the new card.
         while items.count >= maxRetained, let oldest = items.first {

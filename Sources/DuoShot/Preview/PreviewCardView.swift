@@ -30,6 +30,11 @@ final class PreviewCardView: NSView {
     static let gestureSlop: CGFloat = 4
 
     private let image: NSImage
+    /// Non-nil turns this into a video card: a play glyph and this string as a
+    /// duration pill. A still needs neither — its thumbnail already says what it
+    /// is, whereas one frame of a recording is indistinguishable from a
+    /// screenshot of the same screen.
+    private let badge: String?
     private var callbacks: Callbacks
     private var isDraggingOut = false
     private var mouseDownGlobal: CGPoint?
@@ -37,10 +42,12 @@ final class PreviewCardView: NSView {
 
     private var actionBar: NSVisualEffectView!
     private var closeButton: NSView!
+    private var playGlyph: NSView?
     private var isHovering = false
 
-    init(image: NSImage, callbacks: Callbacks) {
+    init(image: NSImage, badge: String? = nil, callbacks: Callbacks) {
         self.image = image
+        self.badge = badge
         self.callbacks = callbacks
         super.init(frame: CGRect(origin: .zero, size: Self.cardSize))
         wantsLayer = true
@@ -69,6 +76,15 @@ final class PreviewCardView: NSView {
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     }
 
+    /// Same contract for the decoration that is not a control. An `NSTextField`
+    /// answers `hitTest` with itself even when it is a plain label, which would
+    /// leave a corner of the card where drag and double-click quietly stop
+    /// working.
+    private final class PassthroughView: NSView {
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    }
+
     private func buildSubviews() {
         let imageView = PassthroughImageView(frame: bounds)
         imageView.autoresizingMask = [.width, .height]
@@ -83,6 +99,8 @@ final class PreviewCardView: NSView {
         imageView.layer?.borderColor = NSColor(white: 1, alpha: 0.16).cgColor
         imageView.layer?.backgroundColor = NSColor(white: 0.09, alpha: 0.96).cgColor
         addSubview(imageView)
+
+        if let badge { buildVideoDecoration(duration: badge) }
 
         let specs: [(symbol: String, tip: String, action: Selector)] = [
             ("doc.on.doc", "Copy", #selector(copyTapped)),
@@ -152,6 +170,54 @@ final class PreviewCardView: NSView {
         closeButton = closeWell
     }
 
+    /// The two marks that separate a recording from a screenshot: a play glyph
+    /// in the middle and the running time in the top-right.
+    ///
+    /// Top-right for the pill specifically — the bottom edge belongs to the
+    /// action bar and the top-left to the close button, so it is the one corner
+    /// that is never occupied.
+    private func buildVideoDecoration(duration: String) {
+        let diameter: CGFloat = 34
+        let well = PassthroughView(frame: CGRect(
+            x: ((bounds.width - diameter) / 2).rounded(),
+            y: ((bounds.height - diameter) / 2).rounded(),
+            width: diameter, height: diameter))
+        well.autoresizingMask = [.minXMargin, .maxXMargin, .minYMargin, .maxYMargin]
+        well.wantsLayer = true
+        well.layer?.cornerRadius = diameter / 2
+        well.layer?.backgroundColor = NSColor(white: 0.08, alpha: 0.55).cgColor
+        well.layer?.borderWidth = 1
+        well.layer?.borderColor = NSColor(white: 1, alpha: 0.3).cgColor
+
+        let glyph = PassthroughImageView(frame: well.bounds)
+        glyph.image = Self.symbol("play.fill", pointSize: 14, description: "Recording")
+        glyph.contentTintColor = .white
+        glyph.imageScaling = .scaleNone
+        well.addSubview(glyph)
+        addSubview(well)
+        playGlyph = well
+
+        let label = NSTextField(labelWithString: duration)
+        label.font = .monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
+        label.textColor = .white
+        label.sizeToFit()
+
+        let padding = CGSize(width: 7, height: 3)
+        let pill = PassthroughView(frame: CGRect(
+            x: bounds.width - label.frame.width - padding.width * 2 - 6,
+            y: bounds.height - label.frame.height - padding.height * 2 - 6,
+            width: label.frame.width + padding.width * 2,
+            height: label.frame.height + padding.height * 2))
+        pill.autoresizingMask = [.minXMargin, .minYMargin]
+        pill.wantsLayer = true
+        pill.layer?.cornerRadius = pill.frame.height / 2
+        pill.layer?.cornerCurve = .continuous
+        pill.layer?.backgroundColor = NSColor(white: 0.08, alpha: 0.72).cgColor
+        label.setFrameOrigin(CGPoint(x: padding.width, y: padding.height))
+        pill.addSubview(label)
+        addSubview(pill)
+    }
+
     /// SF Symbols render at their natural size unless told otherwise, and
     /// `imageScaling` only ever scales *down*. Without an explicit point size the
     /// glyphs came out several times larger than their buttons.
@@ -209,6 +275,10 @@ final class PreviewCardView: NSView {
             context.duration = 0.12
             actionBar.animator().alphaValue = hovering ? 1 : 0
             closeButton.animator().alphaValue = hovering ? 1 : 0
+            // Recedes rather than disappears: it is what marks the card as a
+            // recording, and hovering is exactly when you are deciding what the
+            // card is.
+            playGlyph?.animator().alphaValue = hovering ? 0.35 : 1
         }
         callbacks.hoverChanged(hovering)
     }

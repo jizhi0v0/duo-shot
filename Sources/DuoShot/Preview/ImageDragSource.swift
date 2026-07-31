@@ -12,8 +12,14 @@ import UniformTypeIdentifiers
 /// `NS_SWIFT_NONISOLATED`, which is awkward under Swift 6.
 @MainActor
 final class ImageDragSource: NSObject, NSDraggingSource, NSPasteboardItemDataProvider {
-    private let output: OutputPipeline.Output
     private let onCompleted: (Bool) -> Void
+
+    /// Off for a recording. The image flavours below re-read the file and hand
+    /// it to `NSBitmapImageRep`, which an .mp4 is not — offering `.png` for one
+    /// advertises a flavour that resolves to nothing, and a destination that
+    /// prefers image data over a file URL (rich-text fields do) would take the
+    /// advertised one and receive an empty drop.
+    private let providesImageData: Bool
 
     /// The provider callback below is `nonisolated` and runs on whichever thread
     /// asks for the data, so everything it needs must be Sendable and reachable
@@ -26,10 +32,10 @@ final class ImageDragSource: NSObject, NSDraggingSource, NSPasteboardItemDataPro
     /// clicks on the panel register as failed drags.
     static let threshold: CGFloat = 3
 
-    init(output: OutputPipeline.Output, onCompleted: @escaping (Bool) -> Void) {
-        self.output = output
+    init(entry: PreviewEntry, onCompleted: @escaping (Bool) -> Void) {
         self.onCompleted = onCompleted
-        self.fileURL = output.url
+        self.fileURL = entry.url
+        self.providesImageData = !entry.isVideo
         super.init()
     }
 
@@ -37,11 +43,13 @@ final class ImageDragSource: NSObject, NSDraggingSource, NSPasteboardItemDataPro
         let item = NSPasteboardItem()
         // The file URL is what makes Finder, Mail, Slack, Figma and browser file
         // inputs all do the right thing.
-        item.setString(output.url.absoluteString, forType: .fileURL)
+        item.setString(fileURL.absoluteString, forType: .fileURL)
         // Image bytes as well, for rich-text fields that only accept image data.
         // Supplied lazily so dragging into Finder never materialises a redundant
         // multi-megabyte TIFF.
-        item.setDataProvider(self, forTypes: [.png, .tiff])
+        if providesImageData {
+            item.setDataProvider(self, forTypes: [.png, .tiff])
+        }
 
         let draggingItem = NSDraggingItem(pasteboardWriter: item)
         let frame = CGRect(origin: .zero, size: view.bounds.size)
