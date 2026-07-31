@@ -61,9 +61,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     /// Reflects the recorder's state in the menu bar.
     ///
-    /// Safe to show a live timer up here: measured (M9), a stream never renders
-    /// the capturing process's own windows, and the status item is one of ours —
-    /// so a running clock does not end up inside a fullscreen recording.
+    /// The live timer up here is only safe because of `setHiddenFromCapture`.
+    ///
+    /// It was originally justified by M9 — "a stream never renders the capturing
+    /// process's own windows" — which was withdrawn on 2026-07-31: this item is
+    /// an ordinary `.readOnly` AppKit window and measured 2765 of its 2880 px
+    /// came back inside a recording. So the clock is hidden from ScreenCaptureKit
+    /// for the length of a take instead.
     func refreshRecordingState() {
         recordingTicker?.invalidate()
         recordingTicker = nil

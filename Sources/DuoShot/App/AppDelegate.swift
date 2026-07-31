@@ -45,8 +45,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // of the next one.
         // The recording HUD is on screen for the length of a take, and a
         // screenshot taken during one would otherwise photograph it. Recordings
-        // do not need this — a stream never renders our own windows (M9) — but
-        // screenshots do.
+        // are covered by `sharingType = .none` on the panels themselves rather
+        // than by this list — NOT, as this comment claimed until 2026-07-31,
+        // because a stream declines to render our own windows. It does render
+        // them; see the M9 revision in the plan.
         coordinator.additionalExcludedWindowIDs = { [weak self] in
             guard let self else { return [] }
             return self.previews.panelWindowIDs.union(self.recorder.excludedWindowIDs)
