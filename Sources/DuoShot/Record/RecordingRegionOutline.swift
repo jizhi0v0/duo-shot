@@ -17,7 +17,7 @@ final class RecordingRegionOutlinePanel: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 
-    init(contentRect: CGRect, view: NSView) {
+    init(contentRect: CGRect, view: NSView, hiddenFromCapture: Bool = true) {
         super.init(
             contentRect: contentRect,
             styleMask: [.borderless, .nonactivatingPanel],
@@ -39,7 +39,7 @@ final class RecordingRegionOutlinePanel: NSPanel {
         worksWhenModal = true
         isReleasedWhenClosed = false
         animationBehavior = .none
-        sharingType = Self.usesSharingTypeNone ? .none : .readOnly
+        sharingType = (Self.usesSharingTypeNone && hiddenFromCapture) ? .none : .readOnly
 
         contentView = view
     }
@@ -97,7 +97,7 @@ final class RecordingRegionOutline {
     /// `rect` is the recorded region in AppKit global points. The panel is grown
     /// outwards from it so the border brackets the region rather than sitting
     /// inside it and shaving two points off every edge of what you see.
-    func show(around rect: CGRect) {
+    func show(around rect: CGRect, hiddenFromCapture: Bool = true) {
         let width = RecordingRegionOutlineView.strokeWidth
         let frame = rect.insetBy(dx: -width, dy: -width)
         if let panel {
@@ -106,7 +106,8 @@ final class RecordingRegionOutline {
         }
         let view = RecordingRegionOutlineView(frame: CGRect(origin: .zero, size: frame.size))
         view.autoresizingMask = [.width, .height]
-        let created = RecordingRegionOutlinePanel(contentRect: frame, view: view)
+        let created = RecordingRegionOutlinePanel(
+            contentRect: frame, view: view, hiddenFromCapture: hiddenFromCapture)
         created.orderFrontRegardless()
         panel = created
     }

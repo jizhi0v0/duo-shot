@@ -76,7 +76,7 @@ enum SelfTest {
         /// is already running — ends up inside the recording.
         case recordHUD(
             directory: URL, seconds: Double, sharingNone: Bool, hudFirst: Bool,
-            plainWindow: Bool, statusItem: Bool)
+            plainWindow: Bool, statusItem: Bool, excludeIDs: Bool)
 
         init?(arguments: [String]) {
             let rest = arguments.dropFirst()
@@ -155,7 +155,12 @@ enum SelfTest {
                     // every window this process owns, our own status item
                     // vanishes from a fullscreen recording — which decides
                     // whether a running timer can live up there.
-                    statusItem: rest.contains("--status-item"))
+                    statusItem: rest.contains("--status-item"),
+                    // Puts the surface's window ID into the stream's exclusion
+                    // list. Only meaningful with `--hud-first`: a window that
+                    // does not exist when `SCContentFilter` is built cannot be
+                    // named in it.
+                    excludeIDs: rest.contains("--exclude-ids"))
             case "--selftest-microphone":
                 self = .microphone
             case "--selftest-record":
@@ -237,10 +242,12 @@ enum SelfTest {
             case .microphone: return await microphoneCheck()
             case .recordFlow(let directory, let seconds):
                 return try await recordFlow(into: directory, seconds: seconds)
-            case .recordHUD(let d, let seconds, let sharingNone, let hudFirst, let plain, let status):
+            case .recordHUD(let d, let seconds, let sharingNone, let hudFirst, let plain,
+                            let status, let excludeIDs):
                 return try await recordHUD(
                     into: d, seconds: seconds, sharingNone: sharingNone,
-                    hudFirst: hudFirst, plainWindow: plain, statusItem: status)
+                    hudFirst: hudFirst, plainWindow: plain, statusItem: status,
+                    excludeIDs: excludeIDs)
             case .record(let directory, let seconds, let rect, let audio, let microphone, let fps):
                 return try await recordCheck(
                     into: directory, seconds: seconds, rect: rect,
@@ -3118,7 +3125,7 @@ enum SelfTest {
 
     private static func recordHUD(
         into directory: URL, seconds: Double, sharingNone: Bool, hudFirst: Bool,
-        plainWindow: Bool, statusItem useStatusItem: Bool
+        plainWindow: Bool, statusItem useStatusItem: Bool, excludeIDs: Bool = false
     ) async throws -> Int32 {
         guard ScreenPermission.isGranted else { return permissionHint() }
         if let hint = LoginSession.noDisplaysHint {
@@ -3192,6 +3199,15 @@ enum SelfTest {
                 print("paint:         \(painted) px magenta before the stream was built")
             } else {
                 try await Task.sleep(for: .milliseconds(400))
+            }
+            // Named in the filter only now, because the window has to exist
+            // before it can be named — which is the whole reason this only
+            // works in the hud-first ordering.
+            if excludeIDs {
+                let id = status?.button?.window?.windowNumber ?? plain?.windowNumber
+                    ?? hud.windowIDs.first.map(Int.init)
+                options.excludedWindowIDs = id.map { [CGWindowID($0)] } ?? []
+                print("excluding:     window \(id.map(String.init) ?? "<none>") from the stream")
             }
             recording = try await engine.start(.display(displayID), options: options, to: url)
         } else {
@@ -3350,6 +3366,13 @@ enum SelfTest {
                 + (leaked
                     ? "sharingType = .none did NOT keep the surface out of the recording"
                     : "on screen and absent from the recording, which is what .none must do"))
+            return leaked ? 1 : 0
+        }
+        if excludeIDs {
+            print("result:        \(leaked ? "FAIL" : "PASS") — "
+                + (leaked
+                    ? "named in excludingWindows and recorded anyway (\(magenta) px)"
+                    : "on screen, .readOnly, and kept out of the video by its window ID"))
             return leaked ? 1 : 0
         }
         print("result:        \(leaked ? "PASS" : "FAIL") — "

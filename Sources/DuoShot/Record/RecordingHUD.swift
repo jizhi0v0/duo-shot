@@ -19,7 +19,7 @@ final class RecordingHUDPanel: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 
-    init(contentRect: CGRect, view: NSView) {
+    init(contentRect: CGRect, view: NSView, hiddenFromCapture: Bool = true) {
         super.init(
             contentRect: contentRect,
             styleMask: [.borderless, .nonactivatingPanel],
@@ -46,7 +46,7 @@ final class RecordingHUDPanel: NSPanel {
         worksWhenModal = true
         isReleasedWhenClosed = false
         animationBehavior = .utilityWindow
-        sharingType = Self.usesSharingTypeNone ? .none : .readOnly
+        sharingType = (Self.usesSharingTypeNone && hiddenFromCapture) ? .none : .readOnly
 
         contentView = view
     }
@@ -306,9 +306,10 @@ final class RecordingHUD {
     /// object as far as the user is concerned, and a cut between them is the
     /// thing that made starting a recording feel like three separate windows.
     func showStarting(
-        on screen: NSScreen?, under region: CGRect? = nil, morphingFrom: CGRect? = nil
+        on screen: NSScreen?, under region: CGRect? = nil, morphingFrom: CGRect? = nil,
+        hiddenFromCapture: Bool = true
     ) {
-        show(on: screen, elapsed: nil)
+        show(on: screen, elapsed: nil, hiddenFromCapture: hiddenFromCapture)
         if let region, let screen = panel?.screen ?? screen {
             anchor = (region, screen)
         }
@@ -366,7 +367,10 @@ final class RecordingHUD {
 
     /// Bottom-centre of the recording's own screen, which is where the user is
     /// already looking when they go to stop.
-    func show(on screen: NSScreen?, elapsed: (() -> TimeInterval)?) {
+    func show(
+        on screen: NSScreen?, elapsed: (() -> TimeInterval)?,
+        hiddenFromCapture: Bool = true
+    ) {
         guard panel == nil else { return }
         let screen = screen ?? NSScreen.main ?? NSScreen.screens[0]
         let size = RecordingHUDView.barSize
@@ -378,7 +382,8 @@ final class RecordingHUD {
         callbacks.discard = { [weak self] in self?.onDiscard() }
 
         let view = RecordingHUDView(callbacks: callbacks)
-        let panel = RecordingHUDPanel(contentRect: frame, view: view)
+        let panel = RecordingHUDPanel(
+            contentRect: frame, view: view, hiddenFromCapture: hiddenFromCapture)
         panel.orderFrontRegardless()
         self.panel = panel
         self.view = view

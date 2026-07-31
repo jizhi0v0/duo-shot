@@ -143,7 +143,14 @@ final class RecordingCoordinator {
     private var morphOrigin: CGRect?
 
     private func begin(_ request: RecordingRequest) async {
-        let options = Preferences.shared.recordingOptions
+        var options = Preferences.shared.recordingOptions
+        // Visible to screen sharing only if the user asked. Unlike the overlay,
+        // these two CAN be visible during a take without ending up in it: both
+        // exist before `engine.start` builds the filter, so their window IDs go
+        // into `excludedWindowIDs` below and ScreenCaptureKit leaves them out.
+        // The overlay cannot use that route — it is gone by the time the filter
+        // is built, and an overlay raised later cannot be added to a fixed one.
+        let hidden = !Preferences.shared.overlayVisibleToScreenSharing
         let url = StagingStore.shared.reserve(fileExtension: options.fileExtension)
 
         // Before the stream is built, not after: `SCContentFilter` is fixed at
@@ -159,12 +166,19 @@ final class RecordingCoordinator {
         let region: CGRect? = if case .area(_, let rect) = request { rect } else { nil }
         hud.showStarting(
             on: ScreenIndex.screen(for: request.displayID), under: region,
-            morphingFrom: morphOrigin)
+            morphingFrom: morphOrigin, hiddenFromCapture: hidden)
         morphOrigin = nil
         // Only for an area take. On a fullscreen one the answer to "what is
         // being recorded" is the whole screen, and a border round the edge of it
         // would be noise.
-        if let region { regionOutline.show(around: region) }
+        if let region { regionOutline.show(around: region, hiddenFromCapture: hidden) }
+
+        // Populated at last. The field has existed since the recorder was
+        // written and was always empty, on the strength of M9's claim that a
+        // stream never renders our own windows — which was withdrawn. With
+        // `sharingType = .none` it was merely redundant; without it, it is the
+        // only thing keeping this bar out of the take.
+        options.excludedWindowIDs = excludedWindowIDs
 
         do {
             let recording = try await engine.start(request, options: options, to: url)

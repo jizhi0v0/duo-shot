@@ -226,6 +226,7 @@ test: verify
 	run "hud recorded (readOnly)" --selftest-record-hud $(TEST_OUT) --seconds 2; \
 	run "hud absent (.none)"     --selftest-record-hud $(TEST_OUT) --seconds 2 --sharing-none; \
 	run "plain window recorded"  --selftest-record-hud $(TEST_OUT) --seconds 2 --plain-window --hud-first; \
+	run "excluded by window ID"  --selftest-record-hud $(TEST_OUT) --seconds 2 --plain-window --hud-first --exclude-ids; \
 	run "menu-bar item recorded" --selftest-record-hud $(TEST_OUT) --seconds 2 --status-item --hud-first; \
 	run "recording flow"         --selftest-record-flow $(TEST_OUT) --seconds 2; \
 	printf '  %-26s ' "exclusion negative control"; \
