@@ -95,12 +95,29 @@ final class RecordingHUDView: NSView {
     private static let startingWidth: CGFloat = 78
     private static let stopTitle = "Stop"
 
+    /// The running bar. Also the panel's size at creation, since that is the
+    /// state it spends the take in.
     static var barSize: CGSize {
-        let width = HUDMetrics.margin + Self.dotSize + 8 + Self.timeWidth
-            + HUDMetrics.groupGap + 1 + HUDMetrics.groupGap
-            + HUDPill.width(for: Self.stopTitle) + HUDMetrics.gap
-            + HUDMetrics.iconWidth + HUDMetrics.margin
-        return CGSize(width: width, height: HUDMetrics.height)
+        CGSize(width: width(for: .recording), height: HUDMetrics.height)
+    }
+
+    /// Width per state, because the two states hold very different amounts.
+    ///
+    /// A bar sized for the running state and then emptied down to a dot and one
+    /// word leaves two thirds of itself blank, which reads as broken rather than
+    /// as waiting. Resizing once, at the moment the take actually begins, is a
+    /// state change the user is expecting anyway.
+    static func width(for phase: Phase) -> CGFloat {
+        let lead = HUDMetrics.margin + Self.dotSize + 8
+        switch phase {
+        case .starting:
+            return lead + Self.startingWidth + HUDMetrics.margin
+        case .recording:
+            return lead + Self.timeWidth
+                + HUDMetrics.groupGap + 1 + HUDMetrics.groupGap
+                + HUDPill.width(for: Self.stopTitle) + HUDMetrics.gap
+                + HUDMetrics.iconWidth + HUDMetrics.margin
+        }
     }
 
     private var callbacks = Callbacks()
@@ -152,11 +169,11 @@ final class RecordingHUDView: NSView {
         pulse()
         x += Self.dotSize + 8
 
-        timeLabel.frame = CGRect(x: x, y: 0, width: Self.timeWidth, height: Self.barSize.height)
         timeLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
         timeLabel.textColor = .labelColor
         timeLabel.alignment = .left
         timeLabel.cell?.usesSingleLineMode = true
+        placeTimeLabel(x: x, width: Self.timeWidth)
         addSubview(timeLabel)
         x += Self.timeWidth + HUDMetrics.groupGap
 
@@ -200,11 +217,9 @@ final class RecordingHUDView: NSView {
         case .starting:
             dot.layer?.backgroundColor = NSColor.tertiaryLabelColor.cgColor
             dot.layer?.removeAnimation(forKey: "pulse")
-            timeLabel.frame = CGRect(
-                x: timeLabel.frame.minX, y: 0,
-                width: Self.startingWidth, height: Self.barSize.height)
             timeLabel.stringValue = "Starting…"
             timeLabel.font = .systemFont(ofSize: 12, weight: .medium)
+            placeTimeLabel(x: timeLabel.frame.minX, width: Self.startingWidth)
             timeLabel.textColor = .secondaryLabelColor
             stopPill?.isHidden = true
             discardButton?.isHidden = true
@@ -212,16 +227,28 @@ final class RecordingHUDView: NSView {
         case .recording:
             dot.layer?.backgroundColor = NSColor.systemRed.cgColor
             pulse()
-            timeLabel.frame = CGRect(
-                x: timeLabel.frame.minX, y: 0,
-                width: Self.timeWidth, height: Self.barSize.height)
             timeLabel.stringValue = "0:00"
             timeLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+            placeTimeLabel(x: timeLabel.frame.minX, width: Self.timeWidth)
             timeLabel.textColor = .labelColor
             stopPill?.isHidden = false
             discardButton?.isHidden = false
             divider?.isHidden = false
         }
+    }
+
+    /// Centres the label on its own natural height.
+    ///
+    /// Giving it the full bar height instead is what broke the layout: an
+    /// `NSTextField` draws its text at the TOP of a frame taller than the text,
+    /// so the clock floated above centre while the dot, the divider and both
+    /// buttons sat correctly centred around it. The frames all read as correct
+    /// in a dump; only rendering it showed the problem.
+    private func placeTimeLabel(x: CGFloat, width: CGFloat) {
+        let height = ceil(timeLabel.font?.boundingRectForFont.height ?? 18)
+        timeLabel.frame = CGRect(
+            x: x, y: ((Self.barSize.height - height) / 2).rounded(),
+            width: width, height: height)
     }
 
     private func pulse() {
@@ -266,14 +293,29 @@ final class RecordingHUD {
     func showStarting(on screen: NSScreen?) {
         show(on: screen, elapsed: nil)
         view?.setPhase(.starting)
+        resize(to: .starting)
     }
 
     /// Switches the bar to its running state and starts the clock. The panel is
     /// already up by now; nothing moves, the contents change.
     func beginRecording(elapsed: @escaping () -> TimeInterval) {
         view?.setPhase(.recording)
+        resize(to: .recording)
         elapsedProvider = elapsed
         startTicker()
+    }
+
+    /// Keeps the bar centred on its screen as it changes width, so it grows
+    /// from the middle rather than sliding sideways.
+    private func resize(to phase: RecordingHUDView.Phase) {
+        guard let panel else { return }
+        let width = RecordingHUDView.width(for: phase)
+        let frame = CGRect(
+            x: (panel.frame.midX - width / 2).rounded(),
+            y: panel.frame.minY,
+            width: width, height: RecordingHUDView.barSize.height)
+        panel.setFrame(frame, display: true)
+        view?.frame = CGRect(origin: .zero, size: frame.size)
     }
 
     /// Bottom-centre of the recording's own screen, which is where the user is
@@ -343,4 +385,15 @@ final class RecordingHUD {
     }
 
     var frameForTest: CGRect? { panel?.frame }
+
+    /// Every subview's frame, for `--selftest-hud-appearance`. Layout bugs are
+    /// far quicker to read as numbers than to squint at in a screenshot.
+    var debugSubviewFrames: [String] {
+        guard let content = panel?.contentView else { return [] }
+        return content.subviews.map { view in
+            let kind = "\(type(of: view))"
+            return "\(kind) \(Int(view.frame.minX)),\(Int(view.frame.minY)) "
+                + "\(Int(view.frame.width))x\(Int(view.frame.height))"
+        }
+    }
 }

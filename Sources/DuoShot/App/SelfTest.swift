@@ -50,6 +50,7 @@ enum SelfTest {
         /// double-resumed continuation and leaked panels.
         case lifecycle(iterations: Int)
         case selectionToolbar
+        case hudAppearance(directory: URL)
         /// Repeated captures through the whole pipeline, watching memory and the
         /// staging store.
         case soak(iterations: Int, directory: URL)
@@ -109,6 +110,11 @@ enum SelfTest {
                 self = .output(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-preferences":
                 self = .preferences
+            case "--selftest-hud-appearance":
+                RecordingHUDPanel.usesSharingTypeNone = false
+                SelectionToolbarPanel.usesSharingTypeNone = false
+                self = .hudAppearance(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-selection-toolbar":
                 self = .selectionToolbar
             case "--selftest-lifecycle":
@@ -221,6 +227,7 @@ enum SelfTest {
             case .settingsResize: return try await settingsResize()
             case .lifecycle(let iterations): return try await lifecycle(iterations: iterations)
             case .selectionToolbar: return try await selectionToolbar()
+            case .hudAppearance(let d): return try await hudAppearance(into: d)
             case .soak(let iterations, let directory):
                 return try await soak(iterations: iterations, into: directory)
             case .microphone: return await microphoneCheck()
@@ -1778,6 +1785,66 @@ enum SelfTest {
     /// reconfiguration, a second `present` — and a `CheckedContinuation` that is
     /// resumed twice is a hard crash while one never resumed hangs the caller
     /// forever. This drives every route in turn, many times.
+    /// Photographs both floating bars, in every state, so their layout can be
+    /// looked at instead of reasoned about.
+    ///
+    /// Reasoning about it is what went wrong: a rewrite that shared metrics
+    /// between the two bars compiled, passed the whole suite, and rendered
+    /// wrongly — because nothing in the suite has ever looked at the HUD.
+    ///
+    /// Both panels ship `sharingType = .none`, so the arguments turn that off;
+    /// with it on they are invisible to ScreenCaptureKit and every frame would
+    /// come back empty.
+    private static func hudAppearance(into directory: URL) async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+        if let hint = LoginSession.noDisplaysHint {
+            FileHandle.standardError.write(Data("error: \(hint)\n".utf8))
+            return 2
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        guard let screen = NSScreen.main,
+              let displayID = ScreenIndex.displayID(of: screen)
+        else { throw CaptureError.noDisplays }
+
+        let engine = CaptureEngine()
+        try await engine.refreshContent()
+
+        func shoot(_ name: String, frame: CGRect) async throws {
+            try await Task.sleep(for: .milliseconds(400))
+            let shot = try await engine.capture(
+                .area(displayID: displayID, rectInAppKitGlobal: frame))
+            let url = directory.appendingPathComponent("\(name).png")
+            try? ImageEncoder.write(shot.image, to: url, as: .png, scale: shot.scale)
+            print("  \(name).png  \(rectString(frame))")
+        }
+
+        let hud = RecordingHUD()
+        hud.showStarting(on: screen)
+        guard let starting = hud.frameForTest else { return 1 }
+        try await shoot("hud-starting", frame: starting)
+
+        hud.beginRecording(elapsed: { 754 })
+        guard let running = hud.frameForTest else { return 1 }
+        try await shoot("hud-recording", frame: running)
+        for line in hud.debugSubviewFrames { print("    hud: \(line)") }
+        hud.hide()
+
+        let toolbar = SelectionToolbar()
+        let anchor = CGRect(x: screen.frame.midX - 200, y: screen.frame.midY, width: 400, height: 300)
+        toolbar.show(under: anchor, on: screen)
+        guard let bar = toolbar.frameForTest else { return 1 }
+        try await shoot("toolbar", frame: bar)
+        toolbar.hide()
+
+        // The two are meant to read as one bar changing state, so the thing
+        // worth asserting is that they agree on height. Width legitimately
+        // differs; a HUD as wide as the toolbar would be padding.
+        let sameHeight = abs(starting.height - bar.height) < 0.5
+        print("heights:       hud \(Int(starting.height)) vs toolbar \(Int(bar.height))")
+        print("result:        \(sameHeight ? "PASS" : "FAIL — the two bars are different heights")")
+        return sameHeight ? 0 : 1
+    }
+
     /// The confirmation step: mouse-up arms the selection instead of committing
     /// it, and only the second confirm resumes the caller.
     ///
