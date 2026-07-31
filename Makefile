@@ -9,6 +9,21 @@ CONTENTS  := $(APP)/Contents
 MACOS_DIR := $(CONTENTS)/MacOS
 RES_DIR   := $(CONTENTS)/Resources
 EXEC      := $(MACOS_DIR)/$(APP_NAME)
+# Hardened Runtime denies the microphone outright, with NO prompt, unless the
+# binary claims com.apple.security.device.audio-input. Measured 2026-07-31:
+# --selftest-microphone reported `before=not determined after=denied` on a
+# launchd-parented launch, i.e. attribution was already correct and the
+# entitlement was the whole story. NSMicrophoneUsageDescription is necessary but
+# not sufficient -- it only supplies the prompt's text.
+#
+# Every signing target must pass this: an unentitled re-sign silently breaks
+# recording audio again, and the failure looks like a TCC problem, not a signing
+# one. Entitlements do not participate in the Designated Requirement, so this
+# cannot cost the screen-recording grant -- `verify` is the assertion.
+#
+# Keep the file comment-free. AMFI's plist parser is not plutil's: a comment
+# anywhere in it fails the sign with "AMFIUnserializeXML: syntax error".
+ENTITLEMENTS := Resources/DuoShot.entitlements
 
 .PHONY: all build bundle sign verify run launch logs selftest mic-check install dist clean help
 
@@ -57,6 +72,7 @@ sign: bundle
 		--sign "$(SIGN_ID)" \
 		--identifier $(BUNDLE_ID) \
 		--options runtime \
+		--entitlements $(ENTITLEMENTS) \
 		--timestamp=none \
 		"$(APP)"
 	@echo "signed $(APP)"
@@ -191,6 +207,7 @@ dist: bundle
 		--sign "$(SIGN_ID)" \
 		--identifier $(BUNDLE_ID) \
 		--options runtime \
+		--entitlements $(ENTITLEMENTS) \
 		--timestamp \
 		"$(APP)"
 	@mkdir -p dist
