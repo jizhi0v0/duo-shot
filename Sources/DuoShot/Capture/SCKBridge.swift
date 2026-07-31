@@ -30,7 +30,6 @@ nonisolated enum CaptureError: Error, LocalizedError {
     case noImageProduced
     case encodingFailed(String)
     case recordingStartTimedOut(Double)
-    case recordingNotRunning
 
     var errorDescription: String? {
         switch self {
@@ -42,8 +41,6 @@ nonisolated enum CaptureError: Error, LocalizedError {
             "No SCDisplay for display ID \(id)."
         case .windowNotFound(let id):
             "No SCWindow for window ID \(id)."
-        case .recordingNotRunning:
-            "No recording is running."
         case .noImageProduced:
             "Capture succeeded but produced no image."
         case .encodingFailed(let why):
@@ -310,23 +307,6 @@ nonisolated final class SCKRecordingSession: NSObject, @unchecked Sendable,
                 self.stream = nil
                 self.recordingOutput = nil
             }
-            throw CaptureError.recordingStartTimedOut(timeout.seconds)
-        }
-    }
-
-    /// Applies a new configuration to the running stream.
-    ///
-    /// Whether an audio change mid-take is safe for the *file* — not just for
-    /// the stream — is not something the SDK header or the documentation
-    /// answers, so `--selftest-record-audio-switch` measures it rather than this
-    /// comment asserting it.
-    func update(configuration: SCStreamConfiguration, timeout: Duration = .seconds(5)) async throws {
-        guard let stream = lock.withLock({ self.stream }) else {
-            throw CaptureError.recordingNotRunning
-        }
-        let updated = SCKLatch()
-        stream.updateConfiguration(configuration) { error in updated.signal(error) }
-        guard try await updated.wait(timeout: timeout) else {
             throw CaptureError.recordingStartTimedOut(timeout.seconds)
         }
     }
