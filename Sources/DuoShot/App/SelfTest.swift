@@ -3457,6 +3457,27 @@ enum SelfTest {
             failures.append("modifier masking left device-dependent bits in place")
         }
 
+        // 1b. isAcceptable is hit for every keypress while recording a
+        // shortcut, so it must not trap and must make the right call for the
+        // two interesting classes: bare F-keys are fine, bare letters are not.
+        // (The kVK_F* codes are scattered — F1 = 122, F20 = 90 — which is why
+        // this is worth pinning: a range over them traps at construction.)
+        let acceptableCases: [(KeyCombo, Bool, String)] = [
+            (KeyCombo(keyCode: UInt16(kVK_F1), modifiers: []), true, "bare F1"),
+            (KeyCombo(keyCode: UInt16(kVK_F20), modifiers: []), true, "bare F20"),
+            (KeyCombo(keyCode: UInt16(kVK_ANSI_A), modifiers: []), false, "bare A"),
+            (KeyCombo(keyCode: UInt16(kVK_ANSI_A), modifiers: [.command]), true, "⌘A"),
+            (KeyCombo(keyCode: UInt16(kVK_ANSI_Q), modifiers: [.command]), false, "⌘Q"),
+            (KeyCombo(keyCode: UInt16(kVK_Escape), modifiers: [.command]), false, "⌘⎋"),
+        ]
+        for (candidate, expected, label) in acceptableCases {
+            let got = candidate.isAcceptable
+            print("acceptable:    \(label.padding(toLength: 10, withPad: " ", startingAt: 0)) -> \(got)")
+            if got != expected {
+                failures.append("isAcceptable(\(label)) = \(got), expected \(expected)")
+            }
+        }
+
         let table: [HotKeyAction: KeyCombo] = [.captureArea: combo]
         guard
             let encoded = try? JSONEncoder().encode(table),

@@ -35,13 +35,22 @@ nonisolated struct KeyCombo: Codable, Hashable, Sendable {
     var isAcceptable: Bool {
         let modifierCount = [flags.contains(.command), flags.contains(.control),
                              flags.contains(.option)].filter { $0 }.count
-        let isFunctionKey = (UInt16(kVK_F1)...UInt16(kVK_F20)).contains(keyCode)
-            || keyCode == UInt16(kVK_F20)
+        let isFunctionKey = Self.functionKeyCodes.contains(keyCode)
         guard modifierCount > 0 || isFunctionKey else { return false }
         if keyCode == UInt16(kVK_Escape) || keyCode == UInt16(kVK_Tab) { return false }
         if flags.contains(.command), keyCode == UInt16(kVK_ANSI_Q) { return false }
         return true
     }
+
+    /// The `kVK_F*` values are scattered (F1 = 122, F20 = 90), so a range
+    /// cannot describe them — it has to be an explicit set.
+    private static let functionKeyCodes: Set<UInt16> = [
+        UInt16(kVK_F1), UInt16(kVK_F2), UInt16(kVK_F3), UInt16(kVK_F4),
+        UInt16(kVK_F5), UInt16(kVK_F6), UInt16(kVK_F7), UInt16(kVK_F8),
+        UInt16(kVK_F9), UInt16(kVK_F10), UInt16(kVK_F11), UInt16(kVK_F12),
+        UInt16(kVK_F13), UInt16(kVK_F14), UInt16(kVK_F15), UInt16(kVK_F16),
+        UInt16(kVK_F17), UInt16(kVK_F18), UInt16(kVK_F19), UInt16(kVK_F20),
+    ]
 
     // MARK: - Display
 
