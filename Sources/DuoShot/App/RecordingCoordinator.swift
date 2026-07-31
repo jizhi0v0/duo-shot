@@ -135,11 +135,16 @@ final class RecordingCoordinator {
         // start, and a sharingType flipped underneath a running stream is not a
         // documented way to change what it renders.
         onCaptureChromeHidden?(true)
+        // Up before the stream, not after it. `startCapture` has been measured
+        // at 3.8–4.3 s on this machine, and showing the HUD only once it
+        // returned left the screen with the selection gone and nothing in its
+        // place for that whole time.
+        hud.showStarting(on: ScreenIndex.screen(for: request.displayID))
 
         do {
             let recording = try await engine.start(request, options: options, to: url)
             state = .recording
-            hud.show(on: ScreenIndex.screen(for: request.displayID), elapsed: { [weak self] in
+            hud.beginRecording(elapsed: { [weak self] in
                 self?.elapsed ?? 0
             })
             // A stream that dies on its own — display unplugged, disk full,
@@ -151,6 +156,10 @@ final class RecordingCoordinator {
             onStateChanged?()
         } catch {
             state = .idle
+            // The starting HUD is up by now and there will be no take to attach
+            // it to. Leaving it would be a bar that claims a recording is on its
+            // way forever.
+            hud.hide()
             onCaptureChromeHidden?(false)
             onStateChanged?()
             Log.record.error("""

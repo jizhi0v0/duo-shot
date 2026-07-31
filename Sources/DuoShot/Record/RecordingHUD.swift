@@ -68,12 +68,28 @@ final class RecordingHUDView: NSView {
         var discard: () -> Void = {}
     }
 
+    /// What the bar is showing.
+    ///
+    /// `starting` exists because `SCStream.startCapture` is not reliably quick.
+    /// Measured 2026-07-31 it is 190–340 ms, but three takes that day took
+    /// 3.8–4.3 s inside that one call, with nothing logged anywhere in the
+    /// system while it sat there. The HUD used to be shown only once the call
+    /// returned, so those seconds had the selection gone and nothing in its
+    /// place, which reads as "the app is broken" rather than "it is starting".
+    enum Phase {
+        case starting
+        case recording
+    }
+
     static let barSize = CGSize(width: 208, height: 44)
 
     private var callbacks = Callbacks()
     private let dot = NSView()
     private let timeLabel = NSTextField(labelWithString: "0:00")
     private var background: NSVisualEffectView!
+    private var stopButton: NSButton?
+    private var discardButton: NSButton?
+    private static let timeLabelFrame = CGRect(x: 32, y: 13, width: 58, height: 18)
 
     init(callbacks: Callbacks) {
         self.callbacks = callbacks
@@ -120,19 +136,54 @@ final class RecordingHUDView: NSView {
         addSubview(dot)
         pulse()
 
-        timeLabel.frame = CGRect(x: 32, y: 13, width: 58, height: 18)
+        timeLabel.frame = Self.timeLabelFrame
         timeLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .medium)
         timeLabel.textColor = .labelColor
         addSubview(timeLabel)
 
-        addSubview(button(
+        let stop = button(
             symbol: "stop.fill", tint: .systemRed,
             frame: CGRect(x: 96, y: 7, width: 46, height: 30),
-            action: #selector(stopTapped), tooltip: "Stop and keep the recording"))
-        addSubview(button(
+            action: #selector(stopTapped), tooltip: "Stop and keep the recording")
+        let discard = button(
             symbol: "trash", tint: .secondaryLabelColor,
             frame: CGRect(x: 148, y: 7, width: 46, height: 30),
-            action: #selector(discardTapped), tooltip: "Stop and discard"))
+            action: #selector(discardTapped), tooltip: "Stop and discard")
+        addSubview(stop)
+        addSubview(discard)
+        stopButton = stop
+        discardButton = discard
+    }
+
+    /// Both controls are hidden rather than disabled while starting.
+    ///
+    /// Neither has anything to act on yet — `RecordingCoordinator.stop()` and
+    /// `discard()` both require `state == .recording`, so a press would silently
+    /// do nothing, which is worse than no button. Hiding them also frees the
+    /// width the "Starting…" text needs.
+    func setPhase(_ phase: Phase) {
+        guard !Self.debugFillsMagenta else { return }
+        switch phase {
+        case .starting:
+            dot.layer?.backgroundColor = NSColor.tertiaryLabelColor.cgColor
+            dot.layer?.removeAnimation(forKey: "pulse")
+            timeLabel.frame = CGRect(
+                x: Self.timeLabelFrame.minX, y: Self.timeLabelFrame.minY,
+                width: bounds.width - Self.timeLabelFrame.minX - 12,
+                height: Self.timeLabelFrame.height)
+            timeLabel.stringValue = "Starting…"
+            timeLabel.textColor = .secondaryLabelColor
+            stopButton?.isHidden = true
+            discardButton?.isHidden = true
+        case .recording:
+            dot.layer?.backgroundColor = NSColor.systemRed.cgColor
+            pulse()
+            timeLabel.frame = Self.timeLabelFrame
+            timeLabel.stringValue = "0:00"
+            timeLabel.textColor = .labelColor
+            stopButton?.isHidden = false
+            discardButton?.isHidden = false
+        }
     }
 
     private func button(
@@ -188,9 +239,29 @@ final class RecordingHUD {
     var onStop: () -> Void = {}
     var onDiscard: () -> Void = {}
 
+    /// Puts the bar on screen in its `starting` state, before the stream exists.
+    ///
+    /// Called the moment the selection is committed so the gap between "the
+    /// selection disappeared" and "the recording is running" is never empty —
+    /// see `RecordingHUDView.Phase`. The panel is `sharingType = .none`, so
+    /// existing before the `SCContentFilter` is built costs nothing: it is
+    /// invisible to the stream either way.
+    func showStarting(on screen: NSScreen?) {
+        show(on: screen, elapsed: nil)
+        view?.setPhase(.starting)
+    }
+
+    /// Switches the bar to its running state and starts the clock. The panel is
+    /// already up by now; nothing moves, the contents change.
+    func beginRecording(elapsed: @escaping () -> TimeInterval) {
+        view?.setPhase(.recording)
+        elapsedProvider = elapsed
+        startTicker()
+    }
+
     /// Bottom-centre of the recording's own screen, which is where the user is
     /// already looking when they go to stop.
-    func show(on screen: NSScreen?, elapsed: @escaping () -> TimeInterval) {
+    func show(on screen: NSScreen?, elapsed: (() -> TimeInterval)?) {
         guard panel == nil else { return }
         let screen = screen ?? NSScreen.main ?? NSScreen.screens[0]
         let size = RecordingHUDView.barSize
@@ -214,6 +285,13 @@ final class RecordingHUD {
         // into it is a data race the compiler correctly refuses; reaching it
         // back through MainActor-isolated `self` keeps it in one region.
         elapsedProvider = elapsed
+        // No provider means the caller is `showStarting`: there is no stream to
+        // ask for an elapsed time yet, so there is nothing for a ticker to do.
+        if elapsed != nil { startTicker() }
+    }
+
+    private func startTicker() {
+        ticker?.invalidate()
         let ticker = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }

@@ -160,14 +160,26 @@ final class RecordingEngine {
         let started = ContinuousClock.now
         try await session.start(
             filter: filter, configuration: configuration, recording: recordingConfiguration)
+        let captureStarted = ContinuousClock.now
 
         // `startCapture` returning is not the same as the file existing. Wait for
         // the writer, so a caller that stops after 200 ms cannot produce a file
         // that was never opened.
+        //
+        // The two halves are timed separately because they fail slowly for
+        // completely different reasons and the sum cannot tell them apart.
+        // Measured 2026-07-31, takes on this machine came in at 126–243 ms while
+        // two outliers hit 3887 ms and 4280 ms — and with one number there was
+        // no way to say whether ScreenCaptureKit was slow to start or the writer
+        // was waiting on a first frame that a still screen never produced
+        // (`SCFrameStatusIdle` is a documented state, so no frame is a thing
+        // that happens).
         guard try await session.writerStarted.wait(timeout: .seconds(5)) else {
             _ = try? await session.stop()
             throw RecordingError.writerNeverStarted
         }
+        let writerLatency = captureStarted.duration(to: .now).milliseconds
+        let captureLatency = started.duration(to: captureStarted).milliseconds
 
         let index = content.displayIDs.firstIndex(of: displayID).map { $0 + 1 } ?? 1
         let recording = ActiveRecording(
@@ -186,7 +198,9 @@ final class RecordingEngine {
             scale=\(scale, privacy: .public) fps<=\(options.frameRate, privacy: .public) \
             audio=\(options.capturesSystemAudio, privacy: .public) \
             mic=\(options.capturesMicrophone, privacy: .public) \
-            in \(started.duration(to: .now).milliseconds, privacy: .public) ms
+            in \(started.duration(to: .now).milliseconds, privacy: .public) ms \
+            (startCapture \(captureLatency, privacy: .public) ms + \
+            first frame \(writerLatency, privacy: .public) ms)
             """)
         return recording
     }
