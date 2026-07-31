@@ -2808,6 +2808,18 @@ enum SelfTest {
         view.layer?.backgroundColor = NSColor.magenta.cgColor
         window.contentView = view
         window.backgroundColor = .magenta
+        // `.floating`, despite this being the "most ordinary window AppKit can
+        // make" surface. The property under test is `sharingType` — left at the
+        // default `.readOnly` — and the level is not part of the claim: M9's own
+        // matrix showed level, panel-ness and creation order make no difference.
+        //
+        // What the level *did* affect was whether the test could run at all. A
+        // `.normal` window belongs to a background, non-frontmost process, so any
+        // app coming forward covers it; measured 2026-07-31 this produced runs
+        // where the screenshot saw 0 px and others where it saw 27079 of 36058,
+        // i.e. an intermittent failure reporting "our window was not recorded"
+        // when the truth was "something was sitting on top of it".
+        window.level = .floating
         window.orderFrontRegardless()
         return window
     }
@@ -2870,7 +2882,25 @@ enum SelfTest {
         }
         if hudFirst {
             showSurface()
-            try await Task.sleep(for: .milliseconds(400))
+            // Polled, not slept. A fixed 400 ms was the flaky part of this test
+            // in exactly the way the M2 overlay test taught: it holds on an idle
+            // machine and misses under load, and the failure it produces is
+            // silent and backwards. Measured 2026-07-31, running this straight
+            // after two overlay tests left the plain window still painting when
+            // the stream started, and because the screen was otherwise static
+            // ScreenCaptureKit then delivered no further frame — so the video
+            // held a frame from before the window existed and the test reported
+            // "the surface was NOT recorded", i.e. a pass turning into a failure
+            // that blames the product for the harness being early.
+            //
+            // Skipped under `.none`, where the surface is invisible to the
+            // screenshot by definition and this could only ever time out.
+            if !sharingNone {
+                let painted = await waitUntilPainted(on: displayID, upTo: .seconds(3))
+                print("paint:         \(painted) px magenta before the stream was built")
+            } else {
+                try await Task.sleep(for: .milliseconds(400))
+            }
             recording = try await engine.start(.display(displayID), options: options, to: url)
         } else {
             recording = try await engine.start(.display(displayID), options: options, to: url)
@@ -3029,6 +3059,34 @@ enum SelfTest {
                     + "Either M9 has become true again or this test can no longer detect a leak — "
                     + "check the .none case, which now has no working positive control"))
         return leaked ? 0 : 1
+    }
+
+    /// Blocks until the magenta surface has finished compositing, and returns
+    /// the count it settled on.
+    ///
+    /// "Settled" rather than "non-zero": a window caught mid-composite reports a
+    /// real but partial count — measured 20569 px of an eventual 36060 — so a
+    /// first sighting is not the same as a painted window. Two equal readings in
+    /// a row is the cheapest test for that.
+    private static func waitUntilPainted(
+        on displayID: CGDirectDisplayID, upTo timeout: Duration
+    ) async -> Int {
+        let engine = CaptureEngine()
+        var options = CaptureOptions.default
+        options.excludedWindowIDs = []
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        var previous = -1
+
+        while ContinuousClock.now < deadline {
+            guard
+                let still = try? await engine.capture(.display(displayID), options: options)
+            else { break }
+            let count = PixelCompare.count(still.image, matching: PixelCompare.isDebugMagenta)
+            if count > 500, count == previous { return count }
+            previous = count
+            try? await Task.sleep(for: .milliseconds(120))
+        }
+        return previous
     }
 
     /// Whether the window server lists this window as on screen.
