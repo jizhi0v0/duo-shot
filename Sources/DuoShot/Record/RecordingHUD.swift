@@ -1,63 +1,11 @@
 import AppKit
 
-/// The floating control bar shown while a recording runs.
-///
-/// The one hard constraint that separates it from the selection overlay: it
-/// **must never become key**. The overlay takes the keyboard because nothing
-/// else needs it during a selection; a recording is the opposite situation —
-/// the user is demonstrating an app and typing into it, and a HUD that steals
-/// key status would break their typing for the length of the take. That is also
-/// why `acceptsFirstMouse` is not optional here: in a non-key window the first
-/// click on Stop would otherwise be swallowed as an activation click.
-final class RecordingHUDPanel: NSPanel {
-    /// Test hook, mirroring `OverlayPanel` / `PreviewPanel`. With `.none` the
-    /// panel is invisible to ScreenCaptureKit outright — which is what we ship,
-    /// and which also makes an exclusion test unable to fail, so the self-test
-    /// can turn it off to prove the test responds.
-    static var usesSharingTypeNone = true
-
-    override var canBecomeKey: Bool { false }
-    override var canBecomeMain: Bool { false }
-
-    init(contentRect: CGRect, view: NSView, hiddenFromCapture: Bool = true) {
-        super.init(
-            contentRect: contentRect,
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
-        )
-
-        // See OverlayPanel: isFloatingPanel resets `level`, so it goes first.
-        isFloatingPanel = true
-        becomesKeyOnlyIfNeeded = true
-
-        // Same level as the preview stack: above ordinary floating windows, well
-        // below the overlay's shielding level, so starting a new selection
-        // covers the HUD rather than fighting it.
-        level = .statusBar
-        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
-
-        isOpaque = false
-        backgroundColor = .clear
-        hasShadow = true
-        isMovableByWindowBackground = true
-        acceptsMouseMovedEvents = true
-        hidesOnDeactivate = false
-        worksWhenModal = true
-        isReleasedWhenClosed = false
-        animationBehavior = .utilityWindow
-        sharingType = (Self.usesSharingTypeNone && hiddenFromCapture) ? .none : .readOnly
-
-        contentView = view
-    }
-}
-
 /// The bar's contents: a pulsing record dot, the elapsed time, Stop and Discard.
 ///
-/// Built from `HUDMetrics` and `HUDPill`, the same pieces the pre-record toolbar
-/// uses. The two appear in sequence, in the same place, during one continuous
-/// action — arm the selection, start the take — so they have to read as one bar
-/// changing state rather than as two unrelated pieces of UI.
+/// The second face of `FloatingBarPanel`, and built from the same `HUDMetrics`
+/// and `HUDPill` pieces as the first. It replaces the selection toolbar's
+/// controls inside the bar the user already had in front of them; the glass, the
+/// width and the placement are the window's business.
 ///
 /// It carries no audio controls, and cannot: `SCStream.updateConfiguration`
 /// during a recording ends it (see `RecordingEngine`). Those choices are made on
@@ -85,6 +33,13 @@ final class RecordingHUDView: NSView {
     /// system while it sat there. The HUD used to be shown only once the call
     /// returned, so those seconds had the selection gone and nothing in its
     /// place, which reads as "the app is broken" rather than "it is starting".
+    ///
+    /// The two phases are the same bar: same width, same controls, in the same
+    /// places. `starting` is that bar greyed out, and the take beginning colours
+    /// it in. They used to disagree on both width and which controls existed,
+    /// which — with the selection toolbar before them — made starting a
+    /// recording look like three windows taking turns rather than one bar
+    /// changing state.
     enum Phase {
         case starting
         case recording
@@ -92,43 +47,37 @@ final class RecordingHUDView: NSView {
 
     private static let dotSize: CGFloat = 9
     private static let timeWidth: CGFloat = 46
-    private static let startingWidth: CGFloat = 78
+    /// The clock's slot borrows the gap before the divider when it has to say
+    /// "Starting…" instead of a time. The bar's width is fixed by then, so the
+    /// word has to fit in the space the clock already had.
+    private static let slowStartWidth: CGFloat = 54
     private static let stopTitle = "Stop"
-
-    /// The running bar. Also the panel's size at creation, since that is the
-    /// state it spends the take in.
-    static var barSize: CGSize {
-        CGSize(width: width(for: .recording), height: HUDMetrics.height)
-    }
-
-    /// Width per state, because the two states hold very different amounts.
+    /// How long a start has to take before the bar says so in words.
     ///
-    /// A bar sized for the running state and then emptied down to a dot and one
-    /// word leaves two thirds of itself blank, which reads as broken rather than
-    /// as waiting. Resizing once, at the moment the take actually begins, is a
-    /// state change the user is expecting anyway.
-    static func width(for phase: Phase) -> CGFloat {
-        let lead = HUDMetrics.margin + Self.dotSize + 8
-        switch phase {
-        case .starting:
-            return lead + Self.startingWidth + HUDMetrics.margin
-        case .recording:
-            return lead + Self.timeWidth
-                + HUDMetrics.groupGap + 1 + HUDMetrics.groupGap
-                + HUDPill.width(for: Self.stopTitle) + HUDMetrics.gap
-                + HUDMetrics.iconWidth + HUDMetrics.margin
-        }
+    /// Under this the grey is a blink, and a word flashing up inside it would be
+    /// noise. Over it the user is waiting — and a start that is being retried
+    /// can sit here for seconds — so a still bar needs to admit what it is
+    /// doing.
+    private static let slowStartDelay: TimeInterval = 1.2
+
+    /// One size for both phases, so nothing about the window changes when the
+    /// take begins.
+    static var barSize: CGSize { CGSize(width: width, height: HUDMetrics.height) }
+
+    static var width: CGFloat {
+        HUDMetrics.margin + Self.dotSize + 8 + Self.timeWidth
+            + HUDMetrics.groupGap + 1 + HUDMetrics.groupGap
+            + HUDPill.width(for: Self.stopTitle) + HUDMetrics.gap
+            + HUDMetrics.iconWidth + HUDMetrics.margin
     }
 
     private var callbacks = Callbacks()
     private let dot = NSView()
     private let timeLabel = NSTextField(labelWithString: "0:00")
-    private var glass: NSGlassEffectView!
-    /// Where every control lives — see `HUDMetrics.chrome`.
-    private var content: NSView!
     private var stopPill: HUDPill?
     private var discardButton: NSButton?
-    private var divider: NSView?
+    private var timeOriginX: CGFloat = 0
+    private var slowStartTimer: Timer?
 
     init(callbacks: Callbacks) {
         self.callbacks = callbacks
@@ -157,11 +106,6 @@ final class RecordingHUDView: NSView {
         // exactly how the M4 preview panel came out blank.
         if Self.debugFillsMagenta { return }
 
-        let chrome = HUDMetrics.chrome(in: bounds)
-        glass = chrome.glass
-        content = chrome.content
-        addSubview(glass)
-
         var x = HUDMetrics.margin
         dot.frame = CGRect(
             x: x, y: ((Self.barSize.height - Self.dotSize) / 2).rounded(),
@@ -169,21 +113,25 @@ final class RecordingHUDView: NSView {
         dot.wantsLayer = true
         dot.layer?.backgroundColor = NSColor.systemRed.cgColor
         dot.layer?.cornerRadius = Self.dotSize / 2
-        content.addSubview(dot)
-        pulse()
+        addSubview(dot)
+        pulse(live: true)
         x += Self.dotSize + 8
 
         timeLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
         timeLabel.textColor = .labelColor
         timeLabel.alignment = .left
         timeLabel.cell?.usesSingleLineMode = true
-        placeTimeLabel(x: x, width: Self.timeWidth)
-        content.addSubview(timeLabel)
+        timeLabel.lineBreakMode = .byTruncatingTail
+        timeLabel.wantsLayer = true
+        timeOriginX = x
+        placeTimeLabel(width: Self.timeWidth)
+        addSubview(timeLabel)
         x += Self.timeWidth + HUDMetrics.groupGap
 
-        let line = HUDMetrics.divider(x: x)
-        content.addSubview(line)
-        divider = line
+        // Kept lit in both phases. It is part of the bar's shape rather than
+        // one of its controls, and a rule that blinks out and back is one more
+        // thing changing at the moment the take starts.
+        addSubview(HUDMetrics.divider(x: x))
         x += 1 + HUDMetrics.groupGap
 
         let stop = HUDPill(title: Self.stopTitle, mark: .symbol("stop.fill"), tint: .systemRed)
@@ -191,7 +139,7 @@ final class RecordingHUDView: NSView {
             x: x, y: ((Self.barSize.height - HUDMetrics.controlHeight) / 2).rounded()))
         stop.onClick = { [weak self] in self?.callbacks.stop() }
         stop.toolTip = "Stop and keep the recording"
-        content.addSubview(stop)
+        addSubview(stop)
         stopPill = stop
         x += stop.frame.width + HUDMetrics.gap
 
@@ -206,39 +154,79 @@ final class RecordingHUDView: NSView {
         discard.target = self
         discard.action = #selector(discardTapped)
         discard.toolTip = "Stop and discard"
-        content.addSubview(discard)
+        discard.wantsLayer = true
+        addSubview(discard)
         discardButton = discard
     }
 
-    /// Both controls are hidden rather than disabled while starting.
+    /// Every control stays put and goes grey rather than disappearing.
     ///
-    /// Neither has anything to act on yet — `RecordingCoordinator.stop()` and
-    /// `discard()` both require `state == .recording`, so a press would silently
-    /// do nothing, which is worse than no button.
-    func setPhase(_ phase: Phase) {
+    /// Neither button has anything to act on while the stream is starting —
+    /// `RecordingCoordinator.stop()` and `discard()` both require
+    /// `state == .recording`, so a press would silently do nothing — but hiding
+    /// them was worse than dimming them: the bar then had to change shape twice
+    /// in the half second between Record and the first frame. Grey is the state
+    /// the user already understands, and it is also what a slow start or a retry
+    /// looks like, so the same appearance covers all three.
+    func setPhase(_ phase: Phase, animated: Bool) {
         guard !Self.debugFillsMagenta else { return }
+        slowStartTimer?.invalidate()
+        slowStartTimer = nil
+        if animated {
+            HUDMetrics.crossfade(timeLabel)
+            if let discardButton { HUDMetrics.crossfade(discardButton) }
+        }
         switch phase {
         case .starting:
-            dot.layer?.backgroundColor = NSColor.tertiaryLabelColor.cgColor
-            dot.layer?.removeAnimation(forKey: "pulse")
-            timeLabel.stringValue = "Starting…"
-            timeLabel.font = .systemFont(ofSize: 12, weight: .medium)
-            placeTimeLabel(x: timeLabel.frame.minX, width: Self.startingWidth)
-            timeLabel.textColor = .secondaryLabelColor
-            stopPill?.isHidden = true
-            discardButton?.isHidden = true
-            divider?.isHidden = true
+            HUDMetrics.fill(dot, with: .tertiaryLabelColor, animated: animated)
+            pulse(live: false)
+            // The clock reads 0:00 rather than a placeholder: it is the time the
+            // take will start from, so when it comes alive only its colour
+            // changes. A dash here would be one more thing swapping.
+            showTime("0:00")
+            timeLabel.textColor = .tertiaryLabelColor
+            stopPill?.setLive(false, animated: animated)
+            discardButton?.isEnabled = false
+            discardButton?.contentTintColor = .tertiaryLabelColor
+            scheduleSlowStartText()
         case .recording:
-            dot.layer?.backgroundColor = NSColor.systemRed.cgColor
-            pulse()
-            timeLabel.stringValue = "0:00"
-            timeLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
-            placeTimeLabel(x: timeLabel.frame.minX, width: Self.timeWidth)
+            HUDMetrics.fill(dot, with: .systemRed, animated: animated)
+            pulse(live: true)
+            showTime("0:00")
             timeLabel.textColor = .labelColor
-            stopPill?.isHidden = false
-            discardButton?.isHidden = false
-            divider?.isHidden = false
+            stopPill?.setLive(true, animated: animated)
+            discardButton?.isEnabled = true
+            discardButton?.contentTintColor = .secondaryLabelColor
         }
+    }
+
+    /// Says "Starting…" in the clock's place once a start has dragged on.
+    private func scheduleSlowStartText() {
+        let timer = Timer(timeInterval: Self.slowStartDelay, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                HUDMetrics.crossfade(self.timeLabel)
+                // 10 pt, not the 13 the clock uses: the word has to fit between
+                // the dot and the divider, and it is a status line rather than
+                // the bar's headline number. Measured, because at 11 pt it is
+                // 53 pt wide plus a label cell's own insets and comes out as
+                // "Startin…", which is worse than saying nothing.
+                self.timeLabel.font = .systemFont(ofSize: 10, weight: .medium)
+                self.showTime("Starting…", width: Self.slowStartWidth)
+            }
+        }
+        // `.common`, like the tick timer: a menu tracking or a window drag must
+        // not be able to hold the bar on a word it has outgrown.
+        RunLoop.main.add(timer, forMode: .common)
+        slowStartTimer = timer
+    }
+
+    private func showTime(_ text: String, width: CGFloat = RecordingHUDView.timeWidth) {
+        if width == Self.timeWidth {
+            timeLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+        }
+        timeLabel.stringValue = text
+        placeTimeLabel(width: width)
     }
 
     /// Centres the label on its own natural height.
@@ -248,18 +236,23 @@ final class RecordingHUDView: NSView {
     /// so the clock floated above centre while the dot, the divider and both
     /// buttons sat correctly centred around it. The frames all read as correct
     /// in a dump; only rendering it showed the problem.
-    private func placeTimeLabel(x: CGFloat, width: CGFloat) {
+    private func placeTimeLabel(width: CGFloat) {
         let height = ceil(timeLabel.font?.boundingRectForFont.height ?? 18)
         timeLabel.frame = CGRect(
-            x: x, y: ((Self.barSize.height - height) / 2).rounded(),
+            x: timeOriginX, y: ((Self.barSize.height - height) / 2).rounded(),
             width: width, height: height)
     }
 
-    private func pulse() {
+    /// The dot breathes in both phases, slower and shallower while starting.
+    ///
+    /// A dot that simply stops moving is indistinguishable from a bar that has
+    /// hung, and hanging is exactly what the grey phase has to survive: the
+    /// start being retried, or `startCapture` sitting there for four seconds.
+    private func pulse(live: Bool) {
         let animation = CABasicAnimation(keyPath: "opacity")
         animation.fromValue = 1.0
-        animation.toValue = 0.25
-        animation.duration = 0.8
+        animation.toValue = live ? 0.25 : 0.45
+        animation.duration = live ? 0.8 : 1.1
         animation.autoreverses = true
         animation.repeatCount = .infinity
         // On the render server, like the marching ants: a Timer redrawing this
@@ -276,10 +269,16 @@ final class RecordingHUDView: NSView {
     @objc private func discardTapped() { callbacks.discard() }
 }
 
-/// Owns the HUD panel for the length of one recording.
+/// Drives the bar for the length of one recording.
+///
+/// It usually does not create a window. The selection hands one over, and this
+/// class re-levels it, swaps its face and narrows it — so the bar the user
+/// pressed Record on is, literally and not just apparently, the bar they then
+/// press Stop on. A window is only made from scratch for a take that had no
+/// selection in front of it: a whole display.
 @MainActor
 final class RecordingHUD {
-    private var panel: RecordingHUDPanel?
+    private var panel: FloatingBarPanel?
     private var view: RecordingHUDView?
     private var ticker: Timer?
     private var elapsedProvider: (() -> TimeInterval)?
@@ -301,90 +300,102 @@ final class RecordingHUD {
     /// `under` is the recorded region for an area take, and nil for a whole
     /// display — where there is no anchor and the bottom of the screen is the
     /// only sensible home.
-    /// `morphingFrom` is the outgoing toolbar's frame. Given one, the bar starts
-    /// there and moves into place instead of appearing — the two are the same
-    /// object as far as the user is concerned, and a cut between them is the
-    /// thing that made starting a recording feel like three separate windows.
+    /// `adopting` is the bar the selection was just using. Given one, nothing
+    /// appears and nothing is dismissed: that window stays exactly where it is,
+    /// swaps its controls, and narrows to the width the take needs.
     func showStarting(
-        on screen: NSScreen?, under region: CGRect? = nil, morphingFrom: CGRect? = nil,
-        hiddenFromCapture: Bool = true
+        on screen: NSScreen?, under region: CGRect? = nil,
+        adopting handedOver: FloatingBarPanel? = nil, hiddenFromCapture: Bool = true
     ) {
-        show(on: screen, elapsed: nil, hiddenFromCapture: hiddenFromCapture)
+        // A retried start re-enters here with the bar already up and already
+        // grey. Replaying the entrance would make a retry — the one case the grey
+        // phase exists to cover — flash.
+        let isNew = panel == nil
+        show(on: screen, elapsed: nil, adopting: handedOver,
+             hiddenFromCapture: hiddenFromCapture)
         if let region, let screen = panel?.screen ?? screen {
             anchor = (region, screen)
         }
-        view?.setPhase(.starting)
-        if let morphingFrom, let panel {
-            panel.setFrame(morphingFrom, display: false)
-            view?.frame = CGRect(origin: .zero, size: morphingFrom.size)
+        guard isNew, let panel, let view else { return }
+        view.setPhase(.starting, animated: false)
+
+        guard handedOver != nil else {
+            // Nothing to grow out of: a fullscreen take has no bar before it.
+            panel.morph(to: placedFrame(), animated: false)
             panel.alphaValue = 0
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = FloatingBarPanel.faceIn
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                panel.animator().alphaValue = 1
+            }
+            return
         }
-        resize(to: .starting, animated: morphingFrom != nil, fadingIn: morphingFrom != nil)
+        // The face swap and the width change run together over the same 0.3 s:
+        // the controls leave, the bar tightens around what is arriving, the new
+        // controls land. One object, one movement.
+        panel.morph(to: placedFrame(), animated: true)
     }
 
-    /// Switches the bar to its running state and starts the clock. The panel is
-    /// already up by now; nothing moves, the contents change.
+    /// Brings the bar to life where it stands: the dot reddens, the clock
+    /// starts, Stop and Discard become real controls.
+    ///
+    /// Nothing moves and nothing resizes. The bar has been the size it will keep
+    /// since it appeared, and a resize at this moment is what used to make the
+    /// first second of a take read as a third, separate window.
     func beginRecording(elapsed: @escaping () -> TimeInterval) {
-        view?.setPhase(.recording)
-        resize(to: .recording, animated: true)
+        view?.setPhase(.recording, animated: true)
         elapsedProvider = elapsed
         startTicker()
     }
 
-    /// Keeps the bar centred on its screen as it changes width, so it grows
-    /// from the middle rather than sliding sideways.
-    private func resize(
-        to phase: RecordingHUDView.Phase, animated: Bool = false, fadingIn: Bool = false
-    ) {
-        guard let panel else { return }
-        let size = CGSize(
-            width: RecordingHUDView.width(for: phase),
-            height: RecordingHUDView.barSize.height)
+    /// Where the bar belongs: under the recorded region when there is one, and
+    /// otherwise centred on wherever it already sits.
+    private func placedFrame() -> CGRect {
+        let size = RecordingHUDView.barSize
+        guard let panel else { return CGRect(origin: .zero, size: size) }
         let origin: CGPoint = if let anchor {
             HUDPlacement.origin(for: size, under: anchor.rect, on: anchor.screen)
         } else {
-            // No anchor: keep it where it is and grow from the centre.
             CGPoint(x: (panel.frame.midX - size.width / 2).rounded(), y: panel.frame.minY)
         }
-        let frame = CGRect(origin: origin, size: size)
-        guard animated else {
-            panel.setFrame(frame, display: true)
-            view?.frame = CGRect(origin: .zero, size: size)
-            return
-        }
-        // The contents are laid out at the final size immediately and the window
-        // animates around them. Animating the subview frames too would mean two
-        // animations of the same thing at slightly different rates, which reads
-        // as the controls swimming inside the bar.
-        view?.frame = CGRect(origin: .zero, size: size)
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.22
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            panel.animator().setFrame(frame, display: true)
-            if fadingIn { panel.animator().alphaValue = 1 }
-        }
+        return CGRect(origin: origin, size: size)
     }
 
     /// Bottom-centre of the recording's own screen, which is where the user is
     /// already looking when they go to stop.
     func show(
         on screen: NSScreen?, elapsed: (() -> TimeInterval)?,
+        adopting handedOver: FloatingBarPanel? = nil,
         hiddenFromCapture: Bool = true
     ) {
         guard panel == nil else { return }
         let screen = screen ?? NSScreen.main ?? NSScreen.screens[0]
         let size = RecordingHUDView.barSize
-        let frame = CGRect(
-            origin: HUDPlacement.origin(for: size, atBottomOf: screen), size: size)
 
         var callbacks = RecordingHUDView.Callbacks()
         callbacks.stop = { [weak self] in self?.onStop() }
         callbacks.discard = { [weak self] in self?.onDiscard() }
-
         let view = RecordingHUDView(callbacks: callbacks)
-        let panel = RecordingHUDPanel(
-            contentRect: frame, view: view, hiddenFromCapture: hiddenFromCapture)
-        panel.orderFrontRegardless()
+
+        let panel: FloatingBarPanel
+        if let handedOver {
+            panel = handedOver
+            // Re-levelled before the face lands: at the selection's level the bar
+            // sits above every window on the display, which is right while an
+            // overlay is shielding the screen and wrong for the next minute.
+            panel.assume(.recording)
+            panel.setHiddenFromCapture(hiddenFromCapture)
+        } else {
+            panel = FloatingBarPanel(
+                role: .recording, size: size,
+                usesGlass: !RecordingHUDView.debugFillsMagenta,
+                hiddenFromCapture: hiddenFromCapture)
+            panel.setFrame(
+                CGRect(origin: HUDPlacement.origin(for: size, atBottomOf: screen), size: size),
+                display: false)
+            panel.orderFrontRegardless()
+        }
+        panel.setFace(view, animated: handedOver != nil)
         self.panel = panel
         self.view = view
 
@@ -415,13 +426,19 @@ final class RecordingHUD {
         view?.update(elapsed: elapsedProvider())
     }
 
+    /// Fades out rather than vanishing — the end of a take is the one place the
+    /// bar genuinely goes away, so it is worth not cutting. The panel is dropped
+    /// from `self` first, so everything that asks whether a take is on screen
+    /// gets the answer straight away and the dying window cannot be reused.
     func hide() {
         ticker?.invalidate()
         ticker = nil
         elapsedProvider = nil
-        panel?.orderOut(nil)
-        panel = nil
+        guard let panel else { return }
+        self.panel = nil
         view = nil
+        anchor = nil
+        panel.dismiss()
     }
 
     var isVisible: Bool { panel != nil }
@@ -435,14 +452,8 @@ final class RecordingHUD {
 
     var frameForTest: CGRect? { panel?.frame }
 
-    /// Every subview's frame, for `--selftest-hud-appearance`. Layout bugs are
-    /// far quicker to read as numbers than to squint at in a screenshot.
-    var debugSubviewFrames: [String] {
-        guard let content = panel?.contentView else { return [] }
-        return content.subviews.flatMap { $0.subviews.isEmpty ? [$0] : $0.subviews }.map { view in
-            let kind = "\(type(of: view))"
-            return "\(kind) \(Int(view.frame.minX)),\(Int(view.frame.minY)) "
-                + "\(Int(view.frame.width))x\(Int(view.frame.height))"
-        }
-    }
+    var debugSubviewFrames: [String] { panel?.debugSubviewFrames ?? [] }
+
+    /// See `FloatingBarPanel.debugFaceInk`.
+    var faceInkForTest: Float { panel?.debugFaceInk ?? 0 }
 }

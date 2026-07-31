@@ -113,8 +113,7 @@ enum SelfTest {
             case "--selftest-preferences":
                 self = .preferences
             case "--selftest-hud-appearance":
-                RecordingHUDPanel.usesSharingTypeNone = false
-                SelectionToolbarPanel.usesSharingTypeNone = false
+                FloatingBarPanel.usesSharingTypeNone = false
                 self = .hudAppearance(
                     directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-preview-in-recording":
@@ -1868,10 +1867,17 @@ enum SelfTest {
         guard let starting = hud.frameForTest else { return 1 }
         try await shoot("hud-starting", frame: starting)
 
+        // The grey bar admits what it is doing once a start drags on. In
+        // production that is rare and unrepeatable, so this is the only place
+        // the word can be looked at — and it has to fit the clock's slot without
+        // reaching the divider, since the bar cannot widen for it.
+        try await Task.sleep(for: .milliseconds(1000))
+        try await shoot("hud-slow-start", frame: starting)
+
         hud.beginRecording(elapsed: { 754 })
-        // The bar animates into its running size now, and `frameForTest` reads
-        // the live frame — sampling it immediately would photograph a rect the
-        // window is still moving out of.
+        // Nothing about the window is supposed to move here — only the contents
+        // colour in — but the colour transition is animated, so the shot still
+        // has to wait for it to land.
         try await Task.sleep(for: .milliseconds(350))
         guard let running = hud.frameForTest else { return 1 }
         try await shoot("hud-recording", frame: running)
@@ -1898,13 +1904,102 @@ enum SelfTest {
         if abs(starting.maxY - bar.maxY) >= 0.5 {
             failures.append("different top edges: hud \(Int(starting.maxY)) vs toolbar \(Int(bar.maxY))")
         }
-        if abs(running.maxY - bar.maxY) >= 0.5 {
-            failures.append("the bar moved when the take started: "
-                + "\(Int(bar.maxY)) -> \(Int(running.maxY))")
+        // The starting and running states are one window that never moves. This
+        // is the invariant the grey phase buys: it holds the running bar's exact
+        // shape from the moment it appears, so the take beginning is a change of
+        // colour and nothing else. A geometry difference of any kind here is the
+        // "third bar" coming back.
+        if !starting.equalTo(running) {
+            failures.append("the bar changed shape when the take started: "
+                + "\(rectString(starting)) -> \(rectString(running))")
         }
         print("placement:     anchor \(rectString(anchor))")
         print("               toolbar \(rectString(bar))")
         print("               hud starting \(rectString(starting)) running \(rectString(running))")
+
+        // The hand-over, frame by frame.
+        //
+        // Every still above can be right while the motion between them is not,
+        // and the motion is the whole point: the toolbar and the HUD are two
+        // one window changing what it is for. A filmstrip is the only way to see
+        // whether that reads as one object — whether the glass ever doubles up,
+        // blinks out, or shows two bars of different widths at once.
+        //
+        // Capturing is not free (~50 ms a frame here), so these are labelled
+        // with the time they were actually taken rather than an assumed cadence.
+        try await Task.sleep(for: .milliseconds(400))
+        let handover = SelectionToolbar()
+        handover.show(under: anchor, on: screen)
+        try await Task.sleep(for: .milliseconds(400))
+        guard let outgoing = handover.frameForTest else { return 1 }
+        // Wide enough for the bar at both widths, so a frame mid-morph is shown
+        // rather than cropped.
+        let stage = outgoing.union(running).insetBy(dx: -16, dy: -16)
+
+        let morphing = RecordingHUD()
+        let clock = Date()
+        // The real sequence: the selection gives its window away and the take
+        // adopts it. Nothing is dismissed here, which is the point.
+        morphing.showStarting(on: screen, under: anchor, adopting: handover.handOver())
+        var strip: [String] = []
+        for index in 0..<10 {
+            if index == 6 { morphing.beginRecording(elapsed: { 754 }) }
+            let elapsed = Int(Date().timeIntervalSince(clock) * 1000)
+            let shot = try await engine.capture(
+                .area(displayID: displayID, rectInAppKitGlobal: stage))
+            let name = String(format: "morph-%02d-%dms.png", index, elapsed)
+            try? ImageEncoder.write(
+                shot.image, to: directory.appendingPathComponent(name), as: .png,
+                scale: shot.scale)
+            strip.append("\(elapsed)ms")
+        }
+        morphing.hide()
+        print("hand-over:     \(strip.joined(separator: " "))  -> morph-*.png in \(directory.path)")
+
+        // The same hand-over again, this time watched rather than photographed.
+        //
+        // A still capture takes ~50 ms, so the filmstrip above cannot see a hole
+        // one frame wide — and a one-frame hole is exactly what shipped: the
+        // arriving face used to be scheduled from the departing face's completion
+        // handler, which fires a run-loop turn late, leaving a composited frame
+        // of Liquid Glass with nothing in it. It was reported by eye. This
+        // samples what the render server is drawing every 8 ms instead.
+        try await Task.sleep(for: .milliseconds(500))
+        let watched = SelectionToolbar()
+        watched.show(under: anchor, on: screen)
+        try await Task.sleep(for: .milliseconds(300))
+        let inked = RecordingHUD()
+        inked.showStarting(on: screen, under: anchor, adopting: watched.handOver())
+        var lowest: Float = 2
+        var lowestAt = 0
+        let started = Date()
+        while Date().timeIntervalSince(started) < 0.45 {
+            let ink = inked.faceInkForTest
+            if ink < lowest {
+                lowest = ink
+                lowestAt = Int(Date().timeIntervalSince(started) * 1000)
+            }
+            try await Task.sleep(for: .milliseconds(8))
+        }
+        inked.hide()
+        print(String(format: "crossfade ink: least %.2f at %dms (1.0 = one opaque face)",
+                     lowest, lowestAt))
+        // The dissolve's opacities are complements, so the honest expectation is
+        // 1.00 flat; the margin is for sampling landing between frames. Anything
+        // materially below it means the two faces are no longer covering for each
+        // other — a dip if it is small, the bar blanking out if it is near zero.
+        //
+        // Verified to respond, the way the exclusion tests are: with the arrival
+        // delayed to begin exactly as the departure ends — the arrangement that
+        // shipped — this reported `least 0.01 at 160ms` and failed. A check that
+        // cannot fail would be worse than none here, since the bug it guards was
+        // invisible to every other test in the suite and was found by eye.
+        if lowest < 0.85 {
+            failures.append(String(
+                format: "the bar goes near-empty mid-hand-over: ink fell to %.2f at %dms",
+                lowest, lowestAt))
+        }
+
         print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.joined(separator: "; "))")")
         return failures.isEmpty ? 0 : 1
     }
@@ -2150,6 +2245,18 @@ enum SelfTest {
             check(false, "outcome is .area (got \(String(describing: box.outcome)))")
         }
         check(!overlay.toolbarIsVisibleForTest, "toolbar is gone after the commit")
+        // Gone from the toolbar, and yet not gone. Committing hands the window on
+        // instead of dismissing it: the recorder adopts this exact panel, so the
+        // bar the user pressed Record on is the one they later press Stop on. If
+        // this ever comes back nil, that bar is being thrown away and rebuilt —
+        // the two-windows-pretending-to-be-one arrangement this replaced.
+        let handedOver = overlay.takeHandedOverBar()
+        check(handedOver != nil, "the bar was handed over rather than dismissed")
+        check(handedOver?.isVisible == true, "and is still on screen, waiting to be adopted")
+        check(handedOver?.role == .selection,
+              "still at the selection's level until the take re-levels it")
+        check(overlay.takeHandedOverBar() == nil, "and only one owner can claim it")
+        handedOver?.dismiss()
         overlay.tearDown()
         try await Task.sleep(for: .milliseconds(120))
 
@@ -2196,6 +2303,7 @@ enum SelfTest {
         let stillResumed = await stillFlag.wait(upTo: .seconds(2))
         check(stillResumed, "without requiresConfirmation, one confirm still commits")
         check(!overlay.toolbarIsVisibleForTest, "and no toolbar appears for screenshots")
+        check(overlay.takeHandedOverBar() == nil, "and nothing is handed over either")
         overlay.tearDown()
 
         print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.count) of the above")")
@@ -3263,7 +3371,7 @@ enum SelfTest {
         }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
-        RecordingHUDPanel.usesSharingTypeNone = sharingNone
+        FloatingBarPanel.usesSharingTypeNone = sharingNone
         RecordingHUDView.debugFillsMagenta = true
 
         let displayID = ScreenIndex.screenUnderMouse().flatMap(ScreenIndex.displayID(of:))
@@ -3351,7 +3459,7 @@ enum SelfTest {
         let surfaceName =
             if useStatusItem { "NSStatusItem (menu bar, our process's window)" }
             else if plainWindow { "plain NSWindow (.normal level, titled)" }
-            else { "RecordingHUDPanel (.statusBar, nonactivating)" }
+            else { "FloatingBarPanel (.recording: .statusBar, nonactivating)" }
         print("surface:       \(surfaceName)")
         print("order:         HUD shown \(hudFirst ? "BEFORE" : "AFTER") the stream started")
         print("hud:           \(rectString(hudFrame)) sharingType=\(sharingNone ? "none" : "readOnly")")

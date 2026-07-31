@@ -64,7 +64,7 @@ final class RecordingCoordinator {
     /// photograph it.
     ///
     /// Recordings are covered by a different mechanism, and it is worth being
-    /// exact about which: `RecordingHUDPanel` ships with `sharingType = .none`,
+    /// exact about which: `FloatingBarPanel` ships with `sharingType = .none`,
     /// which hides it from every ScreenCaptureKit path. NOT — as this comment
     /// claimed until 2026-07-31 — because a stream declines to render the
     /// capturing process's own windows. It does render them: measured with
@@ -118,8 +118,9 @@ final class RecordingCoordinator {
         overlay.tearDown()
 
         guard case .area(let displayID, let rect) = outcome else { return }
-        // Read before the overlay is gone for good; the HUD grows out of it.
-        morphOrigin = overlay.lastToolbarFrame
+        // Claimed before the overlay is gone for good: the bar the selection was
+        // using becomes the recording's bar, window and all.
+        adoptedBar = overlay.takeHandedOverBar()
         retriesLeft = 1
         await begin(.area(displayID: displayID, rectInAppKitGlobal: rect))
     }
@@ -144,8 +145,9 @@ final class RecordingCoordinator {
     /// Reset for each trigger, so one bad take never uses up a later one's
     /// retry. Decremented only by the start path below.
     private var retriesLeft = 0
-    /// The toolbar's parting frame, carried from the selection to the HUD.
-    private var morphOrigin: CGRect?
+    /// The selection's bar, on its way to becoming the recording's. Consumed by
+    /// the first `begin`, so a retry does not try to adopt it twice.
+    private var adoptedBar: FloatingBarPanel?
 
     private func begin(_ request: RecordingRequest) async {
         var options = Preferences.shared.recordingOptions
@@ -171,8 +173,8 @@ final class RecordingCoordinator {
         let region: CGRect? = if case .area(_, let rect) = request { rect } else { nil }
         hud.showStarting(
             on: ScreenIndex.screen(for: request.displayID), under: region,
-            morphingFrom: morphOrigin, hiddenFromCapture: hidden)
-        morphOrigin = nil
+            adopting: adoptedBar, hiddenFromCapture: hidden)
+        adoptedBar = nil
         // Only for an area take. On a fullscreen one the answer to "what is
         // being recorded" is the whole screen, and a border round the edge of it
         // would be noise.

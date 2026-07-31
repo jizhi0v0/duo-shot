@@ -76,9 +76,17 @@ final class OverlayController {
 
     var isPresenting: Bool { !panels.isEmpty }
 
-    /// Where the confirmation toolbar was when it went away, so whatever takes
-    /// its place can start from there instead of appearing somewhere else.
-    var lastToolbarFrame: CGRect? { toolbar.lastFrame }
+    /// The bar the confirmation step was using, handed on rather than dismissed.
+    ///
+    /// Reading it takes it: whoever asks owns the window from then on, and is
+    /// responsible for taking it down. Nil unless a selection was just confirmed
+    /// from an armed bar — every other exit dismisses it normally.
+    func takeHandedOverBar() -> FloatingBarPanel? {
+        defer { handedOverBar = nil }
+        return handedOverBar
+    }
+
+    private var handedOverBar: FloatingBarPanel?
 
     /// The CGWindowIDs of our panels, for `SCContentFilter(display:excludingWindows:)`.
     ///
@@ -95,6 +103,12 @@ final class OverlayController {
         requiresConfirmation: Bool = false
     ) async -> Outcome {
         if isPresenting { dismiss(resumingWith: .cancelled) }
+        // A bar handed over by a previous presentation and never claimed would be
+        // furniture nobody can dismiss. It cannot happen on the shipping path —
+        // the recorder adopts it in the same turn — but an unowned window at
+        // shielding level is precisely the kind that strands, so it is checked
+        // rather than assumed.
+        takeHandedOverBar()?.dismiss()
 
         let frontmostBefore = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
 
@@ -369,7 +383,11 @@ final class OverlayController {
             arm(rect: rect, displayID: displayID)
             return
         }
-        toolbar.hide()
+        // Handed on, not hidden. The recording adopts this exact window, so the
+        // bar the user pressed Record on is the bar they then press Stop on —
+        // there is no second window anywhere in the sequence to give the game
+        // away. If nobody claims it, `discardHandedOverBar` cleans up.
+        handedOverBar = toolbar.handOver()
         // Deliberately *not* tearing down here. The panels must still be on
         // screen when the caller builds its SCContentFilter, because that is
         // where `panelWindowIDs` comes from and because ordering windows out and
@@ -539,6 +557,7 @@ final class OverlayController {
     // MARK: - Confirmation-step test hooks
 
     var isArmedForTest: Bool { isArmed }
+
     var toolbarIsVisibleForTest: Bool { toolbar.isVisible }
     var toolbarFrameForTest: CGRect? { toolbar.frameForTest }
 

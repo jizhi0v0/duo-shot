@@ -1,51 +1,12 @@
 import AppKit
 
-/// The bar that appears under a committed selection when the caller asked for a
-/// confirmation step.
-///
-/// It sits one level above `OverlayPanel`, which is at `CGShieldingWindowLevel()`
-/// — the overlay covers everything, so anything meant to be clicked during a
-/// selection has to be above it. Nonactivating for the same reason the overlay
-/// itself is: the app must not come to the front, or the thing about to be
-/// recorded is a window that just lost focus.
-final class SelectionToolbarPanel: NSPanel {
-    /// Test hook, mirroring the other panels.
-    static var usesSharingTypeNone = true
-
-    override var canBecomeKey: Bool { false }
-    override var canBecomeMain: Bool { false }
-
-    init(contentRect: CGRect, view: NSView, hiddenFromCapture: Bool = true) {
-        super.init(
-            contentRect: contentRect,
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
-        )
-
-        // See OverlayPanel: `isFloatingPanel` resets `level`, so it goes first or
-        // the level below is silently undone.
-        isFloatingPanel = true
-        becomesKeyOnlyIfNeeded = true
-        level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()) + 1)
-        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
-
-        isOpaque = false
-        backgroundColor = .clear
-        hasShadow = true
-        acceptsMouseMovedEvents = true
-        hidesOnDeactivate = false
-        worksWhenModal = true
-        isReleasedWhenClosed = false
-        animationBehavior = .none
-        sharingType = (Self.usesSharingTypeNone && hiddenFromCapture) ? .none : .readOnly
-
-        contentView = view
-    }
-}
-
 /// Microphone, its input device, system audio, and the button that starts the
 /// take.
+///
+/// One of the two faces of `FloatingBarPanel` — it holds controls and nothing
+/// else. The glass, the level and the placement belong to the window, which
+/// outlives this view: pressing Record swaps this face for the recording one
+/// inside the same bar.
 ///
 /// The toggles write straight through to `Preferences` rather than holding
 /// per-take state. One place decides what the next recording does, so this bar
@@ -74,8 +35,6 @@ final class SelectionToolbarView: NSView {
     private static let deviceMaxWidth: CGFloat = 132
 
     private var callbacks: Callbacks
-    private var glass: NSGlassEffectView!
-    private var content: NSView!
     private var microphoneButton: NSButton!
     private var deviceButton: NSButton!
     private var deviceLabel: NSTextField!
@@ -99,13 +58,8 @@ final class SelectionToolbarView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     private func buildSubviews() {
-        let chrome = HUDMetrics.chrome(in: bounds)
-        glass = chrome.glass
-        content = chrome.content
-        addSubview(glass)
-
         microphoneButton = button(action: #selector(toggleMicrophone))
-        content.addSubview(microphoneButton)
+        addSubview(microphoneButton)
 
         // A separate hit target rather than a long-press or a right-click: the
         // overlay owns the keyboard and the pointer during a selection, so a
@@ -113,7 +67,7 @@ final class SelectionToolbarView: NSView {
         // may be about to restart.
         deviceButton = button(action: #selector(showDeviceMenu))
         deviceButton.image = HUDMetrics.symbol("chevron.down", pointSize: 8)
-        content.addSubview(deviceButton)
+        addSubview(deviceButton)
 
         // Shown even when it says "System default". The point of putting the
         // input on the bar is that you can see what the take will record without
@@ -124,20 +78,20 @@ final class SelectionToolbarView: NSView {
         deviceLabel.font = Self.deviceFont
         deviceLabel.lineBreakMode = .byTruncatingTail
         deviceLabel.maximumNumberOfLines = 1
-        content.addSubview(deviceLabel)
+        addSubview(deviceLabel)
 
         audioButton = button(action: #selector(toggleSystemAudio))
-        content.addSubview(audioButton)
+        addSubview(audioButton)
 
         divider = NSView()
         divider.wantsLayer = true
         divider.layer?.backgroundColor = NSColor(white: 1, alpha: 0.18).cgColor
-        content.addSubview(divider)
+        addSubview(divider)
 
         pill = HUDPill(title: Self.recordTitle, mark: .dot, tint: .systemRed)
         pill.toolTip = "Start recording  ⏎"
         pill.onClick = { [weak self] in self?.callbacks.start() }
-        content.addSubview(pill)
+        addSubview(pill)
     }
 
     private func button(action: Selector) -> NSButton {
@@ -220,9 +174,19 @@ final class SelectionToolbarView: NSView {
         let size = CGSize(width: x.rounded(.up), height: Self.height)
         if frame.size != size {
             setFrameSize(size)
-            glass.frame = CGRect(origin: .zero, size: size)
             callbacks.resized()
         }
+    }
+
+    /// Goes inert on the way out: Record stops being a red button the instant it
+    /// has been pressed.
+    ///
+    /// Not just feedback for the press. The HUD arrives underneath this bar with
+    /// its own Stop already grey, and a scarlet Record fading out over it was the
+    /// one frame of the hand-over where the eye could still see two different
+    /// bars. Both ends of the dissolve are the same colour now.
+    func goInert() {
+        pill.setLive(false, animated: false)
     }
 
     private var currentDeviceName: String {
@@ -273,10 +237,14 @@ final class SelectionToolbarView: NSView {
     }
 }
 
-/// Owns the toolbar panel for the length of one armed selection.
+/// Owns the bar for the length of one armed selection — and only that long.
+///
+/// The window itself can outlive the selection: `handOver()` gives it to the
+/// recording, which re-levels it and swaps its face. That is the whole reason
+/// this class does not own an `NSPanel` subclass of its own any more.
 @MainActor
 final class SelectionToolbar {
-    private var panel: SelectionToolbarPanel?
+    private var panel: FloatingBarPanel?
     private var view: SelectionToolbarView?
     /// Kept so a width change — a longer device name — can re-place the bar
     /// without the controller having to be told.
@@ -301,8 +269,10 @@ final class SelectionToolbar {
             callbacks.start = { [weak self] in self?.onStart() }
             callbacks.resized = { [weak self] in self?.applySize() }
             let view = SelectionToolbarView(callbacks: callbacks)
-            let created = SelectionToolbarPanel(
-                contentRect: view.frame, view: view, hiddenFromCapture: hiddenFromCapture)
+            let created = FloatingBarPanel(
+                role: .selection, size: view.frame.size,
+                hiddenFromCapture: hiddenFromCapture)
+            created.setFace(view, animated: false)
             created.orderFrontRegardless()
             panel = created
             self.view = view
@@ -322,37 +292,35 @@ final class SelectionToolbar {
         guard let panel, let view, let anchor else { return }
         let size = view.frame.size
         let origin = HUDPlacement.origin(for: size, under: anchor.selection, on: anchor.screen)
-        panel.setFrame(CGRect(origin: origin, size: size), display: true)
+        panel.morph(to: CGRect(origin: origin, size: size), animated: false)
     }
 
-    /// The frame it last occupied, kept after it goes away.
+    /// Gives the bar to whoever comes next, still on screen.
     ///
-    /// The HUD grows out of this, so the bar the user clicked Record on and the
-    /// bar that appears while the stream starts are one moving object rather
-    /// than two windows swapping.
-    private(set) var lastFrame: CGRect?
-
-    private var isDismissing = false
-
-    /// Fades rather than vanishing. A hard `orderOut` is what made the handover
-    /// read as a window closing and another opening.
-    func hide() {
-        guard let panel, !isDismissing else { return }
-        isDismissing = true
-        lastFrame = panel.frame
+    /// The one exit that is not a dismissal: pressing Record does not end this
+    /// bar, it changes what it is for. The caller is responsible for the window
+    /// from here — nothing in this class will take it down again.
+    ///
+    /// Record goes inert on the way out. Not just feedback for the press: the
+    /// recording face arrives with its own Stop already grey, and a scarlet
+    /// Record dissolving into it is the one frame where the eye can still see
+    /// two different bars.
+    func handOver() -> FloatingBarPanel? {
+        guard let panel else { return nil }
+        view?.goInert()
         self.panel = nil
         self.view = nil
         anchor = nil
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.16
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            panel.animator().alphaValue = 0
-        } completionHandler: { [weak self] in
-            MainActor.assumeIsolated {
-                panel.orderOut(nil)
-                self?.isDismissing = false
-            }
-        }
+        return panel
+    }
+
+    func hide() {
+        guard let panel else { return }
+        view?.goInert()
+        self.panel = nil
+        self.view = nil
+        anchor = nil
+        panel.dismiss()
     }
 
     var frameForTest: CGRect? { panel?.frame }

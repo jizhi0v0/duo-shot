@@ -19,6 +19,9 @@ enum HUDMetrics {
     /// Around the divider, between groups that do not.
     static let groupGap: CGFloat = 8
     static let iconWidth: CGFloat = 30
+    /// One duration for every state change a bar makes, so the dot, the clock
+    /// and both buttons come alive as a single movement rather than four.
+    static let transition: CFTimeInterval = 0.28
 
     /// The bar's material, plus the container its controls belong in.
     ///
@@ -60,6 +63,45 @@ enum HUDMetrics {
         view.wantsLayer = true
         view.layer?.backgroundColor = NSColor(white: 1, alpha: 0.18).cgColor
         return view
+    }
+
+    /// Cross-dissolves whatever `view` draws, over its own previous contents.
+    ///
+    /// AppKit animates neither an `NSTextField`'s `textColor` nor an image's
+    /// tint, and both change the moment a take begins. A `CATransition` on the
+    /// view's own layer covers every kind of redraw in one line, where explicit
+    /// animations would have to name each property — and a colour that snaps
+    /// mid-transition is exactly the hard edge these bars are trying to lose.
+    static func crossfade(_ view: NSView, duration: CFTimeInterval = transition) {
+        view.wantsLayer = true
+        let fade = CATransition()
+        fade.type = .fade
+        fade.duration = duration
+        view.layer?.add(fade, forKey: "crossfade")
+    }
+
+    /// Fills a layer-backed view, animating the change when asked.
+    ///
+    /// The colour is resolved inside the view's own appearance: the semantic
+    /// greys used for the inert state are dynamic, and `cgColor` read outside a
+    /// drawing appearance resolves against whatever is current — which on these
+    /// panels is not the vibrant dark the bar is actually drawn in.
+    static func fill(
+        _ view: NSView, with color: NSColor, animated: Bool,
+        duration: CFTimeInterval = transition
+    ) {
+        view.wantsLayer = true
+        guard let layer = view.layer else { return }
+        var resolved = color.cgColor
+        view.effectiveAppearance.performAsCurrentDrawingAppearance { resolved = color.cgColor }
+        if animated, let from = layer.backgroundColor {
+            let animation = CABasicAnimation(keyPath: "backgroundColor")
+            animation.fromValue = from
+            animation.toValue = resolved
+            animation.duration = duration
+            layer.add(animation, forKey: "fill")
+        }
+        layer.backgroundColor = resolved
     }
 
     static func symbol(
@@ -126,10 +168,28 @@ final class HUDPill: NSView {
 
     var onClick: () -> Void = {}
 
+    /// Whether the pill is the live control or a placeholder for one.
+    ///
+    /// Stop exists from the moment the bar appears, but for as long as
+    /// `SCStream.startCapture` takes there is nothing to stop —
+    /// `RecordingCoordinator.stop()` requires `state == .recording`, so a press
+    /// would silently do nothing. It used to be hidden for that window, which
+    /// meant the bar changed shape twice inside half a second. Grey and inert
+    /// keeps the shape and still says "not yet".
+    /// Set through `setLive(_:animated:)`, because whether the change animates
+    /// is the caller's business: colouring in when the take starts must fade,
+    /// and going grey as the bar first appears must not — a Stop button
+    /// crossfading out of red while the bar is still arriving is a red button
+    /// nobody asked for.
+    private(set) var isLive = true
+
     private static let horizontalPadding: CGFloat = 13
     private static let markSize: CGFloat = 11
     private static let markTextGap: CGFloat = 7
     private static let font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+    /// Deliberately not the tint at a low alpha: a faint red Stop still reads as
+    /// a red button, and this one must not be pressed yet.
+    private static let inertFill = NSColor(white: 1, alpha: 0.10)
 
     static func width(for title: String) -> CGFloat {
         let text = (title as NSString).size(withAttributes: [.font: font]).width.rounded(.up)
@@ -138,6 +198,10 @@ final class HUDPill: NSView {
 
     private let tint: NSColor
     private let label: NSTextField
+    /// Kept so the mark can be dimmed with the rest of the pill; a dot and a
+    /// glyph are tinted through different properties.
+    private var markDot: NSView?
+    private var markGlyph: NSImageView?
 
     init(title: String, mark: Mark, tint: NSColor, height: CGFloat = HUDMetrics.controlHeight) {
         self.tint = tint
@@ -158,6 +222,7 @@ final class HUDPill: NSView {
             dot.layer?.backgroundColor = NSColor.white.cgColor
             dot.layer?.cornerRadius = Self.markSize / 2
             addSubview(dot)
+            markDot = dot
         case .symbol(let name):
             let glyph = NSImageView(frame: CGRect(
                 x: Self.horizontalPadding, y: markY,
@@ -166,6 +231,7 @@ final class HUDPill: NSView {
             glyph.contentTintColor = .white
             glyph.imageScaling = .scaleProportionallyDown
             addSubview(glyph)
+            markGlyph = glyph
         }
 
         label.font = Self.font
@@ -175,6 +241,20 @@ final class HUDPill: NSView {
             x: Self.horizontalPadding + Self.markSize + Self.markTextGap,
             y: ((height - label.frame.height) / 2).rounded()))
         addSubview(label)
+    }
+
+    func setLive(_ live: Bool, animated: Bool) {
+        guard live != isLive else { return }
+        isLive = live
+        let ink: NSColor = isLive ? .white : .tertiaryLabelColor
+        HUDMetrics.fill(self, with: isLive ? tint : Self.inertFill, animated: animated)
+        if animated {
+            HUDMetrics.crossfade(label)
+            if let markGlyph { HUDMetrics.crossfade(markGlyph) }
+        }
+        label.textColor = ink
+        markGlyph?.contentTintColor = ink
+        if let markDot { HUDMetrics.fill(markDot, with: ink, animated: animated) }
     }
 
     @available(*, unavailable)
@@ -187,10 +267,12 @@ final class HUDPill: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        guard isLive else { return }
         layer?.backgroundColor = tint.blended(withFraction: 0.2, of: .black)?.cgColor
     }
 
     override func mouseUp(with event: NSEvent) {
+        guard isLive else { return }
         layer?.backgroundColor = tint.cgColor
         guard bounds.contains(convert(event.locationInWindow, from: nil)) else { return }
         onClick()
