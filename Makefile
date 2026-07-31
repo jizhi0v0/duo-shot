@@ -40,6 +40,7 @@ help:
 	@echo "make logs      - stream os_log for $(BUNDLE_ID)"
 	@echo "make install   - copy to /Applications"
 	@echo "make dist      - notarization-ready build (real timestamp) + zip"
+	@echo "make check-26  - compile against an older macOS SDK on $(CHECK_HOST)"
 
 build:
 	swift build -c $(CONFIG)
@@ -142,6 +143,40 @@ mic-check: verify
 .PHONY: mic-repro
 mic-repro: verify
 	@Scripts/mic-recording-repro.sh $${RUNS:-10} $${TAKE:-5}
+
+# --- cross-SDK build check ----------------------------------------------------
+# Compiles the source against an OLDER macOS SDK on another Mac.
+#
+# Not a nicety. `Info.plist` sets a 26.0 minimum, but this machine builds with
+# Xcode beta and the 27 SDK, so anything that exists only in 27 compiles here and
+# fails for everyone else. `#available` does NOT protect against it -- that is a
+# runtime check, and the symbol still has to exist at compile time. Measured
+# 2026-07-31: `SCRecordingOutputConfiguration.mixesAudioWithMicrophone` shipped
+# guarded by `#available(macOS 27.0, *)` alone and broke the build on a Mac mini
+# running 26.5 with Xcode 26. It was found by accident. This makes it a command.
+#
+# Only `swift build` runs remotely. Signing needs the login keychain, and a
+# non-interactive ssh session cannot reach it -- codesign fails with
+# errSecInternalComponent. Testing the *behaviour* of an older OS is a separate
+# job: sign here, `ditto` the bundle across, and let it inherit the TCC grant,
+# which works because the Designated Requirement contains no path and no cdhash.
+CHECK_HOST ?= bobby@mac-mini.example.ts.net
+CHECK_DIR  ?= ~/duo-shot-sdkcheck
+
+.PHONY: check-26
+check-26:
+	@echo "syncing to $(CHECK_HOST):$(CHECK_DIR)"
+	@rsync -az --delete \
+		--exclude '.build' --exclude 'build' --exclude '.git' --exclude 'dist' \
+		./ "$(CHECK_HOST):$(CHECK_DIR)/"
+	@echo "remote SDK:"
+	@ssh -o BatchMode=yes "$(CHECK_HOST)" \
+		'sw_vers -productVersion | sed "s/^/  macOS /"; swift --version 2>&1 | head -1 | sed "s/^/  /"'
+	@ssh -o BatchMode=yes "$(CHECK_HOST)" \
+		'cd $(CHECK_DIR) && swift build -c $(CONFIG) 2>&1 | grep -E "error:|warning: .*deprecat|Build complete" | head -30'
+	@ssh -o BatchMode=yes "$(CHECK_HOST)" 'cd $(CHECK_DIR) && swift build -c $(CONFIG) >/dev/null 2>&1' \
+		&& echo "  OK -- builds against the older SDK" \
+		|| { echo "  FAILED -- see the errors above"; exit 1; }
 
 selftest: verify
 	@"$(EXEC)" --selftest-permission || true
