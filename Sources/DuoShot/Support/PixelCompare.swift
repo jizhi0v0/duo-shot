@@ -157,6 +157,41 @@ enum PixelCompare {
         return sum / Double(pixels.count / 4)
     }
 
+    /// Mean sRGB of a region, 0–255 per channel.
+    ///
+    /// The counting predicate above is the wrong tool for asking "is this patch
+    /// this colour" on a wide-gamut display, and it took a while to see why:
+    /// saturated Display P3 values are outside sRGB and *clip* on conversion —
+    /// P3 green lands on (8,255,3) — while the same green mixed with a little
+    /// white is representable and converts honestly to (70,255,58). Neighbouring
+    /// pixels therefore land 60 apart with nothing wrong, so per-pixel tolerances
+    /// either fail on grid lines and antialiasing or are so loose they prove
+    /// nothing. An average is stable under both.
+    static func meanColour(
+        _ image: CGImage, in region: CGRect? = nil
+    ) -> (r: Double, g: Double, b: Double)? {
+        let target: CGImage
+        if let region {
+            let clamped = region.intersection(
+                CGRect(x: 0, y: 0, width: image.width, height: image.height))
+            guard !clamped.isNull, clamped.width >= 1, clamped.height >= 1,
+                  let cropped = image.cropping(to: clamped)
+            else { return nil }
+            target = cropped
+        } else {
+            target = image
+        }
+        guard let pixels = normalized(target), !pixels.isEmpty else { return nil }
+        var sum = (r: 0.0, g: 0.0, b: 0.0)
+        for index in stride(from: 0, to: pixels.count, by: 4) {
+            sum.r += Double(pixels[index])
+            sum.g += Double(pixels[index + 1])
+            sum.b += Double(pixels[index + 2])
+        }
+        let count = Double(pixels.count / 4)
+        return (sum.r / count, sum.g / count, sum.b / count)
+    }
+
     /// Alpha at one pixel, 0–255, with the origin at the **top** left.
     ///
     /// `normalized` draws into a bottom-up context, so its first row is the

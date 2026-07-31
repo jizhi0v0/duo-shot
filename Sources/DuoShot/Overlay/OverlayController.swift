@@ -35,6 +35,9 @@ final class OverlayController {
     private var mode: SelectionMode = .area
     private var allowsWindowMode = true
     private let toolbar = SelectionToolbar()
+    /// Frozen frames of each display, for the loupe. Filled after the panels are
+    /// up — the capture has to exclude them, which means they have to exist.
+    private let backdrop = BackdropCache()
     /// Whether releasing the drag commits the selection or arms it.
     ///
     /// Screenshots commit on mouse-up: the whole value of the interaction is
@@ -66,6 +69,37 @@ final class OverlayController {
     /// visible: a recording's own selection happens while no stream is running,
     /// and the panels are torn down before one is built.
     var isRecordingActive: (() -> Bool)?
+
+    /// Photographs one display for the loupe, with our own panels left out.
+    ///
+    /// Injected for the same reason `refreshWindows` is: this type owns no
+    /// capture engine. Left nil — as the self-tests leave it — there is simply no
+    /// loupe, which is the right degradation for a magnifier.
+    var captureBackdrop: ((CGDirectDisplayID, Set<CGWindowID>) async -> CaptureResult?)?
+
+    /// Fetches the frozen frame for whichever screen the pointer is on.
+    ///
+    /// Lazily, per screen: a three-display machine should not pay for three
+    /// full-screen captures because the pointer visited one of them. The cost of
+    /// laziness is that the loupe fades in a moment after the pointer first
+    /// crosses onto a new screen, which is the same fade it does at the start.
+    private func warmBackdropUnderPointer() {
+        guard mode == .area, !isArmed, let capture = captureBackdrop,
+              let pointer = model.pointerInAppKitGlobal,
+              let screen = NSScreen.screens.first(where: { $0.frame.contains(pointer) })
+        else { return }
+        backdrop.warm(screen, using: capture, excluding: panelWindowIDs)
+    }
+
+    /// Hands each view the frame for its own screen.
+    private func publishBackdrops() {
+        for (panel, view) in zip(panels, views) {
+            guard let screen = panel.screen,
+                  let displayID = ScreenIndex.displayID(of: screen)
+            else { continue }
+            view.backdrop = backdrop.frame(for: displayID)
+        }
+    }
 
     /// `.none`, unless the user has asked for the selection UI to be visible to
     /// screen sharing and no take is currently being written.
@@ -123,9 +157,11 @@ final class OverlayController {
         // while the bar is up.
         let refresh: () -> Void = { [weak self] in
             guard let self else { return }
+            warmBackdropUnderPointer()
             views.forEach { $0.refresh() }
             if isArmed { repositionToolbar() }
         }
+        backdrop.onArrival = { [weak self] in self?.publishBackdrops() }
         model.onChange = refresh
         picker.onChange = refresh
 
@@ -472,6 +508,9 @@ final class OverlayController {
         // work alive for the rest of the process.
         rankTimer?.invalidate()
         rankTimer = nil
+        // Tens of megabytes per display, and worthless to the next selection.
+        backdrop.clear()
+        views.forEach { $0.backdrop = nil }
         for view in views { view.detachFromDisplayCycle() }
         for panel in panels { panel.orderOut(nil) }
         // Held one turn past the tear-down, the same way PreviewStackController
@@ -524,6 +563,33 @@ final class OverlayController {
         model.setSelection(rectInAppKitGlobal, on: screen)
         views.forEach { $0.refresh() }
         views.forEach { $0.displayIfNeeded() }
+    }
+
+    /// Moves the pointer state without a mouse, for `--selftest-loupe`.
+    ///
+    /// Also warms the backdrop, because that is what a real move does: the
+    /// laziness is part of the behaviour under test.
+    func forcePointerForTest(at pointInAppKitGlobal: CGPoint) {
+        model.pointerMoved(to: pointInAppKitGlobal)
+        warmBackdropUnderPointer()
+        views.forEach { $0.refresh() }
+        views.forEach { $0.displayIfNeeded() }
+    }
+
+    /// The loupe's rect in AppKit global points, so a test can photograph it.
+    var loupeFrameForTest: CGRect? {
+        for (panel, view) in zip(panels, views) {
+            guard let frame = view.loupeFrameForTest else { continue }
+            return CGRect(
+                origin: CGPoint(
+                    x: panel.frame.minX + frame.minX, y: panel.frame.minY + frame.minY),
+                size: frame.size)
+        }
+        return nil
+    }
+
+    var hasBackdropForTest: Bool {
+        views.contains { $0.backdrop != nil }
     }
 
     /// Drives window-picker hover without mouse input.

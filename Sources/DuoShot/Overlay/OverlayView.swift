@@ -44,11 +44,35 @@ final class OverlayView: NSView {
         didSet { if mode != oldValue { refresh() } }
     }
 
+    /// The photograph the loupe magnifies, once it arrives. Nil means no loupe:
+    /// either the capture has not landed yet, or this is a screen the pointer has
+    /// never visited.
+    var backdrop: BackdropCache.Frame? {
+        didSet {
+            loupe.backdrop = backdrop
+            // Fades in rather than appearing. It lands 30–60 ms after the overlay
+            // does, and at that distance a hard cut reads as a glitch in a UI the
+            // user is already interacting with.
+            if oldValue == nil, backdrop != nil {
+                loupe.alphaValue = 0
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0.18
+                    loupe.animator().alphaValue = 1
+                }
+            }
+            refresh()
+        }
+    }
+
+    /// The loupe's frame in this view's coordinates, or nil when it is hidden.
+    var loupeFrameForTest: CGRect? { loupe.isHidden ? nil : loupe.frame }
+
     private let screenFrame: CGRect
     private let model: SelectionModel
     private let picker: WindowPickerModel
     private let callbacks: Callbacks
     private let ants = MarchingAntsLayer()
+    private let loupe = SelectionLoupeView()
     private var trackingAreaRef: NSTrackingArea?
 
     init(
@@ -64,6 +88,8 @@ final class OverlayView: NSView {
         super.init(frame: CGRect(origin: .zero, size: screen.frame.size))
         wantsLayer = true
         layer?.addSublayer(ants)
+        loupe.isHidden = true
+        addSubview(loupe)
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -245,7 +271,42 @@ final class OverlayView: NSView {
         needsDisplay = true
         ants.frame = bounds
         ants.update(rect: highlightRect, contentsScale: window?.backingScaleFactor ?? 2)
+        placeLoupe()
         window?.invalidateCursorRects(for: self)
+    }
+
+    /// Keeps the loupe beside the pointer, on this screen, out of its own way.
+    ///
+    /// Shown while aiming and while dragging — the moving corner *is* the pointer,
+    /// so it is the same question either way — and not once the selection is
+    /// armed: by then the rect is decided and the bar over it is what the user is
+    /// reading.
+    private func placeLoupe() {
+        guard mode == .area, !isArmed, backdrop != nil,
+              let pointer = model.pointerInAppKitGlobal
+        else {
+            loupe.isHidden = true
+            return
+        }
+        let local = toLocal(CGRect(origin: pointer, size: .zero)).origin
+        guard bounds.insetBy(dx: -1, dy: -1).contains(local) else {
+            loupe.isHidden = true
+            return
+        }
+        loupe.isHidden = false
+        loupe.pointInAppKitGlobal = pointer
+
+        // Below-right by default, and flipped to whichever side has room. The
+        // offset is deliberately more than the cursor's own size: a loupe touching
+        // the pointer covers the pixels either side of the one being aimed at.
+        let size = SelectionLoupeView.size
+        let gap: CGFloat = 18
+        var origin = CGPoint(x: local.x + gap, y: local.y - gap - size.height)
+        if origin.x + size.width > bounds.maxX - 8 { origin.x = local.x - gap - size.width }
+        if origin.y < bounds.minY + 8 { origin.y = local.y + gap }
+        origin.x = min(max(origin.x, bounds.minX + 8), bounds.maxX - size.width - 8)
+        origin.y = min(max(origin.y, bounds.minY + 8), bounds.maxY - size.height - 8)
+        loupe.setFrameOrigin(CGPoint(x: origin.x.rounded(), y: origin.y.rounded()))
     }
 
     /// The un-dimmed region: the rubber band in area mode, the hovered window in

@@ -221,6 +221,7 @@ test: verify
 	run "overlay sharing"        --selftest-overlay-sharing; \
 	run "hud appearance"         --selftest-hud-appearance $(TEST_OUT); \
 	run "recording border"       --selftest-region-outline $(TEST_OUT); \
+	run "selection loupe"        --selftest-loupe $(TEST_OUT); \
 	run "preview stack + scroll" --selftest-preview-stack $(TEST_OUT) --count 14; \
 	run "recording area"         --selftest-record $(TEST_OUT) --seconds 2 --rect 400,300,640,400; \
 	run "recording fullscreen"   --selftest-record $(TEST_OUT) --seconds 2; \

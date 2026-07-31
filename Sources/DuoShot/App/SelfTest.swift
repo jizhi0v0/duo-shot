@@ -55,6 +55,8 @@ enum SelfTest {
         case hudAppearance(directory: URL)
         /// The lit border, photographed and measured over black and over white.
         case regionOutline(directory: URL)
+        /// Whether the loupe magnifies the pixels it says it does.
+        case loupe(directory: URL)
         /// Repeated captures through the whole pipeline, watching memory and the
         /// staging store.
         case soak(iterations: Int, directory: URL)
@@ -117,6 +119,12 @@ enum SelfTest {
             case "--selftest-hud-appearance":
                 FloatingBarPanel.usesSharingTypeNone = false
                 self = .hudAppearance(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
+            case "--selftest-loupe":
+                // The loupe lives in an overlay panel, which ships invisible to
+                // ScreenCaptureKit; a capture of it would come back empty.
+                OverlayPanel.usesSharingTypeNone = false
+                self = .loupe(
                     directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-region-outline":
                 // The border ships invisible to ScreenCaptureKit, so a capture of
@@ -258,6 +266,7 @@ enum SelfTest {
                 return try await previewInRecording(into: d, seconds: seconds, excludes: excludes)
             case .hudAppearance(let d): return try await hudAppearance(into: d)
             case .regionOutline(let d): return try await regionOutline(into: d)
+            case .loupe(let d): return try await loupe(into: d)
             case .soak(let iterations, let directory):
                 return try await soak(iterations: iterations, into: directory)
             case .microphone: return await microphoneCheck()
@@ -2010,6 +2019,167 @@ enum SelfTest {
         }
 
         print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.joined(separator: "; "))")")
+        return failures.isEmpty ? 0 : 1
+    }
+
+    // MARK: - Loupe
+
+    /// Whether the loupe magnifies the pixels it claims to.
+    ///
+    /// The interesting failure is not "nothing drew" — it is drawing the *wrong*
+    /// pixels, which looks entirely plausible in a screenshot. Every step between
+    /// the pointer and the photograph can be wrong in a way that still fills the
+    /// glass: a y-flip against the primary screen instead of this one, points
+    /// where pixels were meant, a display origin left out.
+    ///
+    /// So the pointer is put at the exact centre of four known colours. A loupe
+    /// centred on that corner has to show all four, one per quadrant, in the same
+    /// arrangement — which pins the flip, the scale and the offset at once.
+    ///
+    /// It caught the bug it was written for on its first run: the loupe came back
+    /// mirrored, because the draw flipped the CTM to account for the image being
+    /// top-down when `draw(_:in:)` had already done that. Verified to still
+    /// respond — reinstating that flip reports all four quadrants on the wrong
+    /// colour, naming which one each landed on.
+    private static func loupe(into directory: URL) async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+        if let hint = LoginSession.noDisplaysHint {
+            FileHandle.standardError.write(Data("error: \(hint)\n".utf8))
+            return 2
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        guard let screen = NSScreen.main else { throw CaptureError.noDisplays }
+
+        let coordinator = CaptureCoordinator()
+        let overlay = coordinator.overlay
+        try await coordinator.engine.refreshContent()
+
+        // AppKit global, y up: so "top" is the higher y. The quadrants are named
+        // as the user sees them.
+        let target = CGRect(
+            x: (screen.frame.midX - 120).rounded(), y: (screen.frame.midY - 120).rounded(),
+            width: 240, height: 240)
+        let quadrants: [(name: String, colour: NSColor, corner: CGRect)] = [
+            ("top-left", NSColor(srgbRed: 1, green: 0, blue: 0, alpha: 1),
+             CGRect(x: target.minX, y: target.midY, width: 120, height: 120)),
+            ("top-right", NSColor(srgbRed: 0, green: 1, blue: 0, alpha: 1),
+             CGRect(x: target.midX, y: target.midY, width: 120, height: 120)),
+            ("bottom-left", NSColor(srgbRed: 0, green: 0, blue: 1, alpha: 1),
+             CGRect(x: target.minX, y: target.minY, width: 120, height: 120)),
+            ("bottom-right", NSColor(srgbRed: 1, green: 1, blue: 0, alpha: 1),
+             CGRect(x: target.midX, y: target.minY, width: 120, height: 120)),
+        ]
+        let patches = quadrants.map { plainWindow(colour: $0.colour, frame: $0.corner) }
+        // Let them composite before the overlay goes up. The backdrop is captured
+        // the moment the pointer is seeded, which is inside `present`, so without
+        // this the photograph can be of the desktop as it was a frame before these
+        // windows appeared — seen once, as a first run that failed all four
+        // quadrants and then passed three times in a row.
+        try await Task.sleep(for: .milliseconds(400))
+
+        var failures: [String] = []
+        func check(_ condition: Bool, _ description: String) {
+            print("  \(condition ? "ok  " : "FAIL") \(description)")
+            if !condition { failures.append(description) }
+        }
+
+        let flag = CompletionFlag()
+        Task {
+            _ = await overlay.present(mode: .area, windows: [], allowsWindowMode: false)
+            flag.markDone()
+        }
+        try await Task.sleep(for: .milliseconds(200))
+        overlay.forcePointerForTest(at: CGPoint(x: target.midX, y: target.midY))
+
+        // The backdrop is asynchronous — the overlay must appear with no delay —
+        // so the loupe arrives a moment later. Warming starts as soon as the
+        // pointer is seeded, which is inside `present`, so by here it may already
+        // have landed; what is worth asserting is that it lands at all.
+        var waited = 0
+        while !overlay.hasBackdropForTest, waited < 2000 {
+            try await Task.sleep(for: .milliseconds(50))
+            waited += 50
+        }
+        check(overlay.hasBackdropForTest, "the backdrop arrived (in \(waited)ms)")
+        overlay.forcePointerForTest(at: CGPoint(x: target.midX, y: target.midY))
+        try await Task.sleep(for: .milliseconds(300))
+
+        guard let loupeFrame = overlay.loupeFrameForTest else {
+            check(false, "the loupe is on screen")
+            overlay.tearDown()
+            patches.forEach { $0.orderOut(nil) }
+            print("result:        FAIL — no loupe")
+            return 1
+        }
+        print("  loupe: \(rectString(loupeFrame))  pointer: "
+            + "\(Int(target.midX)),\(Int(target.midY))")
+
+        // Photographed through a display capture: the loupe lives in an overlay
+        // panel, and `--selftest-loupe` turns that panel's `.none` off so a
+        // capture can see it at all.
+        guard let displayID = ScreenIndex.displayID(of: screen) else { throw CaptureError.noDisplays }
+        let shot = try await coordinator.engine.capture(
+            .area(displayID: displayID, rectInAppKitGlobal: loupeFrame))
+        try? ImageEncoder.write(
+            shot.image, to: directory.appendingPathComponent("loupe.png"), as: .png,
+            scale: shot.scale)
+
+        // And the same moment from further back. The loupe has to be readable
+        // *beside the pointer*, next to the crosshair and the dim, and a crop of
+        // the glass alone cannot show whether that composition works.
+        let context = CGRect(
+            x: target.midX - 300, y: target.midY - 300, width: 600, height: 600)
+        if let wide = try? await coordinator.engine.capture(
+            .area(displayID: displayID, rectInAppKitGlobal: context)) {
+            try? ImageEncoder.write(
+                wide.image, to: directory.appendingPathComponent("loupe-in-context.png"),
+                as: .png, scale: wide.scale)
+        }
+
+        // The glass is the square above the caption; the four quadrants of it are
+        // sampled well inside, away from the grid lines and the reticle.
+        let scale = shot.scale
+        let glassSide = loupeFrame.width - 2
+        let glass = CGRect(x: 1 * scale, y: 1 * scale, width: glassSide * scale, height: glassSide * scale)
+        func quadrant(_ index: Int) -> CGRect {
+            let half = glass.width / 2
+            let x = glass.minX + (index % 2 == 0 ? 0 : half)
+            let y = glass.minY + (index < 2 ? 0 : half)
+            return CGRect(x: x, y: y, width: half, height: half).insetBy(dx: 12 * scale, dy: 12 * scale)
+        }
+
+        // Each quadrant is matched against all four colours and has to be nearest
+        // to its own. That is the arrangement claim stated directly: any mirror or
+        // rotation moves at least two quadrants onto the wrong colour and fails,
+        // while grid lines and gamut clipping — which broke a per-pixel tolerance
+        // check here — move a mean by a few units and change nothing.
+        for (index, expected) in quadrants.enumerated() {
+            guard let mean = PixelCompare.meanColour(shot.image, in: quadrant(index)) else {
+                check(false, "could not sample the \(expected.name) quadrant")
+                continue
+            }
+            func distance(to colour: NSColor) -> Double {
+                guard let srgb = colour.usingColorSpace(.sRGB) else { return .infinity }
+                let dr = mean.r - srgb.redComponent * 255
+                let dg = mean.g - srgb.greenComponent * 255
+                let db = mean.b - srgb.blueComponent * 255
+                return (dr * dr + dg * dg + db * db).squareRoot()
+            }
+            let nearest = quadrants.min { distance(to: $0.colour) < distance(to: $1.colour) }
+            print(String(
+                format: "  %-13@ mean (%.0f,%.0f,%.0f) → nearest %@",
+                expected.name as NSString, mean.r, mean.g, mean.b,
+                (nearest?.name ?? "none") as NSString))
+            check(nearest?.name == expected.name,
+                  "the glass's \(expected.name) quadrant shows the \(expected.name) colour")
+        }
+
+        overlay.tearDown()
+        _ = await flag.wait(upTo: .seconds(2))
+        patches.forEach { $0.orderOut(nil) }
+
+        print("images:        loupe.png in \(directory.path)")
+        print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.count) of the above")")
         return failures.isEmpty ? 0 : 1
     }
 
