@@ -121,13 +121,11 @@ enum SelfTest {
             case "--selftest-record-hud":
                 // NOTE the default: `.readOnly`, not the shipping `.none`.
                 //
-                // `.none` makes a window invisible to ScreenCaptureKit outright
-                // (M2), which blinds the screenshot this test uses as its
-                // control — and a test whose control cannot see the target is a
-                // test that cannot fail. So the harder configuration is the
-                // default here: leave the window fully capturable and assert it
-                // still never reaches the video. `--sharing-none` runs the
-                // shipping configuration, which is necessarily INCONCLUSIVE.
+                // The two are a matched pair and the suite runs both — see the
+                // verdict block in `recordHUD`. `.readOnly` asserts the surface
+                // IS recorded, which is what proves the measurement can see a
+                // leak; `--sharing-none` runs the shipping configuration and
+                // asserts it is not. Neither half means much alone.
                 self = .recordHUD(
                     directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"),
                     seconds: value(for: "--seconds").flatMap(Double.init) ?? 3,
@@ -1061,9 +1059,17 @@ enum SelfTest {
         // on screen. Written as `== 0` this test agreed with the picker's own
         // too-narrow filter and so could never catch it refusing to see one —
         // which is how a translator popup ended up unselectable.
+        // `alpha > 0` is not padding on the filter, it is the difference between
+        // testing the picker and testing the machine it happens to run on.
+        // Measured 2026-07-31: a DuoPaste panel — the same alpha-0.000 window
+        // `WindowInfo.alpha` was introduced for — ranked first here, so this
+        // picked an invisible window, demanded the picker resolve to it, and
+        // failed all three z-order assertions for doing exactly what the
+        // opacity check two screens down asserts it must do. The expectation has
+        // to be built with the picker's rules, or it contradicts them.
         let frontmost = all.first {
             $0.isOnScreen && (0...8).contains($0.layer) && $0.bundleID != ownBundleID
-                && $0.frame.width >= 200 && $0.frame.height >= 200
+                && $0.frame.width >= 200 && $0.frame.height >= 200 && $0.alpha > 0
         }
         var frontmostOK = true
         if let frontmost {
@@ -2872,6 +2878,9 @@ enum SelfTest {
         }
         guard recording != nil else { return 1 }
         let hudFrame = status?.button?.window?.frame ?? plain?.frame ?? hud.frameForTest ?? .zero
+        let surfaceWindowNumber = status?.button?.window?.windowNumber
+            ?? plain?.windowNumber
+            ?? hud.windowIDs.first.map(Int.init)
         let surfaceName =
             if useStatusItem { "NSStatusItem (menu bar, our process's window)" }
             else if plainWindow { "plain NSWindow (.normal level, titled)" }
@@ -2951,41 +2960,87 @@ enum SelfTest {
         print("magenta:       \(magenta) px in the video, \(stillMagenta) px in the screenshot "
             + "(window rect would hold ~\(expected) px)")
 
-        // The control is the still capture, NOT `sharingType`.
+        // What this test asserts changed on 2026-07-31, because what it was
+        // asserting turned out not to be true.
         //
-        // The first version of this test used `--sharing-default` as the
-        // negative control, on the assumption that `sharingType = .none` was
-        // what kept the HUD out — the mechanism M2 established for screenshots.
-        // It is not: measured 2026-07-31, a plain titled `.normal`-level window
-        // with the default `.readOnly` sharing is absent from the recording too,
-        // and the video shows the desktop behind it. A stream does not render
-        // the capturing process's own windows at all, so toggling `sharingType`
-        // can never make this test respond and a control built on it is dead.
+        // It was written around M9: "a stream does not render the capturing
+        // process's own windows at all", with the screenshot as the control —
+        // if the still sees the surface and the video does not, the difference
+        // is the stream. Measured against a plain titled `.normal` window shown
+        // *before* the stream was built, the video came back holding 35525 of
+        // its 36060 px. The stream renders our windows. M9 is withdrawn.
         //
-        // What does control it: the same magenta, the same counter, the same
-        // instant, through the screenshot path. If the still sees the surface
-        // and the video does not, the difference is the stream.
-        // The control sets the expectation, not an estimate from the window
-        // rect. A status item paints a 40x18 pt swatch inside a wider window, so
-        // an area-derived threshold called a perfectly good measurement
-        // inconclusive. What the screenshot actually found is the number the
-        // video has to be judged against.
-        let surfaceIsOnScreen = stillMagenta > 500
+        // So the two configurations now assert opposite things, and the pair is
+        // the test:
+        //
+        //   .readOnly — the surface IS expected in the video. This is the
+        //     documented behaviour now, and it doubles as the positive control:
+        //     it is what proves the magenta counter, the frame extraction and
+        //     the rect mapping can see a leak at all.
+        //   .none     — the surface must be ABSENT. This is the mechanism the
+        //     app actually relies on for the HUD, the overlay and the preview
+        //     panel, and it is the only one of the two that can regress into a
+        //     user-visible defect.
+        //
+        // `.none` blinds the screenshot control as well, so on-screen-ness is
+        // established without ScreenCaptureKit in the loop: the window server's
+        // own on-screen list. That is metadata, not pixels — no capture path,
+        // nothing for `sharingType` to hide from — so it stays honest in exactly
+        // the configuration where the old control could not.
+        // Two independent ways to establish it, because neither covers both
+        // configurations. The window server's list is the only one that works
+        // under `.none`, but it does not work for a status item: measured
+        // 2026-07-31, `NSStatusItem.button?.window?.windowNumber` reported 2^32
+        // — AppKit's not-ordered-in value — while the swatch was plainly on
+        // screen at 2844 of its 2880 px. The screenshot covers that case and is
+        // blind under `.none`. Either one is enough.
+        let windowServerOnScreen = surfaceWindowNumber.map(windowServerSaysOnScreen) ?? false
+        let onScreen = windowServerOnScreen || stillMagenta > 500
+        print("on screen:     window server says \(windowServerOnScreen) "
+            + "(window \(surfaceWindowNumber.map(String.init) ?? "<none>")), "
+            + "screenshot says \(stillMagenta > 500) (\(stillMagenta) px) -> \(onScreen)")
+
         let leaked = magenta > max(stillMagenta / 20, 100)
-        guard surfaceIsOnScreen else {
-            // With `.none` this is the expected, correct outcome and not a
-            // defect: the window is invisible to every ScreenCaptureKit path,
-            // screenshot included, so there is nothing left to compare.
-            print("result:        INCONCLUSIVE — the surface is not visible to ScreenCaptureKit at all "
-                + "(\(stillMagenta) px in the screenshot)"
-                + (sharingNone ? ", which is what sharingType = .none means" : ""))
-            return sharingNone ? 0 : 1
+        guard onScreen else {
+            // Exit 0, loudly labelled. This says nothing about the product: a
+            // surface that never reached the window server cannot demonstrate
+            // either outcome, and failing on it would make the suite red for a
+            // crowded menu bar. Measured 2026-07-31 with `--status-item`, whose
+            // window reported number 2^32 — the value AppKit uses before a
+            // window is ordered in — because the menu bar had no room left to
+            // show a new item.
+            print("result:        INCONCLUSIVE — the surface never reached the window server "
+                + "(window \(surfaceWindowNumber.map(String.init) ?? "<none>"), "
+                + "\(stillMagenta) px in the screenshot). For --status-item this usually means "
+                + "the menu bar is full; nothing is being asserted either way")
+            return 0
         }
-        print("result:        \(leaked ? "FAIL" : "PASS") — "
+        if sharingNone {
+            print("result:        \(leaked ? "FAIL" : "PASS") — "
+                + (leaked
+                    ? "sharingType = .none did NOT keep the surface out of the recording"
+                    : "on screen and absent from the recording, which is what .none must do"))
+            return leaked ? 1 : 0
+        }
+        print("result:        \(leaked ? "PASS" : "FAIL") — "
             + (leaked
-                ? "the surface was recorded"
-                : "on screen (\(stillMagenta) px in the screenshot) and absent from the recording"))
-        return leaked ? 1 : 0
+                ? "recorded, as a .readOnly window of our own process is expected to be"
+                : "a .readOnly window of ours did NOT reach the video (\(magenta) px). "
+                    + "Either M9 has become true again or this test can no longer detect a leak — "
+                    + "check the .none case, which now has no working positive control"))
+        return leaked ? 0 : 1
+    }
+
+    /// Whether the window server lists this window as on screen.
+    ///
+    /// Metadata only — `CGWindowListCopyWindowInfo` reports no pixels, so it is
+    /// not a capture path and `sharingType` has nothing to hide from it. That is
+    /// the whole reason it is used as the control for the `.none` case.
+    private static func windowServerSaysOnScreen(_ windowNumber: Int) -> Bool {
+        guard let list = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]
+        else { return false }
+        return list.contains { ($0[kCGWindowNumber as String] as? Int) == windowNumber }
     }
 
     // MARK: - Recording

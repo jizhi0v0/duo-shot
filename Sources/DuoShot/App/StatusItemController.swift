@@ -32,6 +32,23 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         statusItem = nil
     }
 
+    /// Hides the menu bar item from ScreenCaptureKit, for the length of a
+    /// recording.
+    ///
+    /// Its window belongs to AppKit and is `.readOnly` like any ordinary one, so
+    /// it is recorded — a stream renders the capturing process's own windows
+    /// (measured 2026-07-31; see `RecordingCoordinator.excludedWindowIDs`).
+    /// During a take this item is showing the running timer, so leaving it
+    /// visible puts a clock in the corner of every fullscreen recording.
+    ///
+    /// Only for the take, never permanently: a screenshot of one's own menu bar
+    /// should still show DuoShot in it. That is also why the Settings window is
+    /// left alone — it is deliberately capturable, and `--selftest-window`
+    /// asserts as much.
+    func setHiddenFromCapture(_ hidden: Bool) {
+        statusItem?.button?.window?.sharingType = hidden ? .none : .readOnly
+    }
+
     func noteOutput(_ output: OutputPipeline.Output) {
         lastOutput = output
         statusItem?.menu = buildMenu()

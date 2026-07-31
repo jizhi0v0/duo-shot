@@ -179,9 +179,10 @@ test: verify
 	run "preview stack + scroll" --selftest-preview-stack $(TEST_OUT) --count 14; \
 	run "recording area"         --selftest-record $(TEST_OUT) --seconds 2 --rect 400,300,640,400; \
 	run "recording fullscreen"   --selftest-record $(TEST_OUT) --seconds 2; \
-	run "recording hud absent"   --selftest-record-hud $(TEST_OUT) --seconds 2; \
-	run "recording hud (plain)"  --selftest-record-hud $(TEST_OUT) --seconds 2 --plain-window --hud-first; \
-	run "recording menu-bar item" --selftest-record-hud $(TEST_OUT) --seconds 2 --status-item --hud-first; \
+	run "hud recorded (readOnly)" --selftest-record-hud $(TEST_OUT) --seconds 2; \
+	run "hud absent (.none)"     --selftest-record-hud $(TEST_OUT) --seconds 2 --sharing-none; \
+	run "plain window recorded"  --selftest-record-hud $(TEST_OUT) --seconds 2 --plain-window --hud-first; \
+	run "menu-bar item recorded" --selftest-record-hud $(TEST_OUT) --seconds 2 --status-item --hud-first; \
 	run "recording flow"         --selftest-record-flow $(TEST_OUT) --seconds 2; \
 	printf '  %-26s ' "exclusion negative control"; \
 	if "$(EXEC)" --selftest-overlay 400,300,640,400 --sharing-default --no-exclude >/dev/null 2>&1; \

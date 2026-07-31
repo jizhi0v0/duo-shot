@@ -30,6 +30,12 @@ final class RecordingCoordinator {
     var onResult: ((OutputPipeline.RecordingOutput) -> Void)?
     var onStateChanged: (() -> Void)?
     var onAuthorisationLost: (() -> Void)?
+    /// Raised for the length of a take so chrome of ours that is capturable —
+    /// the menu bar item, which AppKit owns and which is `.readOnly` like any
+    /// ordinary window — stays out of the video. Lowered again on every exit,
+    /// including the failure ones: an icon left invisible to screenshots after a
+    /// take that never started is a worse bug than the one this fixes.
+    var onCaptureChromeHidden: ((Bool) -> Void)?
     /// The staging directory override, for self-tests that must not touch the
     /// user's save folder.
     var saveDirectoryOverride: URL?
@@ -45,8 +51,20 @@ final class RecordingCoordinator {
     var elapsed: TimeInterval { engine.current?.elapsed ?? 0 }
 
     /// The HUD's window, so a *screenshot* taken mid-recording does not
-    /// photograph it. Recordings do not need this — a stream never renders our
-    /// own windows (M9) — but screenshots very much do.
+    /// photograph it.
+    ///
+    /// Recordings are covered by a different mechanism, and it is worth being
+    /// exact about which: `RecordingHUDPanel` ships with `sharingType = .none`,
+    /// which hides it from every ScreenCaptureKit path. NOT — as this comment
+    /// claimed until 2026-07-31 — because a stream declines to render the
+    /// capturing process's own windows. It does render them: measured with
+    /// `--selftest-record-hud --plain-window --hud-first`, an ordinary titled
+    /// window of this process, on screen before the stream was even built, came
+    /// back in the video at 35525 px of its 36060.
+    ///
+    /// So any window of ours that is not `.none` lands in the take. That is why
+    /// the status item is hidden for the length of one — see
+    /// `onCaptureChromeHidden`.
     var excludedWindowIDs: Set<CGWindowID> { hud.windowIDs }
 
     // MARK: - Triggering
@@ -113,6 +131,11 @@ final class RecordingCoordinator {
         let options = Preferences.shared.recordingOptions
         let url = StagingStore.shared.reserve(fileExtension: options.fileExtension)
 
+        // Before the stream is built, not after: `SCContentFilter` is fixed at
+        // start, and a sharingType flipped underneath a running stream is not a
+        // documented way to change what it renders.
+        onCaptureChromeHidden?(true)
+
         do {
             let recording = try await engine.start(request, options: options, to: url)
             state = .recording
@@ -128,6 +151,7 @@ final class RecordingCoordinator {
             onStateChanged?()
         } catch {
             state = .idle
+            onCaptureChromeHidden?(false)
             onStateChanged?()
             Log.record.error("""
                 could not start \(request.kind, privacy: .public) recording: \
@@ -144,6 +168,7 @@ final class RecordingCoordinator {
         guard state == .recording else { return }
         state = .idle
         hud.hide()
+        onCaptureChromeHidden?(false)
         do {
             let result = try await engine.stop()
             if let output = OutputPipeline.shared.process(
@@ -161,6 +186,7 @@ final class RecordingCoordinator {
         guard state == .recording else { return }
         state = .idle
         hud.hide()
+        onCaptureChromeHidden?(false)
         await engine.cancel()
         onStateChanged?()
     }
@@ -177,6 +203,7 @@ final class RecordingCoordinator {
             """)
         state = .idle
         hud.hide()
+        onCaptureChromeHidden?(false)
         // Salvage rather than discard: whatever was written before the stream
         // died is still a recording, and throwing it away is the one outcome
         // the user can never undo.

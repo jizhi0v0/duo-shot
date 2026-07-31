@@ -61,6 +61,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recorder.onStateChanged = { [weak self] in
             self?.statusItem.refreshRecordingState()
         }
+        recorder.onCaptureChromeHidden = { [weak self] hidden in
+            self?.statusItem.setHiddenFromCapture(hidden)
+        }
         recorder.onResult = { [weak self] output in
             guard let self else { return }
             statusItem.noteRecording(output)
