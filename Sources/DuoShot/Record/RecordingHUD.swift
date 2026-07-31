@@ -123,7 +123,9 @@ final class RecordingHUDView: NSView {
     private var callbacks = Callbacks()
     private let dot = NSView()
     private let timeLabel = NSTextField(labelWithString: "0:00")
-    private var background: NSVisualEffectView!
+    private var glass: NSGlassEffectView!
+    /// Where every control lives — see `HUDMetrics.chrome`.
+    private var content: NSView!
     private var stopPill: HUDPill?
     private var discardButton: NSButton?
     private var divider: NSView?
@@ -155,8 +157,10 @@ final class RecordingHUDView: NSView {
         // exactly how the M4 preview panel came out blank.
         if Self.debugFillsMagenta { return }
 
-        background = HUDMetrics.background(in: bounds)
-        addSubview(background)
+        let chrome = HUDMetrics.chrome(in: bounds)
+        glass = chrome.glass
+        content = chrome.content
+        addSubview(glass)
 
         var x = HUDMetrics.margin
         dot.frame = CGRect(
@@ -165,7 +169,7 @@ final class RecordingHUDView: NSView {
         dot.wantsLayer = true
         dot.layer?.backgroundColor = NSColor.systemRed.cgColor
         dot.layer?.cornerRadius = Self.dotSize / 2
-        addSubview(dot)
+        content.addSubview(dot)
         pulse()
         x += Self.dotSize + 8
 
@@ -174,11 +178,11 @@ final class RecordingHUDView: NSView {
         timeLabel.alignment = .left
         timeLabel.cell?.usesSingleLineMode = true
         placeTimeLabel(x: x, width: Self.timeWidth)
-        addSubview(timeLabel)
+        content.addSubview(timeLabel)
         x += Self.timeWidth + HUDMetrics.groupGap
 
         let line = HUDMetrics.divider(x: x)
-        addSubview(line)
+        content.addSubview(line)
         divider = line
         x += 1 + HUDMetrics.groupGap
 
@@ -187,7 +191,7 @@ final class RecordingHUDView: NSView {
             x: x, y: ((Self.barSize.height - HUDMetrics.controlHeight) / 2).rounded()))
         stop.onClick = { [weak self] in self?.callbacks.stop() }
         stop.toolTip = "Stop and keep the recording"
-        addSubview(stop)
+        content.addSubview(stop)
         stopPill = stop
         x += stop.frame.width + HUDMetrics.gap
 
@@ -202,7 +206,7 @@ final class RecordingHUDView: NSView {
         discard.target = self
         discard.action = #selector(discardTapped)
         discard.toolTip = "Stop and discard"
-        addSubview(discard)
+        content.addSubview(discard)
         discardButton = discard
     }
 
@@ -402,7 +406,7 @@ final class RecordingHUD {
     /// far quicker to read as numbers than to squint at in a screenshot.
     var debugSubviewFrames: [String] {
         guard let content = panel?.contentView else { return [] }
-        return content.subviews.map { view in
+        return content.subviews.flatMap { $0.subviews.isEmpty ? [$0] : $0.subviews }.map { view in
             let kind = "\(type(of: view))"
             return "\(kind) \(Int(view.frame.minX)),\(Int(view.frame.minY)) "
                 + "\(Int(view.frame.width))x\(Int(view.frame.height))"

@@ -20,17 +20,38 @@ enum HUDMetrics {
     static let groupGap: CGFloat = 8
     static let iconWidth: CGFloat = 30
 
-    static func background(in bounds: CGRect) -> NSVisualEffectView {
-        let view = NSVisualEffectView(frame: bounds)
-        view.autoresizingMask = [.width, .height]
-        view.material = .hudWindow
-        view.blendingMode = .behindWindow
-        view.state = .active
-        view.wantsLayer = true
-        view.layer?.cornerRadius = cornerRadius
-        view.layer?.cornerCurve = .continuous
-        view.layer?.masksToBounds = true
-        return view
+    /// The bar's material, plus the container its controls belong in.
+    ///
+    /// Liquid Glass, via `NSGlassEffectView` — available from macOS 26.0, which
+    /// is exactly this app's minimum, so there is no fallback path to keep.
+    ///
+    /// Controls go in the returned `content` view, not straight onto the bar.
+    /// The header is explicit that only `contentView` is guaranteed to sit
+    /// inside the effect: "arbitrary subviews aren't guaranteed specific
+    /// behavior with regard to z-order in relation to the content view or glass
+    /// effect." Adding them as siblings happens to look right and is not
+    /// promised to keep doing so.
+    ///
+    /// `content` matches the bar's bounds and resizes with it, so every frame
+    /// the callers compute stays in the same coordinate space it always was.
+    static func chrome(in bounds: CGRect) -> (glass: NSGlassEffectView, content: NSView) {
+        let glass = NSGlassEffectView(frame: bounds)
+        glass.autoresizingMask = [.width, .height]
+        glass.cornerRadius = cornerRadius
+        glass.style = .regular
+        // macOS 27 only, and absent from the 26 SDK entirely — so the runtime
+        // check is not enough on its own. Same trap as
+        // `mixesAudioWithMicrophone`; see `make check-26`.
+        #if compiler(>=6.4)
+        if #available(macOS 27.0, *) {
+            glass.effectIsInteractive = true
+        }
+        #endif
+
+        let content = NSView(frame: CGRect(origin: .zero, size: bounds.size))
+        content.autoresizingMask = [.width, .height]
+        glass.contentView = content
+        return (glass, content)
     }
 
     static func divider(x: CGFloat) -> NSView {

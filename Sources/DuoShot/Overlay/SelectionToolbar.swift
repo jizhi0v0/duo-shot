@@ -74,7 +74,8 @@ final class SelectionToolbarView: NSView {
     private static let deviceMaxWidth: CGFloat = 132
 
     private var callbacks: Callbacks
-    private var background: NSVisualEffectView!
+    private var glass: NSGlassEffectView!
+    private var content: NSView!
     private var microphoneButton: NSButton!
     private var deviceButton: NSButton!
     private var deviceLabel: NSTextField!
@@ -98,11 +99,13 @@ final class SelectionToolbarView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     private func buildSubviews() {
-        background = HUDMetrics.background(in: bounds)
-        addSubview(background)
+        let chrome = HUDMetrics.chrome(in: bounds)
+        glass = chrome.glass
+        content = chrome.content
+        addSubview(glass)
 
         microphoneButton = button(action: #selector(toggleMicrophone))
-        addSubview(microphoneButton)
+        content.addSubview(microphoneButton)
 
         // A separate hit target rather than a long-press or a right-click: the
         // overlay owns the keyboard and the pointer during a selection, so a
@@ -110,7 +113,7 @@ final class SelectionToolbarView: NSView {
         // may be about to restart.
         deviceButton = button(action: #selector(showDeviceMenu))
         deviceButton.image = HUDMetrics.symbol("chevron.down", pointSize: 8)
-        addSubview(deviceButton)
+        content.addSubview(deviceButton)
 
         // Shown even when it says "System default". The point of putting the
         // input on the bar is that you can see what the take will record without
@@ -121,20 +124,20 @@ final class SelectionToolbarView: NSView {
         deviceLabel.font = Self.deviceFont
         deviceLabel.lineBreakMode = .byTruncatingTail
         deviceLabel.maximumNumberOfLines = 1
-        addSubview(deviceLabel)
+        content.addSubview(deviceLabel)
 
         audioButton = button(action: #selector(toggleSystemAudio))
-        addSubview(audioButton)
+        content.addSubview(audioButton)
 
         divider = NSView()
         divider.wantsLayer = true
         divider.layer?.backgroundColor = NSColor(white: 1, alpha: 0.18).cgColor
-        addSubview(divider)
+        content.addSubview(divider)
 
         pill = HUDPill(title: Self.recordTitle, mark: .dot, tint: .systemRed)
         pill.toolTip = "Start recording  ⏎"
         pill.onClick = { [weak self] in self?.callbacks.start() }
-        addSubview(pill)
+        content.addSubview(pill)
     }
 
     private func button(action: Selector) -> NSButton {
@@ -217,7 +220,7 @@ final class SelectionToolbarView: NSView {
         let size = CGSize(width: x.rounded(.up), height: Self.height)
         if frame.size != size {
             setFrameSize(size)
-            background.frame = CGRect(origin: .zero, size: size)
+            glass.frame = CGRect(origin: .zero, size: size)
             callbacks.resized()
         }
     }

@@ -977,7 +977,22 @@ enum SelfTest {
         }
 
         previews.dismissAll()
-        let pass = !keyWindowIsPreview && frontmostBefore == frontmostAfter
+        // The claim is that showing a preview does not steal focus — not that
+        // nothing else on the machine may take it. Requiring the frontmost app
+        // to be unchanged asserted the second, and failed whenever something
+        // unrelated came forward: measured 2026-07-31, System Settings
+        // activating itself mid-test turned `com.openai.codex` into
+        // `com.apple.systempreferences` and the preview panel was blamed for it.
+        //
+        // What must hold is that *we* did not come forward. A third-party app
+        // taking focus is somebody else's business and cannot be prevented by
+        // this panel anyway.
+        let ownBundle = Bundle.main.bundleIdentifier
+        let weStoleFocus = frontmostAfter == ownBundle && frontmostBefore != ownBundle
+        if frontmostBefore != frontmostAfter, !weStoleFocus {
+            print("               (another app took focus during the test; not ours to prevent)")
+        }
+        let pass = !keyWindowIsPreview && !weStoleFocus
             && exclusionOK && dismissed && hoverOK
         print("result:        \(pass ? "PASS" : "FAIL")")
         return pass ? 0 : 1
@@ -3154,6 +3169,15 @@ enum SelfTest {
         print("still capture: \(stillMagenta) px magenta "
             + "(is the HUD painting at all, and does a *screenshot* see it)")
 
+        // Asked NOW, while the surface is still up.
+        //
+        // It used to be asked in the verdict block, which runs after `hide()`
+        // and `orderOut` — so the answer was a race with the window server
+        // dropping the window from its on-screen list, and the `.none` case,
+        // whose only evidence this is, intermittently came back INCONCLUSIVE
+        // for a surface that had been on screen the whole take.
+        let windowServerOnScreen = surfaceWindowNumber.map(windowServerSaysOnScreen) ?? false
+
         // Let the window server actually composite it. A fixed sleep here was
         // the flaky part of the M2 overlay test; the recording is long enough
         // that a generous settle is cheaper than a poll.
@@ -3238,7 +3262,6 @@ enum SelfTest {
         // — AppKit's not-ordered-in value — while the swatch was plainly on
         // screen at 2844 of its 2880 px. The screenshot covers that case and is
         // blind under `.none`. Either one is enough.
-        let windowServerOnScreen = surfaceWindowNumber.map(windowServerSaysOnScreen) ?? false
         let onScreen = windowServerOnScreen || stillMagenta > 500
         print("on screen:     window server says \(windowServerOnScreen) "
             + "(window \(surfaceWindowNumber.map(String.init) ?? "<none>")), "
