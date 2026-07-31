@@ -49,6 +49,7 @@ enum SelfTest {
         /// Exercises every overlay exit path repeatedly, hunting for a hung or
         /// double-resumed continuation and leaked panels.
         case lifecycle(iterations: Int)
+        case selectionToolbar
         /// Repeated captures through the whole pipeline, watching memory and the
         /// staging store.
         case soak(iterations: Int, directory: URL)
@@ -108,6 +109,8 @@ enum SelfTest {
                 self = .output(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-preferences":
                 self = .preferences
+            case "--selftest-selection-toolbar":
+                self = .selectionToolbar
             case "--selftest-lifecycle":
                 self = .lifecycle(iterations: positional().flatMap(Int.init) ?? 12)
             case "--selftest-soak":
@@ -217,6 +220,7 @@ enum SelfTest {
             case .settingsWindow(let directory): return try await settingsWindow(into: directory)
             case .settingsResize: return try await settingsResize()
             case .lifecycle(let iterations): return try await lifecycle(iterations: iterations)
+            case .selectionToolbar: return try await selectionToolbar()
             case .soak(let iterations, let directory):
                 return try await soak(iterations: iterations, into: directory)
             case .microphone: return await microphoneCheck()
@@ -1774,6 +1778,128 @@ enum SelfTest {
     /// reconfiguration, a second `present` — and a `CheckedContinuation` that is
     /// resumed twice is a hard crash while one never resumed hangs the caller
     /// forever. This drives every route in turn, many times.
+    /// The confirmation step: mouse-up arms the selection instead of committing
+    /// it, and only the second confirm resumes the caller.
+    ///
+    /// The failure this is really guarding against is not the toolbar failing to
+    /// appear — that is visible the first time anyone records. It is
+    /// `present()` resuming on the *first* confirm anyway, which looks identical
+    /// from the outside (a recording starts) and silently deletes the entire
+    /// feature. So every assertion below is about the continuation, not about
+    /// pixels.
+    private static func selectionToolbar() async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+        if let hint = LoginSession.noDisplaysHint {
+            FileHandle.standardError.write(Data("error: \(hint)\n".utf8))
+            return 2
+        }
+        guard let screen = NSScreen.main else { throw CaptureError.noDisplays }
+
+        let coordinator = CaptureCoordinator()
+        let overlay = coordinator.overlay
+        var failures: [String] = []
+
+        func check(_ condition: Bool, _ description: String) {
+            print("  \(condition ? "ok  " : "FAIL") \(description)")
+            if !condition { failures.append(description) }
+        }
+
+        // --- armed, then confirmed -------------------------------------------
+        let selection = CGRect(x: 240, y: 260, width: 420, height: 300)
+        let box = OutcomeBox()
+        let flag = CompletionFlag()
+        Task {
+            box.outcome = await overlay.present(
+                mode: .area, windows: [], allowsWindowMode: false, requiresConfirmation: true)
+            flag.markDone()
+        }
+        try await Task.sleep(for: .milliseconds(140))
+
+        overlay.forceSelection(selection, on: screen)
+        overlay.confirmForTest()
+        try await Task.sleep(for: .milliseconds(120))
+
+        check(overlay.isArmedForTest, "first confirm arms rather than commits")
+        check(overlay.hasPendingContinuation, "present() has NOT resumed yet")
+        check(overlay.toolbarIsVisibleForTest, "toolbar is on screen")
+        check(!flag.isDone, "the caller is still waiting")
+
+        // Under the selection, and inside the screen. Both matter: a bar placed
+        // off-screen is as useless as one that never appeared, and it is the
+        // clamping that is easy to get wrong.
+        if let bar = overlay.toolbarFrameForTest {
+            print("  bar: \(rectString(bar))  selection: \(rectString(selection))")
+            check(bar.midY < selection.midY, "toolbar sits below the selection's centre")
+            check(screen.visibleFrame.contains(bar), "toolbar is fully on screen")
+        } else {
+            check(false, "toolbar has a frame")
+        }
+
+        // The toolbar is one of ours, so a screenshot taken through this list
+        // must not photograph it.
+        check(overlay.panelWindowIDs.count >= 2, "toolbar window is in panelWindowIDs")
+
+        overlay.confirmForTest()
+        let resumed = await flag.wait(upTo: .seconds(2))
+        check(resumed, "second confirm resumes present()")
+        if case .area(_, let rect)? = box.outcome {
+            check(rect == selection, "outcome carries the armed rect, unchanged")
+        } else {
+            check(false, "outcome is .area (got \(String(describing: box.outcome)))")
+        }
+        check(!overlay.toolbarIsVisibleForTest, "toolbar is gone after the commit")
+        overlay.tearDown()
+        try await Task.sleep(for: .milliseconds(120))
+
+        // --- a new drag disarms ----------------------------------------------
+        let secondFlag = CompletionFlag()
+        Task {
+            _ = await overlay.present(
+                mode: .area, windows: [], allowsWindowMode: false, requiresConfirmation: true)
+            secondFlag.markDone()
+        }
+        try await Task.sleep(for: .milliseconds(140))
+        overlay.forceSelection(selection, on: screen)
+        overlay.confirmForTest()
+        try await Task.sleep(for: .milliseconds(100))
+        check(overlay.toolbarIsVisibleForTest, "armed again")
+
+        overlay.restartSelectionForTest(
+            at: CGPoint(x: selection.maxX + 40, y: selection.maxY + 40), on: screen)
+        try await Task.sleep(for: .milliseconds(100))
+        check(!overlay.isArmedForTest, "starting a new drag disarms")
+        check(!overlay.toolbarIsVisibleForTest, "toolbar goes away with it")
+        check(overlay.hasPendingContinuation, "still not resumed by the restart")
+
+        // --- tearDown always takes the bar with it ---------------------------
+        overlay.forceSelection(selection, on: screen)
+        overlay.confirmForTest()
+        try await Task.sleep(for: .milliseconds(100))
+        check(overlay.toolbarIsVisibleForTest, "armed a third time")
+        overlay.tearDown()
+        try await Task.sleep(for: .milliseconds(120))
+        check(!overlay.toolbarIsVisibleForTest, "tearDown hides the toolbar")
+        check(await secondFlag.wait(upTo: .seconds(2)), "tearDown resumes present()")
+
+        // The screenshot path must be untouched by any of this.
+        let stillFlag = CompletionFlag()
+        let stillBox = OutcomeBox()
+        Task {
+            stillBox.outcome = await overlay.present(mode: .area, windows: [])
+            stillFlag.markDone()
+        }
+        try await Task.sleep(for: .milliseconds(140))
+        overlay.forceSelection(selection, on: screen)
+        overlay.confirmForTest()
+        let stillResumed = await stillFlag.wait(upTo: .seconds(2))
+        check(stillResumed, "without requiresConfirmation, one confirm still commits")
+        check(!overlay.toolbarIsVisibleForTest, "and no toolbar appears for screenshots")
+        overlay.tearDown()
+
+        print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.count) of the above")")
+        return failures.isEmpty ? 0 : 1
+    }
+
     private static func lifecycle(iterations: Int) async throws -> Int32 {
         guard ScreenPermission.isGranted else { return permissionHint() }
 

@@ -24,6 +24,7 @@ final class RecordingCoordinator {
     private let engine: RecordingEngine
     private let overlay: OverlayController
     private let hud = RecordingHUD()
+    private let regionOutline = RecordingRegionOutline()
 
     private(set) var state: State = .idle
 
@@ -65,7 +66,7 @@ final class RecordingCoordinator {
     /// So any window of ours that is not `.none` lands in the take. That is why
     /// the status item is hidden for the length of one — see
     /// `onCaptureChromeHidden`.
-    var excludedWindowIDs: Set<CGWindowID> { hud.windowIDs }
+    var excludedWindowIDs: Set<CGWindowID> { hud.windowIDs.union(regionOutline.windowIDs) }
 
     // MARK: - Triggering
 
@@ -104,7 +105,7 @@ final class RecordingCoordinator {
         // those have a defined answer yet, so Space is not offered rather than
         // offered and quietly ignored.
         let outcome = await overlay.present(
-            mode: .area, windows: [], allowsWindowMode: false)
+            mode: .area, windows: [], allowsWindowMode: false, requiresConfirmation: true)
         overlay.tearDown()
 
         guard case .area(let displayID, let rect) = outcome else { return }
@@ -140,6 +141,10 @@ final class RecordingCoordinator {
         // returned left the screen with the selection gone and nothing in its
         // place for that whole time.
         hud.showStarting(on: ScreenIndex.screen(for: request.displayID))
+        // Only for an area take. On a fullscreen one the answer to "what is
+        // being recorded" is the whole screen, and a border round the edge of it
+        // would be noise.
+        if case .area(_, let rect) = request { regionOutline.show(around: rect) }
 
         do {
             let recording = try await engine.start(request, options: options, to: url)
@@ -160,6 +165,7 @@ final class RecordingCoordinator {
             // it to. Leaving it would be a bar that claims a recording is on its
             // way forever.
             hud.hide()
+            regionOutline.hide()
             onCaptureChromeHidden?(false)
             onStateChanged?()
             Log.record.error("""
@@ -177,6 +183,7 @@ final class RecordingCoordinator {
         guard state == .recording else { return }
         state = .idle
         hud.hide()
+        regionOutline.hide()
         onCaptureChromeHidden?(false)
         do {
             let result = try await engine.stop()
@@ -195,6 +202,7 @@ final class RecordingCoordinator {
         guard state == .recording else { return }
         state = .idle
         hud.hide()
+        regionOutline.hide()
         onCaptureChromeHidden?(false)
         await engine.cancel()
         onStateChanged?()
@@ -212,6 +220,7 @@ final class RecordingCoordinator {
             """)
         state = .idle
         hud.hide()
+        regionOutline.hide()
         onCaptureChromeHidden?(false)
         // Salvage rather than discard: whatever was written before the stream
         // died is still a recording, and throwing it away is the one outcome

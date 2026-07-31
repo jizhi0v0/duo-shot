@@ -12,6 +12,10 @@ final class OverlayView: NSView {
         var confirmWindow: (CGWindowID) -> Void = { _ in }
         var cancel: () -> Void = {}
         var toggleMode: () -> Void = {}
+        /// A fresh drag has begun. Only meaningful when the caller asked for a
+        /// confirmation step: it means the armed selection is being replaced and
+        /// its toolbar has to go.
+        var selectionRestarted: () -> Void = {}
     }
 
     /// Debug aid: draws a solid magenta block in the middle of the selection.
@@ -28,6 +32,12 @@ final class OverlayView: NSView {
     /// than one that is not advertised.
     var allowsWindowMode = true {
         didSet { if allowsWindowMode != oldValue { refresh() } }
+    }
+    /// The selection is committed and the toolbar is up. Only changes the hint —
+    /// every other interaction stays live, which is the point: the rect can
+    /// still be nudged and the whole thing still abandoned with Escape.
+    var isArmed = false {
+        didSet { if isArmed != oldValue { refresh() } }
     }
 
     var mode: SelectionMode = .area {
@@ -122,15 +132,46 @@ final class OverlayView: NSView {
         }
     }
 
+    /// Where a press landed while the selection was armed, until it either
+    /// travels far enough to be a new drag or is released as a plain click.
+    private var armedPressOrigin: CGPoint?
+
+    /// Below this a press is a click, not a new selection.
+    ///
+    /// Without it, an armed selection was destroyed by any click anywhere:
+    /// `SelectionModel.isUsable` passes at 1×1 pt, so the pixel of travel in an
+    /// ordinary click was a complete, confirmable rect, and the toolbar
+    /// re-armed itself wherever the pointer happened to be.
+    private static let restartSlop: CGFloat = 5
+
     override func mouseDown(with event: NSEvent) {
         guard mode == .area else { return }
         guard let screen = window?.screen else { return }
-        model.beginDrag(at: toGlobal(convert(event.locationInWindow, from: nil)), on: screen)
+        let point = toGlobal(convert(event.locationInWindow, from: nil))
+        // Armed, so this press is not yet anything. Deciding here would throw
+        // the selection away before knowing whether the user meant to.
+        if isArmed {
+            armedPressOrigin = point
+            return
+        }
+        model.beginDrag(at: point, on: screen)
     }
 
     override func mouseDragged(with event: NSEvent) {
         guard mode == .area else { return }
-        model.updateDrag(to: toGlobal(convert(event.locationInWindow, from: nil)))
+        let point = toGlobal(convert(event.locationInWindow, from: nil))
+
+        if let origin = armedPressOrigin {
+            guard hypot(point.x - origin.x, point.y - origin.y) > Self.restartSlop else { return }
+            guard let screen = window?.screen else { return }
+            armedPressOrigin = nil
+            // Before `beginDrag`, so the toolbar is gone by the time the new
+            // rect starts being drawn under where it used to be.
+            callbacks.selectionRestarted()
+            model.beginDrag(at: origin, on: screen)
+        }
+
+        model.updateDrag(to: point)
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -138,6 +179,14 @@ final class OverlayView: NSView {
         case .window:
             if let hovered = picker.hovered { callbacks.confirmWindow(hovered.id) }
         case .area:
+            // A press that never travelled. The armed selection stands, and the
+            // click is simply discarded — clicking the dim to dismiss would be a
+            // second, undiscoverable way to lose a selection that Escape already
+            // handles visibly.
+            if armedPressOrigin != nil {
+                armedPressOrigin = nil
+                return
+            }
             model.updateDrag(to: toGlobal(convert(event.locationInWindow, from: nil)))
             model.endDrag()
             if model.isUsable { callbacks.confirmArea() }
@@ -266,7 +315,9 @@ final class OverlayView: NSView {
     }
 
     private func drawHint() {
-        let text = if mode != .area {
+        let text = if isArmed {
+            "⏎ to record · drag again to reselect · Esc to cancel"
+        } else if mode != .area {
             "Click a window · Space for area · Esc to cancel"
         } else if allowsWindowMode {
             "Drag to select · Space for window · Esc to cancel"

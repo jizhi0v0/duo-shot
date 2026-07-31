@@ -176,6 +176,7 @@ test: verify
 	run "settings window"        --selftest-settings-window $(TEST_OUT); \
 	run "settings tab resize"    --selftest-settings-resize; \
 	run "overlay lifecycle"      --selftest-lifecycle 10; \
+	run "selection toolbar"      --selftest-selection-toolbar; \
 	run "preview stack + scroll" --selftest-preview-stack $(TEST_OUT) --count 14; \
 	run "recording area"         --selftest-record $(TEST_OUT) --seconds 2 --rect 400,300,640,400; \
 	run "recording fullscreen"   --selftest-record $(TEST_OUT) --seconds 2; \

@@ -34,6 +34,15 @@ final class OverlayController {
     private var isEnumerating = false
     private var mode: SelectionMode = .area
     private var allowsWindowMode = true
+    private let toolbar = SelectionToolbar()
+    /// Whether releasing the drag commits the selection or arms it.
+    ///
+    /// Screenshots commit on mouse-up: the whole value of the interaction is
+    /// that it is over in one gesture. A recording is not the same transaction —
+    /// it has settings that belong to the take, and no way to undo starting one
+    /// — so it gets a step where the selection is final but nothing has begun.
+    private var requiresConfirmation = false
+    private var isArmed = false
 
     /// Re-enumerates the pickable windows while the overlay is up.
     ///
@@ -48,11 +57,15 @@ final class OverlayController {
     ///
     /// `NSWindow.windowNumber` *is* the `CGWindowID` — that is the join key.
     var panelWindowIDs: Set<CGWindowID> {
-        Set(panels.map { CGWindowID($0.windowNumber) })
+        // The toolbar is one of ours too. It is `.none` like the panels, so a
+        // recording never sees it either way, but a *screenshot* taken through
+        // this exclusion list would photograph it.
+        Set(panels.map { CGWindowID($0.windowNumber) }).union(toolbar.windowIDs)
     }
 
     func present(
-        mode initialMode: SelectionMode, windows: [WindowInfo], allowsWindowMode: Bool = true
+        mode initialMode: SelectionMode, windows: [WindowInfo], allowsWindowMode: Bool = true,
+        requiresConfirmation: Bool = false
     ) async -> Outcome {
         if isPresenting { dismiss(resumingWith: .cancelled) }
 
@@ -60,17 +73,29 @@ final class OverlayController {
 
         mode = initialMode
         self.allowsWindowMode = allowsWindowMode
+        self.requiresConfirmation = requiresConfirmation
+        isArmed = false
         model.reset()
 
-        let refresh: () -> Void = { [weak self] in self?.views.forEach { $0.refresh() } }
+        // The toolbar follows the selection, so it has to move on the same
+        // signal the views redraw on — arrow keys nudge and resize the rect
+        // while the bar is up.
+        let refresh: () -> Void = { [weak self] in
+            guard let self else { return }
+            views.forEach { $0.refresh() }
+            if isArmed { repositionToolbar() }
+        }
         model.onChange = refresh
         picker.onChange = refresh
+
+        toolbar.onStart = { [weak self] in self?.confirmArea() }
 
         let callbacks = OverlayView.Callbacks(
             confirmArea: { [weak self] in self?.confirmArea() },
             confirmWindow: { [weak self] id in self?.confirmWindow(id) },
             cancel: { [weak self] in self?.dismiss(resumingWith: .cancelled) },
-            toggleMode: { [weak self] in self?.toggleMode() }
+            toggleMode: { [weak self] in self?.toggleMode() },
+            selectionRestarted: { [weak self] in self?.disarm() }
         )
 
         for screen in NSScreen.screens {
@@ -306,6 +331,14 @@ final class OverlayController {
             dismiss(resumingWith: .cancelled)
             return
         }
+
+        // First commit only arms it. The second — Record, or Return — is what
+        // resumes the caller.
+        if requiresConfirmation, !isArmed {
+            arm(rect: rect, displayID: displayID)
+            return
+        }
+        toolbar.hide()
         // Deliberately *not* tearing down here. The panels must still be on
         // screen when the caller builds its SCContentFilter, because that is
         // where `panelWindowIDs` comes from and because ordering windows out and
@@ -313,6 +346,41 @@ final class OverlayController {
         // classic way to end up with the dim in the screenshot. The caller
         // captures with the panels excluded, then calls `tearDown()`.
         resume(with: .area(displayID: displayID, rectInAppKitGlobal: rect))
+    }
+
+    /// Freezes the selection and puts the toolbar under it.
+    ///
+    /// The overlay panels stay exactly as they are: the dim, the marching ants
+    /// and the keyboard handling all still apply, so the rect can still be
+    /// nudged with the arrow keys and abandoned with Escape. Only the meaning of
+    /// "confirm" has changed.
+    private func arm(rect: CGRect, displayID: CGDirectDisplayID) {
+        isArmed = true
+        views.forEach { $0.isArmed = true }
+        guard let screen = ScreenIndex.screen(for: displayID) ?? NSScreen.main else { return }
+        toolbar.show(under: rect, on: screen)
+        Log.overlay.notice("selection armed \(self.rectString(rect), privacy: .public)")
+    }
+
+    /// Back to dragging. Called when a new drag begins under the armed bar.
+    private func disarm() {
+        guard isArmed else { return }
+        isArmed = false
+        views.forEach { $0.isArmed = false }
+        toolbar.hide()
+    }
+
+    private func repositionToolbar() {
+        guard
+            let rect = model.rectInAppKitGlobal,
+            let displayID = model.originDisplayID,
+            let screen = ScreenIndex.screen(for: displayID) ?? NSScreen.main
+        else { return }
+        toolbar.reposition(under: rect, on: screen)
+    }
+
+    private func rectString(_ rect: CGRect) -> String {
+        "\(Int(rect.origin.x)),\(Int(rect.origin.y)) \(Int(rect.width))x\(Int(rect.height))"
     }
 
     private func confirmWindow(_ id: CGWindowID) {
@@ -340,6 +408,12 @@ final class OverlayController {
     /// path can leave `present()` awaiting forever. Harmless after a confirm,
     /// which has already taken the continuation.
     func tearDown() {
+        // Unconditional, not `if isArmed`. This is the one exit every path goes
+        // through, and a toolbar left on screen at shielding level with no
+        // overlay under it is unreachable furniture the user cannot dismiss.
+        isArmed = false
+        views.forEach { $0.isArmed = false }
+        toolbar.hide()
         if let screenObserver {
             NotificationCenter.default.removeObserver(screenObserver)
             self.screenObserver = nil
@@ -430,4 +504,18 @@ final class OverlayController {
 
     var panelCount: Int { panels.count }
     var hasPendingContinuation: Bool { continuation != nil }
+
+    // MARK: - Confirmation-step test hooks
+
+    var isArmedForTest: Bool { isArmed }
+    var toolbarIsVisibleForTest: Bool { toolbar.isVisible }
+    var toolbarFrameForTest: CGRect? { toolbar.frameForTest }
+
+    /// Begins a fresh drag the way `mouseDown` does, without a mouse. The point
+    /// of the hook is the disarm side effect, which is otherwise only reachable
+    /// through a real gesture.
+    func restartSelectionForTest(at pointInAppKitGlobal: CGPoint, on screen: NSScreen) {
+        disarm()
+        model.beginDrag(at: pointInAppKitGlobal, on: screen)
+    }
 }
