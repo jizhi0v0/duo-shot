@@ -206,6 +206,31 @@ final class RecordingRegionOutlineView: NSView {
         super.setFrameSize(newSize)
         needsDisplay = true
     }
+
+    /// A slow breath, so the light reads as switched on rather than painted on.
+    ///
+    /// Long and shallow on purpose — 2.6 s between extremes and never below 84%.
+    /// This sits at the edge of whatever the user is demonstrating for the entire
+    /// length of a take, and anything faster or deeper becomes the thing you
+    /// notice instead of the thing being recorded. The bar's own red dot carries
+    /// the urgent rhythm at 0.8 s; two of those on screen would compete.
+    ///
+    /// On the render server, like the marching ants and that dot: an opacity
+    /// animation on the layer costs nothing per frame, where a `Timer` redrawing
+    /// four gradients would be measurable for minutes on end.
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil else { return }
+        wantsLayer = true
+        let breath = CABasicAnimation(keyPath: "opacity")
+        breath.fromValue = 1.0
+        breath.toValue = 0.84
+        breath.duration = 1.3
+        breath.autoreverses = true
+        breath.repeatCount = .infinity
+        breath.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        layer?.add(breath, forKey: "breath")
+    }
 }
 
 /// Owns the outline for the length of one area recording.
