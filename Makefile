@@ -137,6 +137,12 @@ mic-check: verify
 		| grep selftest-microphone | tail -1 | sed 's/^/  /' \
 		| grep . || echo "  FAIL: no log entry in the last 20s -- the app did not launch"
 
+# Batch repro for the intermittent microphone-recording failure. See the script;
+# a single run proves nothing, which is the whole reason it exists.
+.PHONY: mic-repro
+mic-repro: verify
+	@Scripts/mic-recording-repro.sh $${RUNS:-10} $${TAKE:-5}
+
 selftest: verify
 	@"$(EXEC)" --selftest-permission || true
 	@"$(EXEC)" --selftest-capture build/selftest-fullscreen.png
