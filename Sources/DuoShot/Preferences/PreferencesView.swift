@@ -1,3 +1,4 @@
+import AVFoundation
 import AppKit
 import Combine
 import SwiftUI
@@ -263,6 +264,121 @@ struct ShortcutsSettingsView: View {
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+// MARK: - Recording
+
+/// The recording counterpart to Capture — and the only place the microphone
+/// grant can be asked for.
+///
+/// `RecordingEngine` refuses to hand ScreenCaptureKit an undecided grant
+/// (`startCapture` hangs forever on one) and drops narration instead, so if the
+/// prompt were never raised here the toggle would be a switch that quietly does
+/// nothing. It is raised from this view because the app is frontmost here, which
+/// is what makes TCC address the dialog to DuoShot rather than to whatever
+/// process it holds responsible.
+struct RecordingSettingsView: View {
+    @Bindable var preferences: Preferences
+
+    /// Mirrored rather than read inline so the view redraws when the answer
+    /// arrives — and re-read on activation, because revoking the grant happens
+    /// over in System Settings where nothing notifies us.
+    @State private var microphoneStatus = MicrophonePermission.status
+    /// Re-enumerated on the same signal as the grant. Devices come and go while
+    /// this window is open — plugging in headphones is exactly the moment
+    /// someone opens it — and nothing pushes that at us.
+    @State private var devices = AudioInputDevices.all
+
+    var body: some View {
+        Form {
+            Section {
+                Picker("Frame rate", selection: $preferences.recordingFrameRate) {
+                    Text("30 fps").tag(30)
+                    Text("60 fps").tag(60)
+                }
+                Toggle("Include the pointer", isOn: $preferences.recordingShowsCursor)
+                Toggle("Highlight clicks", isOn: $preferences.recordingShowsClicks)
+            } footer: {
+                Text("The frame rate is a ceiling, not a promise: ScreenCaptureKit sends a frame when the screen changes, so a still screen costs nothing.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Record system audio", isOn: $preferences.recordingSystemAudio)
+                Toggle("Record microphone", isOn: $preferences.recordingMicrophone)
+                    .onChange(of: preferences.recordingMicrophone) { _, isOn in
+                        guard isOn else { return }
+                        Task { await resolveMicrophoneGrant() }
+                    }
+                Picker("Input", selection: $preferences.recordingMicrophoneDeviceID) {
+                    Text("System default").tag(AudioInputDevices.systemDefaultID)
+                    Divider()
+                    ForEach(devices) { device in
+                        Text(device.name).tag(device.id)
+                    }
+                    // A device chosen earlier and since unplugged still has to
+                    // have a row, or SwiftUI shows the picker blank and the
+                    // stored preference reads as corrupt rather than as absent.
+                    if !preferences.recordingMicrophoneDeviceID.isEmpty,
+                       !devices.contains(where: { $0.id == preferences.recordingMicrophoneDeviceID }) {
+                        Text("Unavailable device")
+                            .tag(preferences.recordingMicrophoneDeviceID)
+                    }
+                }
+                .disabled(!preferences.recordingMicrophone)
+
+                if microphoneStatus == .denied || microphoneStatus == .restricted {
+                    Button("Open Microphone Settings…", action: openMicrophoneSettings)
+                }
+            } header: {
+                Text("Audio")
+            } footer: {
+                Text(audioFooter)
+                    .font(.caption)
+                    .foregroundStyle(microphoneStatus == .denied ? .orange : .secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didBecomeActiveNotification)
+        ) { _ in
+            microphoneStatus = MicrophonePermission.status
+            devices = AudioInputDevices.all
+        }
+        .onAppear { devices = AudioInputDevices.all }
+    }
+
+    private var audioFooter: String {
+        switch microphoneStatus {
+        case .denied:
+            "The microphone is turned off for DuoShot in System Settings, so narration would be dropped from the take."
+        case .restricted:
+            "Microphone access is restricted on this Mac, so narration is unavailable."
+        default:
+            "System audio is the whole system mix, so it has no device to choose. “System default” follows the input macOS is using, which is what you want as headphones come and go."
+        }
+    }
+
+    /// Raises the prompt, then makes the switch tell the truth.
+    ///
+    /// A denied grant cannot be re-prompted — only System Settings can change it
+    /// — so leaving the toggle on would promise narration that the engine then
+    /// silently drops. Better a switch that snaps back with a reason next to it.
+    private func resolveMicrophoneGrant() async {
+        _ = await MicrophonePermission.request()
+        microphoneStatus = MicrophonePermission.status
+        if microphoneStatus != .authorized {
+            preferences.recordingMicrophone = false
+        }
+    }
+
+    private func openMicrophoneSettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
+        else { return }
+        NSWorkspace.shared.open(url)
     }
 }
 

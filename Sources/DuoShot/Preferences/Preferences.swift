@@ -38,6 +38,7 @@ final class Preferences {
         static let filenameTemplate = "filenameTemplate"
         static let recordingSystemAudio = "recordingSystemAudio"
         static let recordingMicrophone = "recordingMicrophone"
+        static let recordingMicrophoneDevice = "recordingMicrophoneDevice"
         static let recordingShowsCursor = "recordingShowsCursor"
         static let recordingShowsClicks = "recordingShowsClicks"
         static let recordingFrameRate = "recordingFrameRate"
@@ -115,6 +116,20 @@ final class Preferences {
     var recordingMicrophone: Bool {
         didSet { defaults.set(recordingMicrophone, forKey: Key.recordingMicrophone) }
     }
+    /// The input device's `uniqueID`, or "" for whatever the system is currently
+    /// using.
+    ///
+    /// Empty is the default and deliberately so: it follows the system as
+    /// headphones come and go, whereas a pinned device that is later unplugged
+    /// records silence — and silence is a failure you only discover afterwards.
+    /// Stored as a String rather than String? so the Settings picker can bind to
+    /// it directly; `recordingOptions` maps "" back to the nil ScreenCaptureKit
+    /// wants.
+    var recordingMicrophoneDeviceID: String {
+        didSet {
+            defaults.set(recordingMicrophoneDeviceID, forKey: Key.recordingMicrophoneDevice)
+        }
+    }
     /// On, unlike the screenshot default. A recording with no pointer is
     /// unreadable; a screenshot with one is noise.
     var recordingShowsCursor: Bool {
@@ -184,6 +199,7 @@ final class Preferences {
         windowPadding = defaults.double(forKey: Key.windowPadding)
         recordingSystemAudio = defaults.bool(forKey: Key.recordingSystemAudio)
         recordingMicrophone = defaults.bool(forKey: Key.recordingMicrophone)
+        recordingMicrophoneDeviceID = defaults.string(forKey: Key.recordingMicrophoneDevice) ?? ""
         recordingShowsCursor = defaults.bool(forKey: Key.recordingShowsCursor)
         recordingShowsClicks = defaults.bool(forKey: Key.recordingShowsClicks)
         recordingFrameRate = defaults.integer(forKey: Key.recordingFrameRate)
@@ -226,6 +242,10 @@ final class Preferences {
         var options = RecordingOptions.default
         options.capturesSystemAudio = recordingSystemAudio
         options.capturesMicrophone = recordingMicrophone
+        // A device that has since been unplugged is not an error worth failing a
+        // take over: dropping back to nil records from the system default, which
+        // is what the user would have picked anyway.
+        options.microphoneDeviceID = AudioInputDevices.resolve(recordingMicrophoneDeviceID)
         options.showsCursor = recordingShowsCursor
         options.showsMouseClicks = recordingShowsClicks
         options.frameRate = max(1, recordingFrameRate)
