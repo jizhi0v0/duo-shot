@@ -53,6 +53,15 @@ final class RecordingHUDPanel: NSPanel {
 }
 
 /// The bar's contents: a pulsing record dot, the elapsed time, Stop and Discard.
+///
+/// Built from `HUDMetrics` and `HUDPill`, the same pieces the pre-record toolbar
+/// uses. The two appear in sequence, in the same place, during one continuous
+/// action — arm the selection, start the take — so they have to read as one bar
+/// changing state rather than as two unrelated pieces of UI.
+///
+/// It carries no audio controls, and cannot: `SCStream.updateConfiguration`
+/// during a recording ends it (see `RecordingEngine`). Those choices are made on
+/// the toolbar, before the take starts.
 final class RecordingHUDView: NSView {
     /// Fills the whole bar with flat magenta instead of drawing the real UI.
     ///
@@ -71,8 +80,8 @@ final class RecordingHUDView: NSView {
     /// What the bar is showing.
     ///
     /// `starting` exists because `SCStream.startCapture` is not reliably quick.
-    /// Measured 2026-07-31 it is 190–340 ms, but three takes that day took
-    /// 3.8–4.3 s inside that one call, with nothing logged anywhere in the
+    /// Measured 2026-07-31 it is 190-340 ms, but three takes that day took
+    /// 3.8-4.3 s inside that one call, with nothing logged anywhere in the
     /// system while it sat there. The HUD used to be shown only once the call
     /// returned, so those seconds had the selection gone and nothing in its
     /// place, which reads as "the app is broken" rather than "it is starting".
@@ -81,15 +90,26 @@ final class RecordingHUDView: NSView {
         case recording
     }
 
-    static let barSize = CGSize(width: 208, height: 44)
+    private static let dotSize: CGFloat = 9
+    private static let timeWidth: CGFloat = 46
+    private static let startingWidth: CGFloat = 78
+    private static let stopTitle = "Stop"
+
+    static var barSize: CGSize {
+        let width = HUDMetrics.margin + Self.dotSize + 8 + Self.timeWidth
+            + HUDMetrics.groupGap + 1 + HUDMetrics.groupGap
+            + HUDPill.width(for: Self.stopTitle) + HUDMetrics.gap
+            + HUDMetrics.iconWidth + HUDMetrics.margin
+        return CGSize(width: width, height: HUDMetrics.height)
+    }
 
     private var callbacks = Callbacks()
     private let dot = NSView()
     private let timeLabel = NSTextField(labelWithString: "0:00")
     private var background: NSVisualEffectView!
-    private var stopButton: NSButton?
+    private var stopPill: HUDPill?
     private var discardButton: NSButton?
-    private static let timeLabelFrame = CGRect(x: 32, y: 13, width: 58, height: 18)
+    private var divider: NSView?
 
     init(callbacks: Callbacks) {
         self.callbacks = callbacks
@@ -118,40 +138,54 @@ final class RecordingHUDView: NSView {
         // exactly how the M4 preview panel came out blank.
         if Self.debugFillsMagenta { return }
 
-        background = NSVisualEffectView(frame: bounds)
-        background.autoresizingMask = [.width, .height]
-        background.material = .hudWindow
-        background.blendingMode = .behindWindow
-        background.state = .active
-        background.wantsLayer = true
-        background.layer?.cornerRadius = 12
-        background.layer?.cornerCurve = .continuous
-        background.layer?.masksToBounds = true
+        background = HUDMetrics.background(in: bounds)
         addSubview(background)
 
-        dot.frame = CGRect(x: 14, y: 17, width: 10, height: 10)
+        var x = HUDMetrics.margin
+        dot.frame = CGRect(
+            x: x, y: ((Self.barSize.height - Self.dotSize) / 2).rounded(),
+            width: Self.dotSize, height: Self.dotSize)
         dot.wantsLayer = true
         dot.layer?.backgroundColor = NSColor.systemRed.cgColor
-        dot.layer?.cornerRadius = 5
+        dot.layer?.cornerRadius = Self.dotSize / 2
         addSubview(dot)
         pulse()
+        x += Self.dotSize + 8
 
-        timeLabel.frame = Self.timeLabelFrame
-        timeLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .medium)
+        timeLabel.frame = CGRect(x: x, y: 0, width: Self.timeWidth, height: Self.barSize.height)
+        timeLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
         timeLabel.textColor = .labelColor
+        timeLabel.alignment = .left
+        timeLabel.cell?.usesSingleLineMode = true
         addSubview(timeLabel)
+        x += Self.timeWidth + HUDMetrics.groupGap
 
-        let stop = button(
-            symbol: "stop.fill", tint: .systemRed,
-            frame: CGRect(x: 96, y: 7, width: 46, height: 30),
-            action: #selector(stopTapped), tooltip: "Stop and keep the recording")
-        let discard = button(
-            symbol: "trash", tint: .secondaryLabelColor,
-            frame: CGRect(x: 148, y: 7, width: 46, height: 30),
-            action: #selector(discardTapped), tooltip: "Stop and discard")
+        let line = HUDMetrics.divider(x: x)
+        addSubview(line)
+        divider = line
+        x += 1 + HUDMetrics.groupGap
+
+        let stop = HUDPill(title: Self.stopTitle, mark: .symbol("stop.fill"), tint: .systemRed)
+        stop.setFrameOrigin(CGPoint(
+            x: x, y: ((Self.barSize.height - HUDMetrics.controlHeight) / 2).rounded()))
+        stop.onClick = { [weak self] in self?.callbacks.stop() }
+        stop.toolTip = "Stop and keep the recording"
         addSubview(stop)
+        stopPill = stop
+        x += stop.frame.width + HUDMetrics.gap
+
+        let discard = FirstMouseButton(frame: CGRect(
+            x: x, y: ((Self.barSize.height - HUDMetrics.controlHeight) / 2).rounded(),
+            width: HUDMetrics.iconWidth, height: HUDMetrics.controlHeight))
+        discard.bezelStyle = .accessoryBarAction
+        discard.isBordered = false
+        discard.image = HUDMetrics.symbol("trash", pointSize: 13)
+        discard.contentTintColor = .secondaryLabelColor
+        discard.imagePosition = .imageOnly
+        discard.target = self
+        discard.action = #selector(discardTapped)
+        discard.toolTip = "Stop and discard"
         addSubview(discard)
-        stopButton = stop
         discardButton = discard
     }
 
@@ -159,8 +193,7 @@ final class RecordingHUDView: NSView {
     ///
     /// Neither has anything to act on yet — `RecordingCoordinator.stop()` and
     /// `discard()` both require `state == .recording`, so a press would silently
-    /// do nothing, which is worse than no button. Hiding them also frees the
-    /// width the "Starting…" text needs.
+    /// do nothing, which is worse than no button.
     func setPhase(_ phase: Phase) {
         guard !Self.debugFillsMagenta else { return }
         switch phase {
@@ -168,42 +201,27 @@ final class RecordingHUDView: NSView {
             dot.layer?.backgroundColor = NSColor.tertiaryLabelColor.cgColor
             dot.layer?.removeAnimation(forKey: "pulse")
             timeLabel.frame = CGRect(
-                x: Self.timeLabelFrame.minX, y: Self.timeLabelFrame.minY,
-                width: bounds.width - Self.timeLabelFrame.minX - 12,
-                height: Self.timeLabelFrame.height)
+                x: timeLabel.frame.minX, y: 0,
+                width: Self.startingWidth, height: Self.barSize.height)
             timeLabel.stringValue = "Starting…"
+            timeLabel.font = .systemFont(ofSize: 12, weight: .medium)
             timeLabel.textColor = .secondaryLabelColor
-            stopButton?.isHidden = true
+            stopPill?.isHidden = true
             discardButton?.isHidden = true
+            divider?.isHidden = true
         case .recording:
             dot.layer?.backgroundColor = NSColor.systemRed.cgColor
             pulse()
-            timeLabel.frame = Self.timeLabelFrame
+            timeLabel.frame = CGRect(
+                x: timeLabel.frame.minX, y: 0,
+                width: Self.timeWidth, height: Self.barSize.height)
             timeLabel.stringValue = "0:00"
+            timeLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
             timeLabel.textColor = .labelColor
-            stopButton?.isHidden = false
+            stopPill?.isHidden = false
             discardButton?.isHidden = false
+            divider?.isHidden = false
         }
-    }
-
-    private func button(
-        symbol: String, tint: NSColor, frame: CGRect, action: Selector, tooltip: String
-    ) -> NSButton {
-        let button = FirstMouseButton(frame: frame)
-        button.bezelStyle = .accessoryBarAction
-        button.isBordered = false
-        button.wantsLayer = true
-        // SF Symbols render at their natural size without an explicit
-        // configuration, and `imageScaling` only ever scales *down* — which is
-        // how these ended up several times the size of their buttons.
-        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tooltip)?
-            .withSymbolConfiguration(.init(pointSize: 14, weight: .semibold))
-        button.contentTintColor = tint
-        button.imagePosition = .imageOnly
-        button.target = self
-        button.action = action
-        button.toolTip = tooltip
-        return button
     }
 
     private func pulse() {
@@ -224,7 +242,6 @@ final class RecordingHUDView: NSView {
         timeLabel.stringValue = String(format: "%d:%02d", total / 60, total % 60)
     }
 
-    @objc private func stopTapped() { callbacks.stop() }
     @objc private func discardTapped() { callbacks.discard() }
 }
 

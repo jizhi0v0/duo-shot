@@ -44,80 +44,6 @@ final class SelectionToolbarPanel: NSPanel {
     }
 }
 
-/// The Record button.
-///
-/// Hand-drawn rather than an `NSButton`. Getting predictable padding out of a
-/// borderless button carrying both an image and a title means guessing at
-/// AppKit's own insets and at the rendered width of an SF Symbol, and the guess
-/// was wrong: the dot ended up flush against the left edge. A view that places
-/// its own two subviews cannot be wrong about that.
-private final class RecordPill: NSView {
-    var onClick: () -> Void = {}
-
-    private static let horizontalPadding: CGFloat = 13
-    private static let dotSize: CGFloat = 11
-    private static let dotTextGap: CGFloat = 7
-    private static let title = "Record"
-    private static let font = NSFont.systemFont(ofSize: 13, weight: .semibold)
-
-    private static var titleWidth: CGFloat {
-        (title as NSString).size(withAttributes: [.font: font]).width.rounded(.up)
-    }
-
-    static var width: CGFloat {
-        horizontalPadding * 2 + dotSize + dotTextGap + titleWidth
-    }
-
-    private let dot = NSView()
-    private let label = NSTextField(labelWithString: RecordPill.title)
-
-    init(height: CGFloat) {
-        super.init(frame: CGRect(x: 0, y: 0, width: Self.width, height: height))
-        wantsLayer = true
-        layer?.cornerRadius = 7
-        layer?.cornerCurve = .continuous
-        layer?.backgroundColor = NSColor.systemRed.cgColor
-
-        dot.wantsLayer = true
-        dot.layer?.backgroundColor = NSColor.white.cgColor
-        dot.layer?.cornerRadius = Self.dotSize / 2
-        dot.frame = CGRect(
-            x: Self.horizontalPadding,
-            y: ((height - Self.dotSize) / 2).rounded(),
-            width: Self.dotSize, height: Self.dotSize)
-        addSubview(dot)
-
-        label.font = Self.font
-        label.textColor = .white
-        label.sizeToFit()
-        label.setFrameOrigin(CGPoint(
-            x: Self.horizontalPadding + Self.dotSize + Self.dotTextGap,
-            y: ((height - label.frame.height) / 2).rounded()))
-        addSubview(label)
-
-        toolTip = "Start recording  ⏎"
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError("not used") }
-
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    // The two subviews are decoration; the pill owns the click.
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        bounds.contains(convert(point, from: superview)) ? self : nil
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        layer?.backgroundColor = NSColor.systemRed.blended(withFraction: 0.2, of: .black)?.cgColor
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        layer?.backgroundColor = NSColor.systemRed.cgColor
-        guard bounds.contains(convert(event.locationInWindow, from: nil)) else { return }
-        onClick()
-    }
-}
-
 /// Microphone, its input device, system audio, and the button that starts the
 /// take.
 ///
@@ -133,13 +59,14 @@ final class SelectionToolbarView: NSView {
         var resized: () -> Void = {}
     }
 
-    private static let margin: CGFloat = 8
-    private static let toggleWidth: CGFloat = 30
+    private static let margin = HUDMetrics.margin
+    private static let toggleWidth = HUDMetrics.iconWidth
     private static let chevronWidth: CGFloat = 14
-    private static let controlHeight: CGFloat = 28
+    private static let controlHeight = HUDMetrics.controlHeight
     private static let gap: CGFloat = 6
-    private static let groupGap: CGFloat = 8
-    private static let height: CGFloat = 40
+    private static let groupGap = HUDMetrics.groupGap
+    private static let height = HUDMetrics.height
+    private static let recordTitle = "Record"
     private static let deviceFont = NSFont.systemFont(ofSize: 11, weight: .regular)
     /// The device name is elided past this. "MacBook Pro Microphone" is already
     /// long, and a USB interface's name can be far longer — the bar has to stay
@@ -153,7 +80,7 @@ final class SelectionToolbarView: NSView {
     private var deviceLabel: NSTextField!
     private var audioButton: NSButton!
     private var divider: NSView!
-    private var pill: RecordPill!
+    private var pill: HUDPill!
 
     private var preferences: Preferences { .shared }
 
@@ -171,15 +98,7 @@ final class SelectionToolbarView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     private func buildSubviews() {
-        background = NSVisualEffectView(frame: bounds)
-        background.autoresizingMask = [.width, .height]
-        background.material = .hudWindow
-        background.blendingMode = .behindWindow
-        background.state = .active
-        background.wantsLayer = true
-        background.layer?.cornerRadius = 10
-        background.layer?.cornerCurve = .continuous
-        background.layer?.masksToBounds = true
+        background = HUDMetrics.background(in: bounds)
         addSubview(background)
 
         microphoneButton = button(action: #selector(toggleMicrophone))
@@ -190,7 +109,7 @@ final class SelectionToolbarView: NSView {
         // gesture that takes time to recognise competes with the drag the user
         // may be about to restart.
         deviceButton = button(action: #selector(showDeviceMenu))
-        deviceButton.image = Self.symbol("chevron.down", pointSize: 8)
+        deviceButton.image = HUDMetrics.symbol("chevron.down", pointSize: 8)
         addSubview(deviceButton)
 
         // Shown even when it says "System default". The point of putting the
@@ -212,7 +131,8 @@ final class SelectionToolbarView: NSView {
         divider.layer?.backgroundColor = NSColor(white: 1, alpha: 0.18).cgColor
         addSubview(divider)
 
-        pill = RecordPill(height: Self.controlHeight)
+        pill = HUDPill(title: Self.recordTitle, mark: .dot, tint: .systemRed)
+        pill.toolTip = "Start recording  ⏎"
         pill.onClick = { [weak self] in self?.callbacks.start() }
         addSubview(pill)
     }
@@ -227,19 +147,12 @@ final class SelectionToolbarView: NSView {
         return button
     }
 
-    private static func symbol(
-        _ name: String, pointSize: CGFloat, weight: NSFont.Weight = .medium
-    ) -> NSImage? {
-        NSImage(systemSymbolName: name, accessibilityDescription: name)?
-            .withSymbolConfiguration(.init(pointSize: pointSize, weight: weight))
-    }
-
     /// Redraws both toggles from the preferences they write to, then re-lays out
     /// — the device name changes the bar's width.
     func refresh() {
         let granted = MicrophonePermission.isGranted
         let micOn = granted && preferences.recordingMicrophone
-        microphoneButton.image = Self.symbol(micOn ? "mic.fill" : "mic.slash.fill", pointSize: 13)
+        microphoneButton.image = HUDMetrics.symbol(micOn ? "mic.fill" : "mic.slash.fill", pointSize: 13)
         microphoneButton.contentTintColor = micOn ? .white : .tertiaryLabelColor
         // The grant is *not* requested from here. A TCC prompt would have to
         // appear over a shielding-level overlay that holds the keyboard, and the
@@ -258,7 +171,7 @@ final class SelectionToolbarView: NSView {
         deviceButton.toolTip = "Choose the input device"
 
         let audioOn = preferences.recordingSystemAudio
-        audioButton.image = Self.symbol(
+        audioButton.image = HUDMetrics.symbol(
             audioOn ? "speaker.wave.2.fill" : "speaker.slash.fill", pointSize: 13)
         audioButton.contentTintColor = audioOn ? .white : .tertiaryLabelColor
         // Named, not just on/off. "Speaker" is not self-explanatory on a
@@ -297,8 +210,9 @@ final class SelectionToolbarView: NSView {
         divider.frame = CGRect(x: x, y: y + 4, width: 1, height: Self.controlHeight - 8)
         x += 1 + Self.groupGap
 
-        pill.frame = CGRect(x: x, y: y, width: RecordPill.width, height: Self.controlHeight)
-        x += RecordPill.width + Self.margin
+        let pillWidth = HUDPill.width(for: Self.recordTitle)
+        pill.frame = CGRect(x: x, y: y, width: pillWidth, height: Self.controlHeight)
+        x += pillWidth + Self.margin
 
         let size = CGSize(width: x.rounded(.up), height: Self.height)
         if frame.size != size {
