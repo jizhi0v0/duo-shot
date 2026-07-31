@@ -65,7 +65,7 @@ enum DisplayGeometry {
         displayLocal(flipped(rect.integral), on: displayID)
     }
 
-    /// AppKit global points -> a pixel in an image that covers exactly `screen`.
+    /// AppKit global points -> a pixel in an image that covers `covered`.
     ///
     /// For the loupe, which has to find one pointer position inside a photograph
     /// of one display. The flip is against that **screen's** own maxY rather than
@@ -74,11 +74,11 @@ enum DisplayGeometry {
     /// the two — invisible on a single-display machine and wildly wrong on a
     /// second screen above or below the first.
     static func pixel(
-        ofAppKitGlobal point: CGPoint, on screenFrame: CGRect, scale: CGFloat
+        ofAppKitGlobal point: CGPoint, in covered: CGRect, scale: CGFloat
     ) -> CGPoint {
         CGPoint(
-            x: (point.x - screenFrame.minX) * scale,
-            y: (screenFrame.maxY - point.y) * scale)
+            x: (point.x - covered.minX) * scale,
+            y: (covered.maxY - point.y) * scale)
     }
 
     /// Pixel dimensions for a points rect at a given scale.

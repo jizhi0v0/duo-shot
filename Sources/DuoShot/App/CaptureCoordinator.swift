@@ -27,11 +27,16 @@ final class CaptureCoordinator {
         // Same reasoning: `engine`, not `self`. The cursor is deliberately left
         // out — a loupe magnifying a frozen arrow, while the live one moves over
         // it, is a picture of two pointers.
-        overlay.captureBackdrop = { [engine] displayID, excluded in
+        overlay.captureBackdrop = { [engine] displayID, rect, excluded in
             var options = CaptureOptions.default
             options.excludedWindowIDs = excluded
             options.showsCursor = false
-            return try? await engine.capture(.display(displayID), options: options)
+            let request: CaptureRequest = if let rect {
+                .area(displayID: displayID, rectInAppKitGlobal: rect)
+            } else {
+                .display(displayID)
+            }
+            return try? await engine.capture(request, options: options)
         }
     }
 

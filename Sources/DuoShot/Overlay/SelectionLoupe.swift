@@ -64,7 +64,7 @@ final class SelectionLoupeView: NSView {
             x: Self.inset, y: Self.captionHeight + Self.inset,
             width: Self.glassSide, height: Self.glassSide)
         let centre = DisplayGeometry.pixel(
-            ofAppKitGlobal: point, on: backdrop.screenFrame, scale: backdrop.scale)
+            ofAppKitGlobal: point, in: backdrop.covers, scale: backdrop.scale)
 
         // The source window, in image pixels, centred on the pointer's pixel.
         let half = CGFloat(Self.pixelsAcross) / 2

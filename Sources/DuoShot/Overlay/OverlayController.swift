@@ -75,7 +75,7 @@ final class OverlayController {
     /// Injected for the same reason `refreshWindows` is: this type owns no
     /// capture engine. Left nil — as the self-tests leave it — there is simply no
     /// loupe, which is the right degradation for a magnifier.
-    var captureBackdrop: ((CGDirectDisplayID, Set<CGWindowID>) async -> CaptureResult?)?
+    var captureBackdrop: BackdropCache.Capture?
 
     /// Fetches the frozen frame for whichever screen the pointer is on.
     ///
@@ -91,14 +91,51 @@ final class OverlayController {
         backdrop.warm(screen, using: capture, excluding: panelWindowIDs)
     }
 
-    /// Hands each view the frame for its own screen.
+    /// Hands each view the freshest frame that covers where the pointer is.
+    ///
+    /// Re-done on every pointer move, not only on arrival: which frame covers the
+    /// pointer changes as it moves, so the choice between the patch and the base
+    /// has to be made here rather than cached in the view.
     private func publishBackdrops() {
+        // No pointer means no loupe either, so any point that no patch can
+        // contain will do: the base frame is the right answer.
+        let pointer = model.pointerInAppKitGlobal ?? CGPoint(x: -1e9, y: -1e9)
         for (panel, view) in zip(panels, views) {
             guard let screen = panel.screen,
                   let displayID = ScreenIndex.displayID(of: screen)
             else { continue }
-            view.backdrop = backdrop.frame(for: displayID)
+            view.backdrop = backdrop.frame(for: displayID, showing: pointer)
         }
+    }
+
+    /// How long the pointer has to be still before the patch is re-taken.
+    ///
+    /// Short enough that it has landed by the time anyone reads the loupe, long
+    /// enough that a sweep across the screen costs one capture rather than fifty.
+    private static let patchDelay: TimeInterval = 0.3
+    private var patchTimer: Timer?
+
+    /// Restarted on every pointer move, so it only fires once the pointer stops.
+    private func scheduleFreshPatch() {
+        patchTimer?.invalidate()
+        patchTimer = nil
+        guard mode == .area, !isArmed, captureBackdrop != nil else { return }
+        let timer = Timer(timeInterval: Self.patchDelay, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated { self?.takeFreshPatch() }
+        }
+        // `.common`: a menu tracking or a window drag must not be able to freeze
+        // the loupe on an old photograph.
+        RunLoop.main.add(timer, forMode: .common)
+        patchTimer = timer
+    }
+
+    private func takeFreshPatch() {
+        guard mode == .area, !isArmed, let capture = captureBackdrop,
+              let pointer = model.pointerInAppKitGlobal,
+              let screen = NSScreen.screens.first(where: { $0.frame.contains(pointer) })
+        else { return }
+        backdrop.refreshPatch(
+            around: pointer, on: screen, using: capture, excluding: panelWindowIDs)
     }
 
     /// `.none`, unless the user has asked for the selection UI to be visible to
@@ -158,6 +195,8 @@ final class OverlayController {
         let refresh: () -> Void = { [weak self] in
             guard let self else { return }
             warmBackdropUnderPointer()
+            scheduleFreshPatch()
+            publishBackdrops()
             views.forEach { $0.refresh() }
             if isArmed { repositionToolbar() }
         }
@@ -508,6 +547,8 @@ final class OverlayController {
         // work alive for the rest of the process.
         rankTimer?.invalidate()
         rankTimer = nil
+        patchTimer?.invalidate()
+        patchTimer = nil
         // Tens of megabytes per display, and worthless to the next selection.
         backdrop.clear()
         views.forEach { $0.backdrop = nil }

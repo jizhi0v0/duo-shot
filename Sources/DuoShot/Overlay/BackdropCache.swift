@@ -17,38 +17,74 @@ import AppKit
 ///
 /// This is the middle route the plan called for: the overlay is live and appears
 /// with no delay, and the backdrop is fetched in the background for the loupe
-/// alone. The cost is honest and worth stating — the frame is a *photograph*, so
-/// a loupe over a playing video shows the pixels as they were when the selection
-/// started. For placing an edge against static UI, which is what a loupe is for,
-/// it is exact.
+/// alone. Filled per display and only on demand: a three-display machine should
+/// not pay for three full-screen captures because the pointer visited one of
+/// them.
 ///
-/// Filled per display and only on demand: a three-display machine should not pay
-/// for three full-screen captures because the pointer visited one of them.
+/// A photograph goes stale, and the first version left it that way — a loupe over
+/// a playing video showed the pixels as they were when the selection started.
+/// So there are two tiers now:
+///
+/// - a **base** frame per display, the whole screen, taken once. It covers
+///   wherever the pointer goes, immediately.
+/// - one small **patch**, re-taken around the pointer every time it comes to
+///   rest, which the loupe prefers whenever it covers what is being magnified.
+///
+/// The patch is what makes it live without making it expensive: a 5K base frame
+/// is ~59 MB and 30-60 ms, while 160 pt square is under a megabyte. Re-taking the
+/// base on a timer would have been the obvious fix and the wrong one — tens of
+/// megabytes of churn per second, to refresh pixels nobody is looking at.
 @MainActor
 final class BackdropCache {
-    /// One display's photograph, with everything needed to map a global point
-    /// into it.
+    /// A photograph, with everything needed to map a global point into it.
     struct Frame {
         let image: CGImage
         /// Pixels per point, from the capture itself rather than from
         /// `NSScreen.backingScaleFactor` — on mixed-DPI setups only the capture
         /// knows what it actually rendered at.
         let scale: CGFloat
-        /// The AppKit global rect the image covers, i.e. the whole screen.
-        let screenFrame: CGRect
+        /// The AppKit global rect the image covers: a whole screen for a base
+        /// frame, a small square for a patch.
+        let covers: CGRect
     }
+
+    /// How big a patch is, and how far inside it the pointer has to be for the
+    /// patch to be used.
+    ///
+    /// The margin is what stops a patch being used right at its own edge, where
+    /// the loupe would magnify the void beyond it. It only has to cover the
+    /// loupe's own window — 21 px, which is 21 pt on a 1x display — and the rest
+    /// is slack so that small pointer movements do not fall back to the base.
+    private static let patchSide: CGFloat = 160
+    private static let patchMargin: CGFloat = 32
+
+    /// Takes one photograph: a whole display when the rect is nil, that rect
+    /// otherwise. Injected, since this layer owns no capture engine.
+    typealias Capture = (CGDirectDisplayID, CGRect?, Set<CGWindowID>) async -> CaptureResult?
 
     /// Called when a frame lands, so the overlay can fade its loupe in.
     var onArrival: (() -> Void)?
 
     private var frames: [CGDirectDisplayID: Frame] = [:]
     private var inFlight: Set<CGDirectDisplayID> = []
+    private var patch: (displayID: CGDirectDisplayID, frame: Frame)?
+    private var patchInFlight = false
     /// Bumped on every teardown. A capture that returns after the selection has
     /// gone belongs to a presentation that no longer exists, and storing it would
     /// hand the *next* selection a photograph of the last one.
     private var generation = 0
 
-    func frame(for displayID: CGDirectDisplayID) -> Frame? { frames[displayID] }
+    /// The freshest frame that actually covers `point`: the patch when it does,
+    /// the base otherwise.
+    func frame(for displayID: CGDirectDisplayID, showing point: CGPoint) -> Frame? {
+        if let patch, patch.displayID == displayID,
+           patch.frame.covers.insetBy(dx: Self.patchMargin, dy: Self.patchMargin).contains(point) {
+            return patch.frame
+        }
+        return frames[displayID]
+    }
+
+    var baseFrameForTest: [CGDirectDisplayID: Frame] { frames }
 
     /// Starts fetching `screen`'s frame if it is not already here or on its way.
     ///
@@ -57,7 +93,7 @@ final class BackdropCache {
     /// loupe rather than a crash.
     func warm(
         _ screen: NSScreen,
-        using capture: @escaping (CGDirectDisplayID, Set<CGWindowID>) async -> CaptureResult?,
+        using capture: @escaping Capture,
         excluding excludedWindowIDs: Set<CGWindowID>
     ) {
         guard let displayID = ScreenIndex.displayID(of: screen),
@@ -66,14 +102,45 @@ final class BackdropCache {
         else { return }
         inFlight.insert(displayID)
         let wanted = generation
-        let frame = screen.frame
+        let covers = screen.frame
         Task { [weak self] in
-            let result = await capture(displayID, excludedWindowIDs)
+            let result = await capture(displayID, nil, excludedWindowIDs)
             guard let self else { return }
             inFlight.remove(displayID)
             guard generation == wanted, let result else { return }
-            frames[displayID] = Frame(
-                image: result.image, scale: result.scale, screenFrame: frame)
+            frames[displayID] = Frame(image: result.image, scale: result.scale, covers: covers)
+            onArrival?()
+        }
+    }
+
+    /// Re-photographs a small square around the pointer.
+    ///
+    /// Called when the pointer comes to rest, which is the only moment it is both
+    /// worth doing and free: nobody is watching the loupe mid-sweep, and by the
+    /// time they look at it the patch has landed. One at a time — a second
+    /// request while one is in flight is dropped rather than queued, since what
+    /// it would fetch is already superseded.
+    func refreshPatch(
+        around point: CGPoint, on screen: NSScreen,
+        using capture: @escaping Capture, excluding excludedWindowIDs: Set<CGWindowID>
+    ) {
+        guard !patchInFlight, let displayID = ScreenIndex.displayID(of: screen) else { return }
+        let side = Self.patchSide
+        let wanted = CGRect(
+            x: (point.x - side / 2).rounded(), y: (point.y - side / 2).rounded(),
+            width: side, height: side
+        ).intersection(screen.frame)
+        guard wanted.width > Self.patchMargin * 2, wanted.height > Self.patchMargin * 2
+        else { return }
+        patchInFlight = true
+        let generationAtRequest = generation
+        Task { [weak self] in
+            let result = await capture(displayID, wanted, excludedWindowIDs)
+            guard let self else { return }
+            patchInFlight = false
+            guard generation == generationAtRequest, let result else { return }
+            patch = (displayID, Frame(
+                image: result.image, scale: result.scale, covers: wanted))
             onArrival?()
         }
     }
@@ -84,5 +151,7 @@ final class BackdropCache {
         generation += 1
         frames.removeAll()
         inFlight.removeAll()
+        patch = nil
+        patchInFlight = false
     }
 }
