@@ -7,10 +7,20 @@
 #   writer failed: The operation couldn't be completed.
 #   (com.apple.ReplayKit.RPRecordingErrorDomain error -5814.)
 #
-# -- and sometimes finalises the file seconds early, leaving a take far shorter
-# than it should be. Roughly 2 runs in 10 on the first sample, so a single run
-# proves nothing in either direction and eyeballing it is hopeless. This runs a
-# batch and tallies.
+# So far that is the ONLY unexplained symptom, and it has been seen exactly
+# once in 32 microphone takes. The two other things that looked like it turned
+# out to be something else:
+#
+#   - a writer finalising 1.16 s into a take: that was `updateConfiguration`,
+#     which the SDK documents as ending a recording (see RecordingEngine)
+#   - a take stranded after `startCapture` took 7.8 s: the start stall is real
+#     but not microphone-specific; it was measured at 3.8-4.3 s with the
+#     microphone off on the same machine
+#
+# Which is why this script exists rather than a conclusion. One occurrence is
+# not a failure rate, an earlier guess of "2 in 10" was wrong precisely because
+# it counted those two, and 20 clean runs do not prove the bug is gone either.
+# Run a batch, tally the three symptoms separately, and let the numbers say.
 #
 # Every launch goes through LaunchServices, not the shell. TCC attributes a
 # shell-launched process to its responsible ancestor, and this binary then
