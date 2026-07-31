@@ -1,6 +1,7 @@
 import AppKit
 
-/// The rubber-band state machine. All rects are in **AppKit global points**.
+/// The selection's state: dragged out, then moved, resized or nudged. All rects
+/// are in **AppKit global points**.
 ///
 /// v1 rule: the selection is clamped to the display where the drag started.
 /// `sourceRect` is inherently per-filter/per-display, and a rect spanning a 2×
@@ -115,9 +116,11 @@ final class SelectionModel {
     /// Clamped by *intersection* with the display, unlike `move(originTo:)`,
     /// because here that is the right answer: the edge being dragged should stop
     /// at the screen border, and the opposite edge is not supposed to follow it.
-    /// A drag that would take it below the minimum is dropped rather than
-    /// clamped, so the rect simply stops instead of snapping to a size nobody
-    /// asked for.
+    /// The minimum is enforced here as a backstop only: `SelectionZones.resized`
+    /// has already stopped the dragged side short of its opposite, so what this
+    /// guard catches is a rect the *display* clamp squeezed below it. Dropped
+    /// rather than clamped, so the rect stops where it last made sense instead of
+    /// snapping to a size nobody asked for.
     func resize(to rect: CGRect) {
         guard anchor != nil, current != nil else { return }
         var target = rect

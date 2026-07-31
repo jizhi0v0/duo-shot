@@ -84,7 +84,6 @@ final class BackdropCache {
         return frames[displayID]
     }
 
-    var baseFrameForTest: [CGDirectDisplayID: Frame] { frames }
 
     /// Starts fetching `screen`'s frame if it is not already here or on its way.
     ///

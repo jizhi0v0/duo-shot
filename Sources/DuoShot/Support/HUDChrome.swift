@@ -1,13 +1,13 @@
 import AppKit
 
-/// The metrics and controls shared by the two floating bars: the toolbar under
-/// an armed selection, and the HUD that replaces it while the take runs.
+/// The metrics and controls shared by the bar's two faces: the selection toolbar
+/// and the recording HUD.
 ///
-/// They were built a week apart and looked it — different heights, different
-/// corner radii, different button idioms, one using an `NSButton` with an image
-/// and a title and the other hand-placing subviews. Two bars that appear in
-/// sequence, in the same place, during one continuous action have to read as one
-/// thing changing state rather than as two unrelated pieces of UI.
+/// They started as two separate windows, built a week apart and looking it —
+/// different heights, corner radii and button idioms, one using an `NSButton`
+/// with an image and a title and the other hand-placing subviews. Sharing these
+/// pieces is what made them agree; `FloatingBarPanel` then made them the same
+/// window, which is why nothing here owns a panel or a position any more.
 enum HUDMetrics {
     static let height: CGFloat = 40
     static let margin: CGFloat = 8
@@ -28,12 +28,12 @@ enum HUDMetrics {
     /// Liquid Glass, via `NSGlassEffectView` — available from macOS 26.0, which
     /// is exactly this app's minimum, so there is no fallback path to keep.
     ///
-    /// Controls go in the returned `content` view, not straight onto the bar.
-    /// The header is explicit that only `contentView` is guaranteed to sit
-    /// inside the effect: "arbitrary subviews aren't guaranteed specific
-    /// behavior with regard to z-order in relation to the content view or glass
-    /// effect." Adding them as siblings happens to look right and is not
-    /// promised to keep doing so.
+    /// Whatever is drawn goes in the returned `content` view — for the bar, that
+    /// is the face — and not straight onto the glass as a sibling. The header is
+    /// explicit that only `contentView` is guaranteed to sit inside the effect:
+    /// "arbitrary subviews aren't guaranteed specific behavior with regard to
+    /// z-order in relation to the content view or glass effect." Siblings happen
+    /// to look right and are not promised to keep doing so.
     ///
     /// `content` matches the bar's bounds and resizes with it, so every frame
     /// the callers compute stays in the same coordinate space it always was.

@@ -1,7 +1,8 @@
 import AppKit
 import Carbon.HIToolbox
 
-/// The dim, crosshair, rubber band, window highlight and readout for one screen.
+/// One screen's worth of selection UI: the dim, the crosshair, the rubber band,
+/// the window highlight, the readout, the loupe and the armed rect's grips.
 ///
 /// All geometry exchanged with `SelectionModel` and `WindowPickerModel` is in
 /// AppKit global points; the only conversion here is the constant offset to the
