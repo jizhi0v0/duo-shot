@@ -41,6 +41,11 @@ final class RecordingCoordinator {
     /// file, so there is no preview card to carry the news, and saying nothing
     /// means the user recorded for a minute and got silence.
     var onRecordingLost: ((any Error) -> Void)?
+    /// Other windows of ours that are on screen and must not reach the video —
+    /// a preview card left over from an earlier capture, most of all. Only
+    /// windows that exist before `engine.start` can be named in the filter, so
+    /// this is read at exactly that moment.
+    var additionalExcludedWindowIDs: (() -> Set<CGWindowID>)?
     /// The staging directory override, for self-tests that must not touch the
     /// user's save folder.
     var saveDirectoryOverride: URL?
@@ -179,6 +184,7 @@ final class RecordingCoordinator {
         // `sharingType = .none` it was merely redundant; without it, it is the
         // only thing keeping this bar out of the take.
         options.excludedWindowIDs = excludedWindowIDs
+            .union(additionalExcludedWindowIDs?() ?? [])
 
         do {
             let recording = try await engine.start(request, options: options, to: url)

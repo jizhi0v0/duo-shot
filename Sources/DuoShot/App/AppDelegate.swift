@@ -86,6 +86,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 previews.present(output, poster: poster ?? VideoPoster.placeholder())
             }
         }
+        recorder.additionalExcludedWindowIDs = { [weak self] in
+            self?.previews.panelWindowIDs ?? []
+        }
+        previews.isRecordingActive = { [weak self] in self?.recorder.isRecording ?? false }
         recorder.onRecordingLost = { [weak self] error in
             self?.reportRecordingLost(error)
         }

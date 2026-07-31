@@ -47,6 +47,17 @@ final class PreviewStackController {
 
     var timeout: Duration = .seconds(6)
 
+    /// Whether a recording is being written right now. Injected, because this
+    /// controller owns no recorder.
+    ///
+    /// Decides one thing: a card raised *during* a take cannot be excluded from
+    /// it — `SCContentFilter` is fixed when the stream starts and this panel
+    /// does not exist yet at that moment — so it stays `.none` whatever the
+    /// preference says. A card that was already up when the take began is a
+    /// different case: it exists before the filter, so its window ID goes into
+    /// the exclusion list and it can be visible.
+    var isRecordingActive: (() -> Bool)?
+
     /// Read fresh rather than cached so changing it in Settings takes effect on
     /// the next capture without a relaunch.
     private var corner: PreviewCorner { Preferences.shared.previewCorner }
@@ -155,7 +166,10 @@ final class PreviewStackController {
         scroll.documentView = document
         container.addSubview(scroll)
 
-        let created = PreviewPanel(contentRect: container.bounds, view: container)
+        let hidden = !Preferences.shared.overlayVisibleToScreenSharing
+            || (isRecordingActive?() ?? false)
+        let created = PreviewPanel(
+            contentRect: container.bounds, view: container, hiddenFromCapture: hidden)
         created.setFrameOrigin(corner.panelOrigin(
             in: screen.visibleFrame, panelSize: container.bounds.size, inset: screenInset))
         created.orderFrontRegardless()

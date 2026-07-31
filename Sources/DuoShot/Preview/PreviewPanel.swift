@@ -15,7 +15,7 @@ final class PreviewPanel: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 
-    init(contentRect: CGRect, view: NSView) {
+    init(contentRect: CGRect, view: NSView, hiddenFromCapture: Bool = true) {
         super.init(
             contentRect: contentRect,
             styleMask: [.borderless, .nonactivatingPanel],
@@ -46,7 +46,7 @@ final class PreviewPanel: NSPanel {
         isReleasedWhenClosed = false
         animationBehavior = .utilityWindow
         // Keep the preview out of a subsequent capture.
-        sharingType = Self.usesSharingTypeNone ? .none : .readOnly
+        sharingType = (Self.usesSharingTypeNone && hiddenFromCapture) ? .none : .readOnly
 
         contentView = view
     }
