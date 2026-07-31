@@ -80,6 +80,30 @@ final class SelectionModel {
         onChange?()
     }
 
+    /// Puts the selection's origin somewhere else, keeping its size. The gesture
+    /// behind it is dragging a settled selection around by its middle.
+    ///
+    /// Absolute rather than incremental, and clamped as a *translation* rather
+    /// than by letting `rectInAppKitGlobal` intersect the result. Both matter for
+    /// the same reason: the size the user chose is the one thing a move must never
+    /// change. Intersecting would shave the rect against the screen edge, and
+    /// feeding it per-event deltas would let those clamped points accumulate, so
+    /// dragging into the edge and back would leave the rect lagging behind the
+    /// pointer by however far it was pushed.
+    func move(originTo newOrigin: CGPoint) {
+        guard let anchor, let current, let rect = rectInAppKitGlobal else { return }
+        var origin = newOrigin
+        if let clampFrame {
+            origin.x = min(max(origin.x, clampFrame.minX), clampFrame.maxX - rect.width)
+            origin.y = min(max(origin.y, clampFrame.minY), clampFrame.maxY - rect.height)
+        }
+        let delta = CGVector(dx: origin.x - rect.minX, dy: origin.y - rect.minY)
+        guard delta.dx != 0 || delta.dy != 0 else { return }
+        self.anchor = CGPoint(x: anchor.x + delta.dx, y: anchor.y + delta.dy)
+        self.current = CGPoint(x: current.x + delta.dx, y: current.y + delta.dy)
+        onChange?()
+    }
+
     /// Arrow-key resize of the trailing corner, in points.
     func resize(by delta: CGVector) {
         guard current != nil else { return }

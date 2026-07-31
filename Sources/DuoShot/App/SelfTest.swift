@@ -2572,6 +2572,74 @@ enum SelfTest {
         overlay.tearDown()
         try await Task.sleep(for: .milliseconds(120))
 
+        // --- dragging an armed selection moves it ----------------------------
+        let moveFlag = CompletionFlag()
+        Task {
+            _ = await overlay.present(
+                mode: .area, windows: [], allowsWindowMode: false, requiresConfirmation: true)
+            moveFlag.markDone()
+        }
+        try await Task.sleep(for: .milliseconds(140))
+        overlay.forceSelection(selection, on: screen)
+        overlay.confirmForTest()
+        try await Task.sleep(for: .milliseconds(100))
+        let beforeMove = overlay.selectionRectForTest
+        let barBeforeMove = overlay.toolbarFrameForTest
+
+        let shift = CGVector(dx: 40, dy: -30)
+        overlay.dragForTest(
+            from: CGPoint(x: selection.midX, y: selection.midY),
+            to: CGPoint(x: selection.midX + shift.dx, y: selection.midY + shift.dy))
+        try await Task.sleep(for: .milliseconds(100))
+        let afterMove = overlay.selectionRectForTest
+
+        check(overlay.isArmedForTest, "dragging from inside keeps the selection armed")
+        check(overlay.toolbarIsVisibleForTest, "and keeps its bar")
+        if let before = beforeMove, let after = afterMove {
+            print("  moved: \(rectString(before)) -> \(rectString(after))")
+            check(after.size == before.size, "the size is unchanged by a move")
+            check(abs(after.minX - (before.minX + shift.dx)) < 1
+                    && abs(after.minY - (before.minY + shift.dy)) < 1,
+                  "it moved by exactly the drag")
+        } else {
+            check(false, "there is a selection to move")
+        }
+        // The bar hangs off the selection, so it has to have come along.
+        if let before = barBeforeMove, let after = overlay.toolbarFrameForTest {
+            check(abs(after.midX - (before.midX + shift.dx)) < 1,
+                  "the bar followed the selection")
+        }
+
+        // Off the edge: clamped as a translation, so the rect stays whole. Letting
+        // it be cut by the screen edge would silently change the size the user
+        // picked, which is the one thing a move must not do.
+        overlay.dragForTest(
+            from: CGPoint(x: (afterMove ?? selection).midX, y: (afterMove ?? selection).midY),
+            to: CGPoint(x: screen.frame.maxX + 4000, y: screen.frame.minY - 4000))
+        try await Task.sleep(for: .milliseconds(100))
+        if let shoved = overlay.selectionRectForTest, let before = beforeMove {
+            print("  shoved off-screen: \(rectString(shoved))")
+            check(shoved.size == before.size, "a move pushed off the edge keeps its size")
+            check(screen.frame.contains(shoved), "and stays on the screen")
+        }
+
+        // And a drag that starts *outside* still means "start again": the old rect
+        // is replaced by the one just drawn, which re-arms at mouse-up.
+        let outside = CGPoint(x: selection.maxX + 80, y: selection.maxY + 80)
+        overlay.dragForTest(from: outside, to: CGPoint(x: outside.x + 60, y: outside.y + 40))
+        try await Task.sleep(for: .milliseconds(120))
+        if let replaced = overlay.selectionRectForTest {
+            print("  redrawn: \(rectString(replaced))")
+            check(abs(replaced.minX - outside.x) < 2 && abs(replaced.minY - outside.y) < 2
+                    && abs(replaced.width - 60) < 2 && abs(replaced.height - 40) < 2,
+                  "a drag from outside drew a new selection rather than moving the old one")
+        } else {
+            check(false, "a drag from outside produced a selection")
+        }
+        overlay.tearDown()
+        try await Task.sleep(for: .milliseconds(120))
+        check(await moveFlag.wait(upTo: .seconds(2)), "tearDown resumed that presentation")
+
         // --- a new drag disarms ----------------------------------------------
         let secondFlag = CompletionFlag()
         Task {

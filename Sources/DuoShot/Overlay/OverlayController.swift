@@ -623,7 +623,40 @@ final class OverlayController {
     // MARK: - Confirmation-step test hooks
 
     var isArmedForTest: Bool { isArmed }
+    var selectionRectForTest: CGRect? { model.rectInAppKitGlobal }
 
+    /// Synthesises a press-drag-release, for `--selftest-selection-toolbar`.
+    ///
+    /// Real `NSEvent`s through the real handlers, rather than a hook that reaches
+    /// past them. The thing under test *is* the decision in `mouseDown` — inside
+    /// the armed rect means move it, outside means start again — so a shortcut
+    /// around that method would leave the only interesting line untested.
+    func dragForTest(from: CGPoint, to: CGPoint, steps: Int = 4) {
+        guard let index = panels.firstIndex(where: {
+            $0.screen.map { $0.frame.contains(from) } ?? false
+        }) else { return }
+        let panel = panels[index]
+        let view = views[index]
+
+        func event(_ type: NSEvent.EventType, at point: CGPoint) -> NSEvent? {
+            NSEvent.mouseEvent(
+                with: type,
+                location: CGPoint(x: point.x - panel.frame.minX, y: point.y - panel.frame.minY),
+                modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: panel.windowNumber, context: nil, eventNumber: 0,
+                clickCount: 1, pressure: 1)
+        }
+
+        if let down = event(.leftMouseDown, at: from) { view.mouseDown(with: down) }
+        for step in 1...max(steps, 1) {
+            let progress = CGFloat(step) / CGFloat(max(steps, 1))
+            let point = CGPoint(
+                x: from.x + (to.x - from.x) * progress,
+                y: from.y + (to.y - from.y) * progress)
+            if let dragged = event(.leftMouseDragged, at: point) { view.mouseDragged(with: dragged) }
+        }
+        if let up = event(.leftMouseUp, at: to) { view.mouseUp(with: up) }
+    }
     var toolbarIsVisibleForTest: Bool { toolbar.isVisible }
     var toolbarFrameForTest: CGRect? { toolbar.frameForTest }
 

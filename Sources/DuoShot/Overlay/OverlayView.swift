@@ -104,7 +104,35 @@ final class OverlayView: NSView {
     // exactly where a dangling view segfaulted (see PreviewStackController.retire).
 
     override func resetCursorRects() {
-        addCursorRect(bounds, cursor: mode == .area ? .crosshair : .arrow)
+        let cursor: NSCursor = mode == .area ? .crosshair : .arrow
+        // An open hand over an armed selection, because it can now be dragged
+        // somewhere else, and the crosshair everywhere else, because a press
+        // there starts a new one.
+        guard mode == .area, isArmed, let rect = model.rectInAppKitGlobal else {
+            addCursorRect(bounds, cursor: cursor)
+            return
+        }
+        let inside = toLocal(rect).intersection(bounds)
+        guard !inside.isEmpty else {
+            addCursorRect(bounds, cursor: cursor)
+            return
+        }
+        addCursorRect(inside, cursor: .openHand)
+        // The four slabs around it, rather than `bounds` plus an overlapping
+        // rect: AppKit does not define which cursor wins where two cursor rects
+        // overlap, and "it looked right on my machine" is not a specification.
+        for slab in [
+            CGRect(x: bounds.minX, y: inside.maxY,
+                   width: bounds.width, height: bounds.maxY - inside.maxY),
+            CGRect(x: bounds.minX, y: bounds.minY,
+                   width: bounds.width, height: inside.minY - bounds.minY),
+            CGRect(x: bounds.minX, y: inside.minY,
+                   width: inside.minX - bounds.minX, height: inside.height),
+            CGRect(x: inside.maxX, y: inside.minY,
+                   width: bounds.maxX - inside.maxX, height: inside.height),
+        ] where slab.width > 0 && slab.height > 0 {
+            addCursorRect(slab, cursor: cursor)
+        }
     }
 
     /// Unhooks the view from the two AppKit registries that hold it *unretained*:
@@ -170,6 +198,11 @@ final class OverlayView: NSView {
     /// re-armed itself wherever the pointer happened to be.
     private static let restartSlop: CGFloat = 5
 
+    /// A press inside the armed selection: where it started, and where the rect
+    /// was at the time. Both, so the move can be computed absolutely — see
+    /// `SelectionModel.move(originTo:)`.
+    private var movePress: (pointer: CGPoint, origin: CGPoint)?
+
     override func mouseDown(with event: NSEvent) {
         guard mode == .area else { return }
         guard let screen = window?.screen else { return }
@@ -177,6 +210,15 @@ final class OverlayView: NSView {
         // Armed, so this press is not yet anything. Deciding here would throw
         // the selection away before knowing whether the user meant to.
         if isArmed {
+            // Inside the rect it means "move this", outside it means "start
+            // again". Which is the only reading that leaves both gestures
+            // available: before this, a press anywhere — including on the
+            // selection the user had just carefully placed — could only destroy
+            // it, so nudging a rect two points to the left meant redrawing it.
+            if let rect = model.rectInAppKitGlobal, rect.contains(point) {
+                movePress = (pointer: point, origin: rect.origin)
+                return
+            }
             armedPressOrigin = point
             return
         }
@@ -186,6 +228,14 @@ final class OverlayView: NSView {
     override func mouseDragged(with event: NSEvent) {
         guard mode == .area else { return }
         let point = toGlobal(convert(event.locationInWindow, from: nil))
+
+        if let press = movePress {
+            model.move(originTo: CGPoint(
+                x: press.origin.x + (point.x - press.pointer.x),
+                y: press.origin.y + (point.y - press.pointer.y)))
+            model.pointerMoved(to: point)
+            return
+        }
 
         if let origin = armedPressOrigin {
             guard hypot(point.x - origin.x, point.y - origin.y) > Self.restartSlop else { return }
@@ -205,12 +255,15 @@ final class OverlayView: NSView {
         case .window:
             if let hovered = picker.hovered { callbacks.confirmWindow(hovered.id) }
         case .area:
-            // A press that never travelled. The armed selection stands, and the
-            // click is simply discarded — clicking the dim to dismiss would be a
-            // second, undiscoverable way to lose a selection that Escape already
-            // handles visibly.
-            if armedPressOrigin != nil {
+            // A press that never travelled, or one that moved the selection
+            // rather than replacing it. Either way the armed rect stands and the
+            // click is discarded — clicking the dim to dismiss would be a second,
+            // undiscoverable way to lose a selection that Escape already handles
+            // visibly. The moved rect needs no confirming: it is still armed, and
+            // the bar over it is still the thing that starts the take.
+            if armedPressOrigin != nil || movePress != nil {
                 armedPressOrigin = nil
+                movePress = nil
                 return
             }
             model.updateDrag(to: toGlobal(convert(event.locationInWindow, from: nil)))
@@ -377,7 +430,7 @@ final class OverlayView: NSView {
 
     private func drawHint() {
         let text = if isArmed {
-            "⏎ to record · drag again to reselect · Esc to cancel"
+            "⏎ to record · drag it to move · drag outside to reselect · Esc to cancel"
         } else if mode != .area {
             "Click a window · Space for area · Esc to cancel"
         } else if allowsWindowMode {
