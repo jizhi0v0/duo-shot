@@ -163,13 +163,30 @@ final class RecordingEngine {
         // pick a single audio track rather than summing them, so narration
         // would go missing for anyone who did not open it in an editor.
         //
-        // The property is macOS 27+ and this ships with a 26.0 minimum. What
-        // `SCRecordingOutput` does with two sources on macOS 26 is NOT
-        // established here — untestable on this machine — so the availability
-        // check is a genuine unknown rather than a formality.
+        // Two guards, because they answer different questions and one of them
+        // is not optional.
+        //
+        // `#available` is a RUNTIME check: the symbol still has to exist when
+        // the file is compiled. The property is absent from the macOS 26 SDK
+        // entirely, so a build with Xcode 26 fails on this line no matter what
+        // the availability check says. Caught on a Mac mini running 26.5 —
+        // it compiles here only because this machine has the 27 SDK, which is
+        // exactly the kind of breakage that does not show up until someone
+        // else builds it.
+        //
+        // `compiler(>=6.4)` stands in for "built against the macOS 27 SDK".
+        // It is a proxy — the toolchain and the SDK ship together — and it is
+        // the mechanism Swift actually offers; there is no `#if sdk(...)`.
+        //
+        // Skipping it on macOS 26 costs nothing: measured 2026-07-31 on a Mac
+        // mini running 26.5, a take with system audio and the microphone both
+        // on came back as one AAC 48 kHz stereo track there too. Mixing is what
+        // 26 already did; 27 added the ability to turn it OFF, not the mixing.
+        #if compiler(>=6.4)
         if #available(macOS 27.0, *) {
             recordingConfiguration.mixesAudioWithMicrophone = true
         }
+        #endif
 
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
