@@ -105,33 +105,42 @@ final class OverlayView: NSView {
 
     override func resetCursorRects() {
         let cursor: NSCursor = mode == .area ? .crosshair : .arrow
-        // An open hand over an armed selection, because it can now be dragged
-        // somewhere else, and the crosshair everywhere else, because a press
-        // there starts a new one.
+        // Over an armed selection the pointer says which of the three gestures a
+        // press would start: a resize cursor on each edge and corner, an open
+        // hand in the middle, the crosshair outside.
         guard mode == .area, isArmed, let rect = model.rectInAppKitGlobal else {
             addCursorRect(bounds, cursor: cursor)
             return
         }
-        let inside = toLocal(rect).intersection(bounds)
-        guard !inside.isEmpty else {
+        let zones = SelectionZones(rect: toLocal(rect))
+        let interior = zones.interior.intersection(bounds)
+        guard !interior.isEmpty else {
             addCursorRect(bounds, cursor: cursor)
             return
         }
-        addCursorRect(inside, cursor: .openHand)
-        // The four slabs around it, rather than `bounds` plus an overlapping
-        // rect: AppKit does not define which cursor wins where two cursor rects
-        // overlap, and "it looked right on my machine" is not a specification.
+        addCursorRect(interior, cursor: .openHand)
+        for handle in SelectionZones.Handle.allCases {
+            let zone = zones.zone(handle).intersection(bounds)
+            guard !zone.isEmpty else { continue }
+            addCursorRect(zone, cursor: handle.cursor)
+        }
+        // The four slabs around the whole ring, rather than `bounds` plus
+        // overlapping rects on top: AppKit does not define which cursor wins
+        // where two cursor rects overlap, and "it looked right on my machine" is
+        // not a specification. `SelectionZones` guarantees the ring's own pieces
+        // do not overlap either.
+        let ring = zones.interior.insetBy(dx: -zones.grab * 2, dy: -zones.grab * 2)
         for slab in [
-            CGRect(x: bounds.minX, y: inside.maxY,
-                   width: bounds.width, height: bounds.maxY - inside.maxY),
+            CGRect(x: bounds.minX, y: ring.maxY,
+                   width: bounds.width, height: bounds.maxY - ring.maxY),
             CGRect(x: bounds.minX, y: bounds.minY,
-                   width: bounds.width, height: inside.minY - bounds.minY),
-            CGRect(x: bounds.minX, y: inside.minY,
-                   width: inside.minX - bounds.minX, height: inside.height),
-            CGRect(x: inside.maxX, y: inside.minY,
-                   width: bounds.maxX - inside.maxX, height: inside.height),
+                   width: bounds.width, height: ring.minY - bounds.minY),
+            CGRect(x: bounds.minX, y: ring.minY,
+                   width: ring.minX - bounds.minX, height: ring.height),
+            CGRect(x: ring.maxX, y: ring.minY,
+                   width: bounds.maxX - ring.maxX, height: ring.height),
         ] where slab.width > 0 && slab.height > 0 {
-            addCursorRect(slab, cursor: cursor)
+            addCursorRect(slab.intersection(bounds), cursor: cursor)
         }
     }
 
@@ -203,6 +212,12 @@ final class OverlayView: NSView {
     /// `SelectionModel.move(originTo:)`.
     private var movePress: (pointer: CGPoint, origin: CGPoint)?
 
+    /// A press on one of the armed selection's edges or corners, and the rect it
+    /// started from. Absolute for the same reason a move is: the sides that are
+    /// not being dragged come from the rect as it was at press, so they cannot
+    /// drift over a long gesture.
+    private var resizePress: (handle: SelectionZones.Handle, rect: CGRect)?
+
     override func mouseDown(with event: NSEvent) {
         guard mode == .area else { return }
         guard let screen = window?.screen else { return }
@@ -210,14 +225,22 @@ final class OverlayView: NSView {
         // Armed, so this press is not yet anything. Deciding here would throw
         // the selection away before knowing whether the user meant to.
         if isArmed {
-            // Inside the rect it means "move this", outside it means "start
-            // again". Which is the only reading that leaves both gestures
-            // available: before this, a press anywhere — including on the
-            // selection the user had just carefully placed — could only destroy
-            // it, so nudging a rect two points to the left meant redrawing it.
-            if let rect = model.rectInAppKitGlobal, rect.contains(point) {
-                movePress = (pointer: point, origin: rect.origin)
-                return
+            // On an edge or corner it means "resize", elsewhere inside it means
+            // "move this", outside it means "start again". Which is the only
+            // reading that leaves all three available: before this, a press
+            // anywhere — including on the selection the user had just carefully
+            // placed — could only destroy it, so nudging a rect two points to
+            // the left meant redrawing it.
+            if let rect = model.rectInAppKitGlobal {
+                let zones = SelectionZones(rect: rect)
+                if let handle = zones.handle(at: point) {
+                    resizePress = (handle: handle, rect: rect)
+                    return
+                }
+                if rect.contains(point) {
+                    movePress = (pointer: point, origin: rect.origin)
+                    return
+                }
             }
             armedPressOrigin = point
             return
@@ -228,6 +251,12 @@ final class OverlayView: NSView {
     override func mouseDragged(with event: NSEvent) {
         guard mode == .area else { return }
         let point = toGlobal(convert(event.locationInWindow, from: nil))
+
+        if let press = resizePress {
+            model.resize(to: SelectionZones.resized(press.rect, by: press.handle, to: point))
+            model.pointerMoved(to: point)
+            return
+        }
 
         if let press = movePress {
             model.move(originTo: CGPoint(
@@ -255,15 +284,16 @@ final class OverlayView: NSView {
         case .window:
             if let hovered = picker.hovered { callbacks.confirmWindow(hovered.id) }
         case .area:
-            // A press that never travelled, or one that moved the selection
-            // rather than replacing it. Either way the armed rect stands and the
+            // A press that never travelled, or one that moved or resized the
+            // selection rather than replacing it. Either way the armed rect stands and the
             // click is discarded — clicking the dim to dismiss would be a second,
             // undiscoverable way to lose a selection that Escape already handles
             // visibly. The moved rect needs no confirming: it is still armed, and
             // the bar over it is still the thing that starts the take.
-            if armedPressOrigin != nil || movePress != nil {
+            if armedPressOrigin != nil || movePress != nil || resizePress != nil {
                 armedPressOrigin = nil
                 movePress = nil
+                resizePress = nil
                 return
             }
             model.updateDrag(to: toGlobal(convert(event.locationInWindow, from: nil)))
@@ -407,6 +437,7 @@ final class OverlayView: NSView {
 
         switch mode {
         case .area:
+            if isArmed { drawHandles(on: highlight) }
             drawBadge("\(Int(highlight.width)) × \(Int(highlight.height))", near: highlight)
         case .window:
             if let hovered = picker.hovered {
@@ -414,6 +445,31 @@ final class OverlayView: NSView {
             }
         }
         drawHint()
+    }
+
+    /// Four corner grips, drawn only once the selection is armed.
+    ///
+    /// They are the affordance for a gesture that would otherwise be invisible:
+    /// a settled rect that can be resized has to look like one. Corners only —
+    /// eight grips read as a diagram, and the edges announce themselves through
+    /// the cursor.
+    ///
+    /// Dark ring under a light fill, the pairing used everywhere else here, since
+    /// these land on whatever the user is about to record.
+    private func drawHandles(on highlight: CGRect) {
+        let side: CGFloat = 7
+        for centre in SelectionZones(rect: highlight).cornerPoints {
+            let grip = CGRect(
+                x: (centre.x - side / 2).rounded(), y: (centre.y - side / 2).rounded(),
+                width: side, height: side)
+            NSColor(white: 0, alpha: 0.5).setStroke()
+            let ring = NSBezierPath(roundedRect: grip.insetBy(dx: -0.5, dy: -0.5),
+                                    xRadius: 2, yRadius: 2)
+            ring.lineWidth = 1
+            ring.stroke()
+            NSColor(white: 1, alpha: 0.95).setFill()
+            NSBezierPath(roundedRect: grip, xRadius: 1.5, yRadius: 1.5).fill()
+        }
     }
 
     private func drawCrosshair(at point: CGPoint) {
@@ -430,7 +486,7 @@ final class OverlayView: NSView {
 
     private func drawHint() {
         let text = if isArmed {
-            "⏎ to record · drag it to move · drag outside to reselect · Esc to cancel"
+            "⏎ to record · drag to move, edges to resize · drag outside to reselect · Esc"
         } else if mode != .area {
             "Click a window · Space for area · Esc to cancel"
         } else if allowsWindowMode {

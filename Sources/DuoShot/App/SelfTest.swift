@@ -39,6 +39,9 @@ enum SelfTest {
         case fullscreen(directory: URL)
         /// Settings persistence, key-combo encoding and the system-shortcut probe.
         case preferences
+        /// Pure geometry of the armed selection's grab zones. Headless: no screen,
+        /// no capture, so it runs where the interactive tests cannot.
+        case selectionZones
         /// Opens the real Settings window and captures it, so the SwiftUI layout
         /// can actually be looked at.
         case settingsWindow(directory: URL)
@@ -116,6 +119,8 @@ enum SelfTest {
                 self = .output(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-preferences":
                 self = .preferences
+            case "--selftest-selection-zones":
+                self = .selectionZones
             case "--selftest-hud-appearance":
                 FloatingBarPanel.usesSharingTypeNone = false
                 self = .hudAppearance(
@@ -257,6 +262,7 @@ enum SelfTest {
             case .windowMode(let directory): return try await windowMode(into: directory)
             case .fullscreen(let directory): return try await fullscreenMode(into: directory)
             case .preferences: return preferencesCheck()
+            case .selectionZones: return selectionZonesCheck()
             case .settingsWindow(let directory): return try await settingsWindow(into: directory)
             case .settingsResize: return try await settingsResize()
             case .lifecycle(let iterations): return try await lifecycle(iterations: iterations)
@@ -2022,6 +2028,110 @@ enum SelfTest {
         return failures.isEmpty ? 0 : 1
     }
 
+    // MARK: - Selection zones
+
+    /// The grab-zone arithmetic: which handle a point belongs to, and what each
+    /// one does to the rect.
+    ///
+    /// Headless on purpose. It is eight near-identical cases of min/max, the kind
+    /// of thing where a transposed pair looks fine until someone drags the one
+    /// corner nobody tried — and it needs no window server, so unlike the gesture
+    /// test it also runs on a locked screen.
+    private static func selectionZonesCheck() -> Int32 {
+        var failures: [String] = []
+        func check(_ condition: Bool, _ description: String) {
+            print("  \(condition ? "ok  " : "FAIL") \(description)")
+            if !condition { failures.append(description) }
+        }
+
+        let rect = CGRect(x: 100, y: 200, width: 400, height: 300)
+        let zones = SelectionZones(rect: rect)
+
+        // Every handle claims the point it is named after. AppKit's y is up, so
+        // "top" is the higher edge — the classic place to get this backwards.
+        let probes: [(SelectionZones.Handle, CGPoint)] = [
+            (.topLeft, CGPoint(x: rect.minX, y: rect.maxY)),
+            (.top, CGPoint(x: rect.midX, y: rect.maxY)),
+            (.topRight, CGPoint(x: rect.maxX, y: rect.maxY)),
+            (.right, CGPoint(x: rect.maxX, y: rect.midY)),
+            (.bottomRight, CGPoint(x: rect.maxX, y: rect.minY)),
+            (.bottom, CGPoint(x: rect.midX, y: rect.minY)),
+            (.bottomLeft, CGPoint(x: rect.minX, y: rect.minY)),
+            (.left, CGPoint(x: rect.minX, y: rect.midY)),
+        ]
+        for (handle, point) in probes {
+            check(zones.handle(at: point) == handle,
+                  "\(handle) is the handle at its own corner or edge midpoint")
+        }
+        check(zones.handle(at: CGPoint(x: rect.midX, y: rect.midY)) == nil,
+              "the middle belongs to no handle, so a press there is a move")
+        check(zones.handle(at: CGPoint(x: rect.minX - 40, y: rect.midY)) == nil,
+              "well outside belongs to no handle either")
+        check(zones.interior.contains(CGPoint(x: rect.midX, y: rect.midY))
+                && !zones.interior.contains(CGPoint(x: rect.minX, y: rect.midY)),
+              "the interior holds the middle and not the edge")
+
+        // No two zones overlap. This is what lets the cursor rects be laid out
+        // without depending on AppKit's undefined behaviour for overlapping ones.
+        var overlaps: [String] = []
+        let all = SelectionZones.Handle.allCases
+        for (index, one) in all.enumerated() {
+            for other in all.dropFirst(index + 1) {
+                let shared = zones.zone(one).intersection(zones.zone(other))
+                if !shared.isEmpty { overlaps.append("\(one)/\(other)") }
+            }
+        }
+        check(overlaps.isEmpty, "no two grab zones overlap\(overlaps.isEmpty ? "" : ": " + overlaps.joined(separator: " "))")
+
+        // What each handle does. Every case names the sides that must NOT move,
+        // which is the half that a transposition breaks.
+        let cases: [(SelectionZones.Handle, CGPoint, CGRect)] = [
+            (.left, CGPoint(x: 150, y: 0),
+             CGRect(x: 150, y: 200, width: 350, height: 300)),
+            (.right, CGPoint(x: 600, y: 0),
+             CGRect(x: 100, y: 200, width: 500, height: 300)),
+            (.top, CGPoint(x: 0, y: 400),
+             CGRect(x: 100, y: 200, width: 400, height: 200)),
+            (.bottom, CGPoint(x: 0, y: 150),
+             CGRect(x: 100, y: 150, width: 400, height: 350)),
+            (.topLeft, CGPoint(x: 150, y: 400),
+             CGRect(x: 150, y: 200, width: 350, height: 200)),
+            (.topRight, CGPoint(x: 600, y: 400),
+             CGRect(x: 100, y: 200, width: 500, height: 200)),
+            (.bottomLeft, CGPoint(x: 150, y: 150),
+             CGRect(x: 150, y: 150, width: 350, height: 350)),
+            (.bottomRight, CGPoint(x: 600, y: 150),
+             CGRect(x: 100, y: 150, width: 500, height: 350)),
+        ]
+        for (handle, to, expected) in cases {
+            let got = SelectionZones.resized(rect, by: handle, to: to)
+            check(got == expected,
+                  "\(handle) dragged to \(Int(to.x)),\(Int(to.y)) gives "
+                    + "\(rectString(expected))\(got == expected ? "" : " — got \(rectString(got))")")
+        }
+
+        // Through the opposite side: parks at the minimum, leaves that side alone.
+        // A normalising version of this flipped the rect to the far side of the
+        // anchor instead, and came out 200 pt wide.
+        let minimum = SelectionModel.minimumSide
+        let crossed = SelectionZones.resized(rect, by: .left, to: CGPoint(x: rect.maxX + 200, y: 0))
+        check(crossed.width == minimum && crossed.maxX == rect.maxX
+                && crossed.minY == rect.minY && crossed.height == rect.height,
+              "the left edge dragged past the right stops \(Int(minimum))pt short of it")
+        let crossedUp = SelectionZones.resized(rect, by: .bottom, to: CGPoint(x: 0, y: rect.maxY + 200))
+        check(crossedUp.height == minimum && crossedUp.maxY == rect.maxY,
+              "and the bottom edge dragged past the top does the same")
+
+        // A selection too small to hold a full-width ring still has a middle to
+        // grab, or it could be resized and never moved again.
+        let tiny = SelectionZones(rect: CGRect(x: 0, y: 0, width: 21, height: 21))
+        check(tiny.grab < 8 && !tiny.interior.isEmpty,
+              "a 21pt selection shrinks its grab band instead of becoming all handles")
+
+        print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.count) of the above")")
+        return failures.isEmpty ? 0 : 1
+    }
+
     // MARK: - Loupe
 
     /// Whether the loupe magnifies the pixels it claims to.
@@ -2621,6 +2731,82 @@ enum SelfTest {
             print("  shoved off-screen: \(rectString(shoved))")
             check(shoved.size == before.size, "a move pushed off the edge keeps its size")
             check(screen.frame.contains(shoved), "and stays on the screen")
+        }
+
+        // --- and dragging an edge resizes it ---------------------------------
+        //
+        // All eight handles, because the arithmetic is eight near-identical cases
+        // and a transposed pair is exactly the sort of thing that looks fine
+        // until someone drags the one corner nobody tried. Each is checked for
+        // the side it moved *and* for the three it must not have.
+        // Deliberately not whatever the move cases left behind: that rect is
+        // jammed into the screen's corner, where half these pulls would be
+        // clamped by the display edge and the test would be measuring the clamp.
+        let base = selection
+        let pulls: [(name: String, grab: CGPoint, to: CGPoint, expect: CGRect)] = [
+            ("left edge", CGPoint(x: base.minX, y: base.midY),
+             CGPoint(x: base.minX + 50, y: base.midY),
+             CGRect(x: base.minX + 50, y: base.minY, width: base.width - 50, height: base.height)),
+            ("right edge", CGPoint(x: base.maxX, y: base.midY),
+             CGPoint(x: base.maxX + 30, y: base.midY),
+             CGRect(x: base.minX, y: base.minY, width: base.width + 30, height: base.height)),
+            ("top edge", CGPoint(x: base.midX, y: base.maxY),
+             CGPoint(x: base.midX, y: base.maxY - 40),
+             CGRect(x: base.minX, y: base.minY, width: base.width, height: base.height - 40)),
+            ("bottom edge", CGPoint(x: base.midX, y: base.minY),
+             CGPoint(x: base.midX, y: base.minY - 20),
+             CGRect(x: base.minX, y: base.minY - 20, width: base.width, height: base.height + 20)),
+            ("top-left", CGPoint(x: base.minX, y: base.maxY),
+             CGPoint(x: base.minX + 25, y: base.maxY - 15),
+             CGRect(x: base.minX + 25, y: base.minY,
+                    width: base.width - 25, height: base.height - 15)),
+            ("top-right", CGPoint(x: base.maxX, y: base.maxY),
+             CGPoint(x: base.maxX - 25, y: base.maxY - 15),
+             CGRect(x: base.minX, y: base.minY,
+                    width: base.width - 25, height: base.height - 15)),
+            ("bottom-left", CGPoint(x: base.minX, y: base.minY),
+             CGPoint(x: base.minX + 25, y: base.minY + 15),
+             CGRect(x: base.minX + 25, y: base.minY + 15,
+                    width: base.width - 25, height: base.height - 15)),
+            ("bottom-right", CGPoint(x: base.maxX, y: base.minY),
+             CGPoint(x: base.maxX - 25, y: base.minY + 15),
+             CGRect(x: base.minX, y: base.minY + 15,
+                    width: base.width - 25, height: base.height - 15)),
+        ]
+        for pull in pulls {
+            overlay.forceSelection(base, on: screen)
+            overlay.confirmForTest()
+            try await Task.sleep(for: .milliseconds(60))
+            overlay.dragForTest(from: pull.grab, to: pull.to)
+            try await Task.sleep(for: .milliseconds(60))
+            let got = overlay.selectionRectForTest ?? .zero
+            let matches = abs(got.minX - pull.expect.minX) < 2 && abs(got.minY - pull.expect.minY) < 2
+                && abs(got.width - pull.expect.width) < 2 && abs(got.height - pull.expect.height) < 2
+            print("  \(pull.name): \(rectString(got))"
+                + (matches ? "" : "  expected \(rectString(pull.expect))"))
+            check(matches, "dragging the \(pull.name) resizes exactly that side")
+            check(overlay.isArmedForTest, "the \(pull.name) drag left it armed")
+        }
+
+        // Dragged past its own opposite edge, a rect must stop rather than turn
+        // inside out. `SelectionModel.minimumSide` is the floor.
+        overlay.forceSelection(base, on: screen)
+        overlay.confirmForTest()
+        try await Task.sleep(for: .milliseconds(60))
+        overlay.dragForTest(
+            from: CGPoint(x: base.minX, y: base.midY),
+            to: CGPoint(x: base.maxX + 200, y: base.midY))
+        try await Task.sleep(for: .milliseconds(60))
+        if let collapsed = overlay.selectionRectForTest {
+            print("  pulled through itself: \(rectString(collapsed))")
+            // Precisely: parked at the minimum against an untouched right edge.
+            // "Still has some size" was the first version of this assertion and
+            // it passed on a rect that had flipped to the far side of the anchor
+            // and come out 200 pt wide.
+            check(abs(collapsed.width - SelectionModel.minimumSide) < 1
+                    && abs(collapsed.maxX - base.maxX) < 1
+                    && abs(collapsed.height - base.height) < 1,
+                  "a resize dragged through the opposite edge stops at the minimum")
         }
 
         // And a drag that starts *outside* still means "start again": the old rect

@@ -214,6 +214,7 @@ test: verify
 	run "window mode"            --selftest-window $(TEST_OUT); \
 	run "fullscreen menu bar"    --selftest-fullscreen $(TEST_OUT); \
 	run "preferences"            --selftest-preferences; \
+	run "selection zones"        --selftest-selection-zones; \
 	run "settings window"        --selftest-settings-window $(TEST_OUT); \
 	run "settings tab resize"    --selftest-settings-resize; \
 	run "overlay lifecycle"      --selftest-lifecycle 10; \

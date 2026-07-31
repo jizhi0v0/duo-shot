@@ -104,6 +104,33 @@ final class SelectionModel {
         onChange?()
     }
 
+    /// Below this the selection stops shrinking. A rect the user cannot see is
+    /// one they cannot grab an edge of either, and letting a resize run through
+    /// zero would flip it inside out mid-drag.
+    static let minimumSide: CGFloat = 8
+
+    /// Replaces the rect outright, keeping the display it belongs to. The gesture
+    /// behind it is dragging one edge or corner of a settled selection.
+    ///
+    /// Clamped by *intersection* with the display, unlike `move(originTo:)`,
+    /// because here that is the right answer: the edge being dragged should stop
+    /// at the screen border, and the opposite edge is not supposed to follow it.
+    /// A drag that would take it below the minimum is dropped rather than
+    /// clamped, so the rect simply stops instead of snapping to a size nobody
+    /// asked for.
+    func resize(to rect: CGRect) {
+        guard anchor != nil, current != nil else { return }
+        var target = rect
+        if let clampFrame {
+            target = target.intersection(clampFrame)
+            guard !target.isNull else { return }
+        }
+        guard target.width >= Self.minimumSide, target.height >= Self.minimumSide else { return }
+        anchor = CGPoint(x: target.minX, y: target.minY)
+        current = CGPoint(x: target.maxX, y: target.maxY)
+        onChange?()
+    }
+
     /// Arrow-key resize of the trailing corner, in points.
     func resize(by delta: CGVector) {
         guard current != nil else { return }
