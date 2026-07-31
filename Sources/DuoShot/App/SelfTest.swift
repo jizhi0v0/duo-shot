@@ -50,6 +50,7 @@ enum SelfTest {
         /// double-resumed continuation and leaked panels.
         case lifecycle(iterations: Int)
         case selectionToolbar
+        case audioSwitch(directory: URL, seconds: Double)
         /// Repeated captures through the whole pipeline, watching memory and the
         /// staging store.
         case soak(iterations: Int, directory: URL)
@@ -109,6 +110,10 @@ enum SelfTest {
                 self = .output(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-preferences":
                 self = .preferences
+            case "--selftest-record-audio-switch":
+                self = .audioSwitch(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"),
+                    seconds: value(for: "--seconds").flatMap(Double.init) ?? 6)
             case "--selftest-selection-toolbar":
                 self = .selectionToolbar
             case "--selftest-lifecycle":
@@ -221,6 +226,7 @@ enum SelfTest {
             case .settingsResize: return try await settingsResize()
             case .lifecycle(let iterations): return try await lifecycle(iterations: iterations)
             case .selectionToolbar: return try await selectionToolbar()
+            case .audioSwitch(let d, let seconds): return try await audioSwitch(into: d, seconds: seconds)
             case .soak(let iterations, let directory):
                 return try await soak(iterations: iterations, into: directory)
             case .microphone: return await microphoneCheck()
@@ -1778,6 +1784,167 @@ enum SelfTest {
     /// reconfiguration, a second `present` — and a `CheckedContinuation` that is
     /// resumed twice is a hard crash while one never resumed hangs the caller
     /// forever. This drives every route in turn, many times.
+    /// Whether the audio settings can be changed while a take is running
+    /// *without damaging the file*.
+    ///
+    /// The question this answers is not "does `updateConfiguration` return
+    /// without an error" — it does. It is whether `SCRecordingOutput`, which
+    /// opened its writer before the change, produces a file that is still whole
+    /// afterwards. Neither the SDK header nor Apple's documentation says which
+    /// configuration properties may change mid-stream or what happens to the
+    /// recording output when they do, and there is a developer-forum report of
+    /// output corruption specifically with `captureMicrophone`. So this measures
+    /// it: three switches during one take, then the file is opened and checked.
+    private static func audioSwitch(into directory: URL, seconds: Double) async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+        if let hint = LoginSession.noDisplaysHint {
+            FileHandle.standardError.write(Data("error: \(hint)\n".utf8))
+            return 2
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let displayID = ScreenIndex.screenUnderMouse().flatMap(ScreenIndex.displayID(of:))
+            ?? CGMainDisplayID()
+        let url = directory.appendingPathComponent("record-audio-switch.mp4")
+        try? FileManager.default.removeItem(at: url)
+
+        let micGranted = MicrophonePermission.isGranted
+        print("microphone:    \(MicrophonePermission.statusDescription)")
+
+        var options = RecordingOptions.default
+        options.capturesSystemAudio = true
+        options.capturesMicrophone = micGranted
+
+        let engine = RecordingEngine()
+        try await engine.refreshContent()
+        _ = try await engine.start(.display(displayID), options: options, to: url)
+
+        var failures: [String] = []
+        func check(_ condition: Bool, _ description: String) {
+            print("  \(condition ? "ok  " : "FAIL") \(description)")
+            if !condition { failures.append(description) }
+        }
+
+        let slice = Duration.seconds(seconds / 4)
+
+        /// Applies one switch and reports whether the take is still alive after
+        /// it.
+        ///
+        /// Survival is the assertion, not the call returning. Measured
+        /// 2026-07-31, `updateConfiguration` reported success and
+        /// `SCRecordingOutput` finalised the file 70 ms later — the API said yes
+        /// and the recording ended anyway, which no check on the return value
+        /// could ever have caught.
+        func switchAudio(
+            _ label: String, system: Bool, microphone: Bool, device: String? = nil,
+            expectRefusal: Bool = false
+        ) async {
+            do {
+                try await engine.updateAudio(
+                    capturesSystemAudio: system, capturesMicrophone: microphone,
+                    microphoneDeviceID: device)
+                check(!expectRefusal, "\(label): accepted")
+            } catch {
+                check(expectRefusal, "\(label): refused — \(error.localizedDescription)")
+            }
+            // Long enough for the writer to have given up if it is going to —
+            // measured, it takes about 100 ms.
+            try? await Task.sleep(for: .milliseconds(400))
+            // `writerHasFinished`, not `isRecording`. Our own state says the
+            // take is running right up until we stop it; only the writer knows
+            // it has closed the file.
+            let alive = engine.isRecording && !(engine.current?.writerHasFinished ?? true)
+            Log.record.notice("""
+                selftest-audio-switch step \(label, privacy: .public) \
+                alive=\(alive, privacy: .public)
+                """)
+            check(alive, "\(label): the take is still running afterwards")
+        }
+
+        try await Task.sleep(for: slice)
+        await switchAudio("microphone off", system: true, microphone: false)
+        try await Task.sleep(for: slice)
+        await switchAudio("microphone back on", system: true, microphone: micGranted)
+        try await Task.sleep(for: slice)
+        // The destructive one, now that the engine refuses it. Both halves are
+        // asserted: the refusal, and — the point of the refusal — that the take
+        // is still being written afterwards.
+        await switchAudio(
+            "all audio off", system: false, microphone: false, expectRefusal: !micGranted)
+        try await Task.sleep(for: slice)
+
+        if let device = AudioInputDevices.all.first, micGranted {
+            await switchAudio(
+                "input device -> \(device.name)", system: true, microphone: true, device: device.id)
+        } else {
+            print("  skip input-device switch (no device, or no grant)")
+        }
+
+        let result = try await engine.stop()
+
+        // The file, not the API's return value. A take that survives three
+        // switches and then will not open has still been ruined.
+        let asset = AVURLAsset(url: result.url)
+        let duration = (try? await asset.load(.duration))?.seconds ?? 0
+        let videoTracks = (try? await asset.loadTracks(withMediaType: .video)) ?? []
+        let audioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
+        print("file:          \(result.fileSize) bytes, \(String(format: "%.2f", duration))s, "
+            + "\(videoTracks.count) video / \(audioTracks.count) audio track(s)")
+
+        // A control take of the same length with no switches at all.
+        //
+        // Without it the duration check is meaningless: a static screen makes
+        // ScreenCaptureKit deliver almost no frames, so the file's duration is
+        // the timestamp of the last sample and comes out well short of the
+        // wall-clock take — measured 4.25s for an 8s take with nothing moving.
+        // Judged against a fixed fraction that reads as "the switches truncated
+        // the recording". Judged against a take that did nothing else
+        // differently, it reads as what it is.
+        let controlURL = directory.appendingPathComponent("record-audio-switch-control.mp4")
+        try? FileManager.default.removeItem(at: controlURL)
+        var controlOptions = RecordingOptions.default
+        controlOptions.capturesSystemAudio = true
+        controlOptions.capturesMicrophone = micGranted
+        _ = try await engine.start(.display(displayID), options: controlOptions, to: controlURL)
+        try await Task.sleep(for: .seconds(seconds))
+        let control = try await engine.stop()
+        let controlDuration =
+            (try? await AVURLAsset(url: control.url).load(.duration))?.seconds ?? 0
+        print("control:       \(String(format: "%.2f", controlDuration))s with no switches "
+            + "(same length, same still screen)")
+
+        check(duration >= controlDuration * 0.6,
+              "duration is in line with the control "
+              + "(\(String(format: "%.2f", duration))s vs \(String(format: "%.2f", controlDuration))s)")
+        check(videoTracks.count == 1, "exactly one video track")
+        check(!audioTracks.isEmpty, "the audio track is still there")
+        check(result.fileSize > 10_000, "the file has real content")
+
+        // Decodable, not merely present: a writer torn by a mid-stream change
+        // can leave a file whose moov says one thing and whose samples say
+        // another, and only touching a frame finds that.
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        let late = CMTime(seconds: duration * 0.85, preferredTimescale: 600)
+        let decoded = (try? await generator.image(at: late)) != nil
+        check(decoded, "a frame at 85% of the take still decodes")
+
+        // To os_log as well. The microphone half of this test only runs when the
+        // process actually holds the grant, and that requires a LaunchServices
+        // launch (see `MicrophonePermission`) — which has no stdout to read.
+        Log.record.notice("""
+            selftest-audio-switch: mic=\(MicrophonePermission.statusDescription, privacy: .public) \
+            duration=\(String(format: "%.2f", duration), privacy: .public)s \
+            control=\(String(format: "%.2f", controlDuration), privacy: .public)s \
+            audioTracks=\(audioTracks.count, privacy: .public) \
+            decoded=\(decoded, privacy: .public) \
+            result=\(failures.isEmpty ? "PASS" : "FAIL", privacy: .public)
+            """)
+
+        print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.count) of the above")")
+        return failures.isEmpty ? 0 : 1
+    }
+
     /// The confirmation step: mouse-up arms the selection instead of committing
     /// it, and only the second confirm resumes the caller.
     ///

@@ -9,11 +9,14 @@ nonisolated enum RecordingError: Error, LocalizedError {
     case writerNeverStarted
     case fileMissing(URL)
     case emptyFile(URL)
+    case audioWouldTruncateTake
 
     var errorDescription: String? {
         switch self {
         case .alreadyRecording:
             "A recording is already in progress."
+        case .audioWouldTruncateTake:
+            "Turning off the last audio source would end the recording."
         case .notRecording:
             "No recording is in progress."
         case .displayNotFound(let id):
@@ -67,6 +70,22 @@ final class ActiveRecording {
     }
 
     var fileSize: Int { session.stats.fileSize }
+
+    /// The audio settings currently in force, so a mid-take change starts from
+    /// what is actually running rather than from what the take was started with.
+    private(set) var liveOptions: RecordingOptions?
+
+    fileprivate func noteOptions(_ options: RecordingOptions) { liveOptions = options }
+    fileprivate var currentSession: SCKRecordingSession { session }
+
+    /// True once `SCRecordingOutput` has closed the file.
+    ///
+    /// Not the same question as "is this coordinator still in a recording
+    /// state", and the difference is not academic: measured 2026-07-31, taking
+    /// the last audio source away mid-take made the writer finalise 99 ms later
+    /// while every piece of our own bookkeeping still said the take was running.
+    /// Everything recorded after that moment is lost, silently.
+    var writerHasFinished: Bool { session.writerFinished.signalled }
 
     /// Fires when the recording dies on its own rather than being stopped.
     func onUnexpectedStop(_ handler: @escaping @Sendable (any Error) -> Void) {
@@ -203,6 +222,73 @@ final class RecordingEngine {
             first frame \(writerLatency, privacy: .public) ms)
             """)
         return recording
+    }
+
+    /// Changes the audio settings of the take that is already running.
+    ///
+    /// Rebuilds the whole configuration rather than mutating the live one:
+    /// `SCStreamConfiguration` is a value the stream copied at start, so the
+    /// object we hold is not what is running and mutating it would change
+    /// nothing.
+    ///
+    /// The geometry is recomputed from the same inputs so it comes out
+    /// identical — an update that changed `width`/`height` mid-take would
+    /// change the encoded frame size, which is not what a microphone toggle
+    /// should do.
+    func updateAudio(
+        capturesSystemAudio: Bool, capturesMicrophone: Bool, microphoneDeviceID: String?
+    ) async throws {
+        guard let recording = active else { throw RecordingError.notRecording }
+
+        // Refused, not clamped, so the caller can put its toggle back and say
+        // why rather than silently disagreeing with the user.
+        //
+        // Measured 2026-07-31: taking the last audio source away mid-take makes
+        // `SCRecordingOutput` finalise the file ~99 ms later. `updateConfiguration`
+        // reports success, `active` still points at a recording, the HUD keeps
+        // counting — and nothing after that instant is written. A 9.6 s take
+        // ended at 7.0 s with no error anywhere. See
+        // `--selftest-record-audio-switch`, which asserts both halves.
+        //
+        // Whether the trigger is "zero sources" or "capturesAudio going false"
+        // specifically is NOT established: telling them apart needs a run with
+        // the microphone grant in hand, which a shell-launched process does not
+        // have. The guard covers both readings.
+        let effectiveMicrophone = capturesMicrophone && MicrophonePermission.isGranted
+        guard capturesSystemAudio || effectiveMicrophone else {
+            throw RecordingError.audioWouldTruncateTake
+        }
+
+        var options = recording.liveOptions ?? recording.options
+        options.capturesSystemAudio = capturesSystemAudio
+        // Same degradation rule as `start`: never hand ScreenCaptureKit an
+        // undecided grant.
+        options.capturesMicrophone = effectiveMicrophone
+        options.microphoneDeviceID = options.capturesMicrophone ? microphoneDeviceID : nil
+
+        let configuration = streamConfiguration(
+            pixelSize: (width: Int(recording.pixelSize.width),
+                        height: Int(recording.pixelSize.height)),
+            sourceRect: sourceRect(for: recording.request),
+            options: options)
+
+        try await recording.currentSession.update(configuration: configuration)
+        recording.noteOptions(options)
+        Log.record.notice("""
+            recording audio updated: system=\(options.capturesSystemAudio, privacy: .public) \
+            mic=\(options.capturesMicrophone, privacy: .public)
+            """)
+    }
+
+    /// The crop for a request, or nil for a whole display. Extracted so `start`
+    /// and `updateAudio` cannot drift apart on it.
+    private func sourceRect(for request: RecordingRequest) -> CGRect? {
+        switch request {
+        case .area(let displayID, let rectInAppKitGlobal):
+            DisplayGeometry.sourceRect(fromAppKitGlobal: rectInAppKitGlobal, on: displayID)
+        case .display:
+            nil
+        }
     }
 
     // MARK: - Stop

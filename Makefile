@@ -137,6 +137,20 @@ mic-check: verify
 		| grep selftest-microphone | tail -1 | sed 's/^/  /' \
 		| grep . || echo "  FAIL: no log entry in the last 20s -- the app did not launch"
 
+# The audio-switch test with the microphone grant actually in hand.
+#
+# Same attribution rule as mic-check: run from a shell, this process reports the
+# grant as `not determined` and the whole microphone half of the test silently
+# skips -- which is the half worth measuring, since the developer-forum report of
+# a corrupted recording output is specifically about captureMicrophone.
+audio-switch-check: verify
+	@pkill -f "$(APP_NAME).app/Contents/MacOS/$(APP_NAME)" 2>/dev/null || true
+	@open -n -a "$(CURDIR)/$(APP)" --args --selftest-record-audio-switch $(TEST_OUT) --seconds 8
+	@sleep 25
+	@/usr/bin/log show --predicate 'subsystem == "$(BUNDLE_ID)"' --last 40s --info --debug --style compact 2>/dev/null \
+		| grep selftest-audio-switch | tail -1 | sed 's/^/  /' \
+		| grep . || echo "  FAIL: no log entry -- the app did not launch or did not finish"
+
 selftest: verify
 	@"$(EXEC)" --selftest-permission || true
 	@"$(EXEC)" --selftest-capture build/selftest-fullscreen.png
@@ -184,6 +198,7 @@ test: verify
 	run "hud absent (.none)"     --selftest-record-hud $(TEST_OUT) --seconds 2 --sharing-none; \
 	run "plain window recorded"  --selftest-record-hud $(TEST_OUT) --seconds 2 --plain-window --hud-first; \
 	run "menu-bar item recorded" --selftest-record-hud $(TEST_OUT) --seconds 2 --status-item --hud-first; \
+	run "audio switch mid-take" --selftest-record-audio-switch $(TEST_OUT) --seconds 6; \
 	run "recording flow"         --selftest-record-flow $(TEST_OUT) --seconds 2; \
 	printf '  %-26s ' "exclusion negative control"; \
 	if "$(EXEC)" --selftest-overlay 400,300,640,400 --sharing-default --no-exclude >/dev/null 2>&1; \

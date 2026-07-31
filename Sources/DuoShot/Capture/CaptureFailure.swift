@@ -22,7 +22,7 @@ nonisolated enum CaptureFailure: Sendable, Equatable {
             switch captureError {
             case .noDisplays, .displayNotFound, .windowNotFound:
                 self = .noCaptureSource
-            case .emptyOutput, .noImageProduced, .recordingStartTimedOut:
+            case .emptyOutput, .noImageProduced, .recordingStartTimedOut, .recordingNotRunning:
                 self = .transient
             case .encodingFailed:
                 self = .other
