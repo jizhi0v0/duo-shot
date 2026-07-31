@@ -35,6 +35,8 @@ final class PreviewCardView: NSView {
     /// is, whereas one frame of a recording is indistinguishable from a
     /// screenshot of the same screen.
     private let badge: String?
+    /// Colours the duration pill and adds a warning glyph.
+    private let isIncomplete: Bool
     private var callbacks: Callbacks
     private var isDraggingOut = false
     private var mouseDownGlobal: CGPoint?
@@ -45,9 +47,11 @@ final class PreviewCardView: NSView {
     private var playGlyph: NSView?
     private var isHovering = false
 
-    init(image: NSImage, badge: String? = nil, callbacks: Callbacks) {
+    init(image: NSImage, badge: String? = nil, isIncomplete: Bool = false,
+         callbacks: Callbacks) {
         self.image = image
         self.badge = badge
+        self.isIncomplete = isIncomplete
         self.callbacks = callbacks
         super.init(frame: CGRect(origin: .zero, size: Self.cardSize))
         wantsLayer = true
@@ -197,7 +201,7 @@ final class PreviewCardView: NSView {
         addSubview(well)
         playGlyph = well
 
-        let label = NSTextField(labelWithString: duration)
+        let label = NSTextField(labelWithString: isIncomplete ? "⚠ \(duration)" : duration)
         label.font = .monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
         label.textColor = .white
         label.sizeToFit()
@@ -212,7 +216,12 @@ final class PreviewCardView: NSView {
         pill.wantsLayer = true
         pill.layer?.cornerRadius = pill.frame.height / 2
         pill.layer?.cornerCurve = .continuous
-        pill.layer?.backgroundColor = NSColor(white: 0.08, alpha: 0.72).cgColor
+        pill.layer?.backgroundColor = isIncomplete
+            ? NSColor.systemOrange.withAlphaComponent(0.9).cgColor
+            : NSColor(white: 0.08, alpha: 0.72).cgColor
+        pill.toolTip = isIncomplete
+            ? "This take ended unexpectedly. The file holds what was written before it stopped."
+            : nil
         label.setFrameOrigin(CGPoint(x: padding.width, y: padding.height))
         pill.addSubview(label)
         addSubview(pill)

@@ -111,6 +111,9 @@ final class OutputPipeline {
         let result: RecordingResult
         let url: URL
         let wasSaved: Bool
+        /// The take ended badly and this file is what survived. Set by
+        /// `RecordingCoordinator`, which is the only place that knows.
+        var isIncomplete = false
     }
 
     func reveal(_ url: URL) {

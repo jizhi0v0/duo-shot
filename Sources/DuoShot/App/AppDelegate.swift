@@ -81,9 +81,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 previews.present(output, poster: poster ?? VideoPoster.placeholder())
             }
         }
+        recorder.onRecordingLost = { [weak self] error in
+            self?.reportRecordingLost(error)
+        }
         recorder.onAuthorisationLost = { [weak self] in
             Task { await self?.handleAuthorisationLost() }
         }
+    }
+
+    /// The one case that has to interrupt: a take that produced no file.
+    ///
+    /// Everything else the recorder can say is carried by the preview card —
+    /// the file is there, and a card marked incomplete is proportionate. When
+    /// there is no file there is no card, and staying silent means the user
+    /// recorded for a minute, watched the HUD disappear, and is left to work
+    /// out on their own that nothing was kept.
+    ///
+    /// Deliberately not raised for `authorisationLost`, which has its own
+    /// re-grant flow and would otherwise produce two dialogs for one cause.
+    private func reportRecordingLost(_ error: any Error) {
+        guard CaptureFailure(error) != .authorisationLost else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "The recording could not be saved"
+        alert.informativeText = """
+            \(error.localizedDescription)
+
+            Nothing was written, so there is no file to recover. If this keeps happening, Console shows the details under DuoShot.
+            """
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     /// macOS 15+ expires the Screen Recording grant roughly monthly. When it

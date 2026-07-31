@@ -68,7 +68,8 @@ final class PreviewStackController {
     func present(_ entry: PreviewEntry) {
         var callbacks = PreviewCardView.Callbacks()
         let card = PreviewCardView(
-            image: entry.thumbnail, badge: entry.badge, callbacks: callbacks)
+            image: entry.thumbnail, badge: entry.badge,
+            isIncomplete: entry.isIncomplete, callbacks: callbacks)
         let item = Item(entry: entry, card: card)
 
         // Every capture of `item` is weak. `item` owns the card, the card owns

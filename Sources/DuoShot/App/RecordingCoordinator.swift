@@ -37,6 +37,10 @@ final class RecordingCoordinator {
     /// including the failure ones: an icon left invisible to screenshots after a
     /// take that never started is a worse bug than the one this fixes.
     var onCaptureChromeHidden: ((Bool) -> Void)?
+    /// A take that produced nothing at all. The only channel left: there is no
+    /// file, so there is no preview card to carry the news, and saying nothing
+    /// means the user recorded for a minute and got silence.
+    var onRecordingLost: ((any Error) -> Void)?
     /// The staging directory override, for self-tests that must not touch the
     /// user's save folder.
     var saveDirectoryOverride: URL?
@@ -109,6 +113,7 @@ final class RecordingCoordinator {
         overlay.tearDown()
 
         guard case .area(let displayID, let rect) = outcome else { return }
+        retriesLeft = 1
         await begin(.area(displayID: displayID, rectInAppKitGlobal: rect))
     }
 
@@ -125,8 +130,13 @@ final class RecordingCoordinator {
         }
         let displayID = ScreenIndex.screenUnderMouse().flatMap(ScreenIndex.displayID(of:))
             ?? CGMainDisplayID()
+        retriesLeft = 1
         await begin(.display(displayID))
     }
+
+    /// Reset for each trigger, so one bad take never uses up a later one's
+    /// retry. Decremented only by the start path below.
+    private var retriesLeft = 0
 
     private func begin(_ request: RecordingRequest) async {
         let options = Preferences.shared.recordingOptions
@@ -160,6 +170,26 @@ final class RecordingCoordinator {
             }
             onStateChanged?()
         } catch {
+            Log.record.error("""
+                could not start \(request.kind, privacy: .public) recording: \
+                \(error.localizedDescription, privacy: .public)\
+                \(self.retriesLeft > 0 ? "; retrying once" : "")
+                """)
+
+            // Retried only here, at the start, and only once.
+            //
+            // The user has pressed a shortcut and is waiting; nothing has been
+            // performed yet, so a second attempt costs them nothing and hides a
+            // transient failure. The same retry *during* a take would be the
+            // opposite of helpful: it would throw away the minute they had
+            // already recorded and start a new take mid-sentence, without them
+            // knowing either had happened.
+            if retriesLeft > 0, CaptureFailure(error) != .authorisationLost {
+                retriesLeft -= 1
+                await begin(request)
+                return
+            }
+
             state = .idle
             // The starting HUD is up by now and there will be no take to attach
             // it to. Leaving it would be a bar that claims a recording is on its
@@ -168,12 +198,9 @@ final class RecordingCoordinator {
             regionOutline.hide()
             onCaptureChromeHidden?(false)
             onStateChanged?()
-            Log.record.error("""
-                could not start \(request.kind, privacy: .public) recording: \
-                \(error.localizedDescription, privacy: .public)
-                """)
             if CaptureFailure(error) == .authorisationLost { onAuthorisationLost?() }
             NSSound.beep()
+            onRecordingLost?(error)
         }
     }
 
@@ -185,16 +212,7 @@ final class RecordingCoordinator {
         hud.hide()
         regionOutline.hide()
         onCaptureChromeHidden?(false)
-        do {
-            let result = try await engine.stop()
-            if let output = OutputPipeline.shared.process(
-                result, saveDirectoryOverride: saveDirectoryOverride) {
-                onResult?(output)
-            }
-        } catch {
-            Log.record.error("stopping failed: \(error.localizedDescription, privacy: .public)")
-            NSSound.beep()
-        }
+        await deliver(await engine.finish())
         onStateChanged?()
     }
 
@@ -214,7 +232,13 @@ final class RecordingCoordinator {
     var stagedURLForTest: URL? { engine.current?.url }
 
     private func handleUnexpectedStop(_ error: any Error) async {
-        guard state == .recording else { return }
+        // `.arming` counts. There is a window between `engine.start` returning
+        // and the handler being attached in which the stream can die, and
+        // `SCKRecordingSession` now replays such an error to whoever attaches
+        // next — so it can legitimately land while this is still arming, and
+        // returning here would leave the HUD stuck on "Starting…" and the menu
+        // bar item hidden from capture for the rest of the session.
+        guard state != .idle else { return }
         Log.record.error("""
             recording stopped on its own: \(error.localizedDescription, privacy: .public)
             """)
@@ -225,14 +249,45 @@ final class RecordingCoordinator {
         // Salvage rather than discard: whatever was written before the stream
         // died is still a recording, and throwing it away is the one outcome
         // the user can never undo.
-        if let result = try? await engine.stop(),
-           let output = OutputPipeline.shared.process(
-            result, saveDirectoryOverride: saveDirectoryOverride) {
-            onResult?(output)
-        } else {
-            engine.forget()
-        }
+        await deliver(await engine.finish(), stopError: error)
         if CaptureFailure(error) == .authorisationLost { onAuthorisationLost?() }
         onStateChanged?()
+    }
+
+    /// Turns an outcome into exactly one user-visible consequence.
+    ///
+    /// The three cases are deliberately separate. A take that ended badly but
+    /// left a file is still handed over — marked, so the preview card can say
+    /// it is incomplete — because only the user can decide a partial recording
+    /// is worthless. A take that left nothing has to speak up, since there will
+    /// be no card to carry the news.
+    private func deliver(_ outcome: RecordingEngine.Outcome, stopError: (any Error)? = nil) async {
+        switch outcome {
+        case .finished(let result):
+            if let output = OutputPipeline.shared.process(
+                result, saveDirectoryOverride: saveDirectoryOverride) {
+                onResult?(output)
+            }
+        case .salvaged(let result, let failure):
+            Log.record.error("""
+                salvaged \(result.url.lastPathComponent, privacy: .public) \
+                after \((failure ?? stopError)?.localizedDescription ?? "an unclean stop", privacy: .public)
+                """)
+            if var output = OutputPipeline.shared.process(
+                result, saveDirectoryOverride: saveDirectoryOverride) {
+                output.isIncomplete = true
+                onResult?(output)
+            }
+        case .lost(let url, let failure):
+            // The file is left where it is on purpose. It is the only sample of
+            // a failure we cannot reproduce on demand, and deleting it is how
+            // the last one was lost.
+            Log.record.error("""
+                recording lost, staged file left at \(url.path, privacy: .public): \
+                \((failure ?? stopError)?.localizedDescription ?? "unknown", privacy: .public)
+                """)
+            NSSound.beep()
+            onRecordingLost?(failure ?? stopError ?? RecordingError.fileMissing(url))
+        }
     }
 }

@@ -21,6 +21,10 @@ struct PreviewEntry {
     /// so it must be the post-move URL, never the staged one.
     let url: URL
     let sourceDisplayID: CGDirectDisplayID
+    /// A recording whose take ended badly. The card says so, because the file
+    /// looks ordinary and the user would otherwise discover the truncation only
+    /// on playback.
+    var isIncomplete = false
 
     var isVideo: Bool {
         if case .video = kind { true } else { false }
@@ -59,7 +63,8 @@ extension PreviewEntry {
             kind: .video(output.result),
             thumbnail: poster,
             url: output.url,
-            sourceDisplayID: output.result.sourceDisplayID)
+            sourceDisplayID: output.result.sourceDisplayID,
+            isIncomplete: output.isIncomplete)
     }
 }
 

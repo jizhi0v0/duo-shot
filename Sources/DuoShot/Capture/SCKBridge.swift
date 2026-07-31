@@ -254,6 +254,8 @@ nonisolated final class SCKRecordingSession: NSObject, @unchecked Sendable,
     /// still be readable at the end.
     private var lastStats = Stats(duration: 0, fileSize: 0)
     private var unexpectedStop: (@Sendable (any Error) -> Void)?
+    /// An unexpected stop that arrived before anyone was listening.
+    private var missedStop: (any Error)?
 
     init(outputURL: URL) {
         self.outputURL = outputURL
@@ -262,8 +264,21 @@ nonisolated final class SCKRecordingSession: NSObject, @unchecked Sendable,
 
     /// Called when the stream or the writer dies on its own — display
     /// disconnected, disk full, Screen Recording revoked mid-recording.
+    /// Registers the handler, and delivers an error that already happened.
+    ///
+    /// There is a real window between `start()` returning and the caller
+    /// attaching this: the stream is live and can die inside it. Without the
+    /// replay below, `reportUnexpectedStop` found no handler and dropped the
+    /// error on the floor — the take was dead, and nothing in the app ever
+    /// learned it.
     func onUnexpectedStop(_ handler: @escaping @Sendable (any Error) -> Void) {
-        lock.withLock { unexpectedStop = handler }
+        let pending: (any Error)? = lock.withLock {
+            unexpectedStop = handler
+            let stashed = missedStop
+            missedStop = nil
+            return stashed
+        }
+        if let pending { handler(pending) }
     }
 
     /// Builds the stream, attaches the writer, and starts capturing.
@@ -329,16 +344,32 @@ nonisolated final class SCKRecordingSession: NSObject, @unchecked Sendable,
 
     /// Stops the stream and waits for the writer to finalise the file.
     ///
+    /// What a stop attempt found. Nothing here throws: a writer that failed is
+    /// a *fact about the take*, not a reason to deny the caller the chance to
+    /// look at what reached disk. Deciding otherwise is how a partial recording
+    /// used to be thrown away without ever being opened.
+    struct StopReport {
+        let stats: Stats
+        /// Non-nil when `SCRecordingOutput` reported a failure. The file may
+        /// still hold something.
+        let writerFailure: (any Error)?
+        /// False when the writer never said it was done. The bytes on disk are
+        /// then whatever the last flush left.
+        let finalised: Bool
+    }
+
     /// The counters are sampled *before* stopping, because the only moment the
     /// writer is guaranteed to still be able to answer is while it is running.
     @discardableResult
-    func stop(finaliseTimeout: Duration = .seconds(15)) async throws -> Stats {
+    func stop(finaliseTimeout: Duration = .seconds(15)) async -> StopReport {
         let stream: SCStream? = lock.withLock {
             guard !isStopping else { return nil }
             isStopping = true
             return self.stream
         }
-        guard let stream else { return stats }
+        guard let stream else {
+            return StopReport(stats: stats, writerFailure: writerFinished.error, finalised: true)
+        }
 
         let sampled = stats
 
@@ -360,8 +391,16 @@ nonisolated final class SCKRecordingSession: NSObject, @unchecked Sendable,
                 "stopCapture reported \(error.localizedDescription, privacy: .public); continuing to finalise")
         }
 
-        let finalised = try await writerFinished.wait(timeout: finaliseTimeout)
-        if !finalised {
+        // `wait` throws when the latch was opened with an error, and that error
+        // is exactly the case this method must survive rather than propagate.
+        var finalised = false
+        var writerFailure: (any Error)?
+        do {
+            finalised = try await writerFinished.wait(timeout: finaliseTimeout)
+        } catch {
+            writerFailure = error
+        }
+        if !finalised, writerFailure == nil {
             Log.record.error(
                 "writer never reported finishing after \(finaliseTimeout.seconds, privacy: .public)s")
         }
@@ -369,7 +408,7 @@ nonisolated final class SCKRecordingSession: NSObject, @unchecked Sendable,
             self.stream = nil
             self.recordingOutput = nil
         }
-        return sampled
+        return StopReport(stats: sampled, writerFailure: writerFailure, finalised: finalised)
     }
 
     // MARK: - SCRecordingOutputDelegate
@@ -404,6 +443,11 @@ nonisolated final class SCKRecordingSession: NSObject, @unchecked Sendable,
     private func reportUnexpectedStop(_ error: any Error) {
         let handler: (@Sendable (any Error) -> Void)? = lock.withLock {
             guard !isStopping else { return nil }
+            guard let unexpectedStop else {
+                // Nobody is listening yet. Keep it for whoever attaches next.
+                missedStop = error
+                return nil
+            }
             return unexpectedStop
         }
         handler?(error)

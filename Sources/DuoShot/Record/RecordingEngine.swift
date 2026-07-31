@@ -235,19 +235,50 @@ final class RecordingEngine {
 
     // MARK: - Stop
 
-    func stop() async throws -> RecordingResult {
-        guard let recording = active else { throw RecordingError.notRecording }
+    /// How a take ended.
+    ///
+    /// Three independent facts used to be collapsed into one `throws`: whether
+    /// the writer reported a failure, whether anything reached disk, and
+    /// whether the caller gets a result. `engine.stop()` threw at the first,
+    /// so the second was never asked and the third was always "nothing" — a
+    /// take could be forty seconds of real content and be discarded without
+    /// being opened.
+    enum Outcome {
+        case finished(RecordingResult)
+        /// The writer failed or never finalised, but there is a file with bytes
+        /// in it. Whether it plays is the caller's to find out; with movie
+        /// fragments it often would, and either way it is the user's only copy.
+        case salvaged(RecordingResult, failure: (any Error)?)
+        /// Nothing usable. The URL is still handed back so the caller can log
+        /// it and leave it alone rather than delete the evidence.
+        case lost(url: URL, failure: (any Error)?)
+    }
+
+    /// Ends the take and reports what came of it. Never throws.
+    func finish() async -> Outcome {
+        guard let recording = active else {
+            return .lost(url: URL(fileURLWithPath: "/dev/null"), failure: RecordingError.notRecording)
+        }
         active = nil
 
-        let stats = try await recording.session.stop()
+        let report = await recording.session.stop()
         let url = recording.url
-
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            throw RecordingError.fileMissing(url)
+        if let failure = report.writerFailure {
+            Log.record.error("""
+                writer failed for \(url.lastPathComponent, privacy: .public): \
+                \(failure.localizedDescription, privacy: .public)
+                """)
         }
+
         let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int)
-            .flatMap { $0 } ?? stats.fileSize
-        guard size > 0 else { throw RecordingError.emptyFile(url) }
+            .flatMap { $0 } ?? 0
+        guard FileManager.default.fileExists(atPath: url.path), size > 0 else {
+            Log.record.error("""
+                nothing on disk for \(url.lastPathComponent, privacy: .public) \
+                (\(size, privacy: .public) bytes)
+                """)
+            return .lost(url: url, failure: report.writerFailure)
+        }
 
         // The duration comes from the finished file, not from the writer.
         // `SCRecordingOutput.recordedDuration` lags: measured 2026-07-31 it
@@ -255,11 +286,16 @@ final class RecordingEngine {
         // 3.65 s — round to the tenth in both cases, so it is quantised as well
         // as behind. It is fine for a live HUD counter and wrong for the number
         // stamped on a finished recording.
-        let duration = await Self.assetDuration(of: url) ?? stats.duration
+        //
+        // A file the container cannot parse at all is the signal that the take
+        // is unplayable, and it is reported as salvaged-with-no-duration rather
+        // than deleted: an unplayable file can still be repaired, and only the
+        // user can decide it is worthless.
+        let duration = await Self.assetDuration(of: url)
 
         let result = RecordingResult(
             url: url,
-            duration: duration,
+            duration: duration ?? report.stats.duration,
             fileSize: size,
             pixelSize: recording.pixelSize,
             pointSize: recording.pointSize,
@@ -268,16 +304,28 @@ final class RecordingEngine {
             sourceDescription: recording.sourceDescription,
             startedAt: recording.startedAt)
 
+        let intact = report.writerFailure == nil && report.finalised && duration != nil
         Log.record.notice("""
-            recording finished \(url.lastPathComponent, privacy: .public) \
+            recording \(intact ? "finished" : "SALVAGED", privacy: .public) \
+            \(url.lastPathComponent, privacy: .public) \
             \(result.durationDescription, privacy: .public) \
-            \(size / 1024, privacy: .public) KB
+            \(size / 1024, privacy: .public) KB \
+            playable=\(duration != nil, privacy: .public)
             """)
-        return result
+        return intact ? .finished(result) : .salvaged(result, failure: report.writerFailure)
     }
 
-    /// Stops and deletes. Used by the cancel path, where the user has said the
-    /// take is not wanted.
+    /// The throwing shape, kept for the self-tests that only care about the
+    /// happy path.
+    func stop() async throws -> RecordingResult {
+        switch await finish() {
+        case .finished(let result), .salvaged(let result, _):
+            return result
+        case .lost(let url, let failure):
+            throw failure ?? RecordingError.fileMissing(url)
+        }
+    }
+
     func cancel() async {
         guard let recording = active else { return }
         active = nil
