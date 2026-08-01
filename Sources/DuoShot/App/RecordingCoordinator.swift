@@ -5,7 +5,7 @@ import AppKit
 /// The screenshot coordinator runs to completion inside one `await`; a recording
 /// cannot, because it has to hand control back to the user for the length of the
 /// take. So this one is a small state machine instead — `idle` / `arming` /
-/// `recording`.
+/// `recording` / `finishing`.
 ///
 /// A take has three ways to end and each one has to leave the same world behind
 /// it: `stop` (keep the file), `discard` (delete it), and `handleUnexpectedStop`
@@ -19,6 +19,15 @@ final class RecordingCoordinator {
         /// Selection is on screen, or the stream is starting.
         case arming
         case recording
+        /// The stream is stopped and the file is being finalised.
+        ///
+        /// A separate state because finalising is not instant — `finish` waits
+        /// on the writer and then reads the duration back out of the container,
+        /// which is seconds for a long take — and until it returns the old
+        /// stream is still tearing down. Going straight back to `idle` there let
+        /// the next trigger through the guard in `perform` and start a second
+        /// stream on top of the first.
+        case finishing
     }
 
     private let engine: RecordingEngine
@@ -88,7 +97,8 @@ final class RecordingCoordinator {
             return
         }
         guard state == .idle else {
-            Log.record.notice("recording trigger ignored; already arming")
+            let reason = state == .arming ? "already arming" : "still finishing the last take"
+            Log.record.notice("recording trigger ignored; \(reason, privacy: .public)")
             return
         }
         switch action {
@@ -171,9 +181,14 @@ final class RecordingCoordinator {
         // Anchored to the region for an area take, so the bar stays where the
         // toolbar just was instead of jumping to the bottom of the screen.
         let region: CGRect? = if case .area(_, let rect) = request { rect } else { nil }
+        // Asked before the stream exists because it changes the bar's width, and
+        // the bar must not change width when the take begins. The engine applies
+        // the same predicate to the same options, so the prediction and the
+        // `ActiveRecording.microphoneDenied` it hands back cannot disagree.
         hud.showStarting(
             on: ScreenIndex.screen(for: request.displayID), under: region,
-            adopting: adoptedBar, hiddenFromCapture: hidden)
+            adopting: adoptedBar, hiddenFromCapture: hidden,
+            microphoneOff: RecordingEngine.microphoneWillBeDropped(options))
         adoptedBar = nil
         // Only for an area take. On a fullscreen one the answer to "what is
         // being recorded" is the whole screen, and a border round the edge of it
@@ -191,9 +206,9 @@ final class RecordingCoordinator {
         do {
             let recording = try await engine.start(request, options: options, to: url)
             state = .recording
-            hud.beginRecording(elapsed: { [weak self] in
-                self?.elapsed ?? 0
-            })
+            hud.beginRecording(
+                elapsed: { [weak self] in self?.elapsed ?? 0 },
+                microphoneOff: recording.microphoneDenied)
             // A stream that dies on its own — display unplugged, disk full,
             // Screen Recording revoked — must not leave the HUD on screen and
             // the menu bar claiming to record.
@@ -238,25 +253,53 @@ final class RecordingCoordinator {
 
     // MARK: - Ending
 
+    /// `.finishing` for the whole of the await, `.idle` only once the file is
+    /// closed. The state used to go to `.idle` first, which meant the seconds a
+    /// finalise takes were seconds in which a hotkey could start a second stream
+    /// while the first was still tearing down.
     func stop() async {
         guard state == .recording else { return }
-        state = .idle
+        state = .finishing
         hud.hide()
         regionOutline.hide()
         onCaptureChromeHidden?(false)
         await deliver(await engine.finish())
+        state = .idle
         onStateChanged?()
     }
 
     func discard() async {
         guard state == .recording else { return }
-        state = .idle
+        // Same reason as `stop`: `cancel` clears the engine's own handle before
+        // it awaits the stream's stop, so `.idle` here would let the next
+        // trigger build a stream while this one is still going down.
+        state = .finishing
         hud.hide()
         regionOutline.hide()
         onCaptureChromeHidden?(false)
         await engine.cancel()
+        state = .idle
         onStateChanged?()
     }
+
+    /// Ends whatever is in flight and does not return until the file is closed.
+    ///
+    /// For `applicationShouldTerminate`, which is the one caller that has to
+    /// wait: quitting mid-take otherwise kills the writer with the file
+    /// unfinalised. A stop already under way owns the finish, so this waits it
+    /// out rather than starting a second one — `finish` on a cleared engine
+    /// would report the take as lost and put an alert up on the way out.
+    func settle() async {
+        if state == .recording { await stop() }
+        // `!Task.isCancelled` because a cancelled `Task.sleep` throws at once:
+        // without it this becomes a hot loop the moment anyone cancels.
+        while state == .finishing, !Task.isCancelled {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+    }
+
+    /// A take that would be destroyed by quitting now.
+    var hasTakeInFlight: Bool { state == .recording || state == .finishing }
 
     // MARK: - Test hooks
 
@@ -270,7 +313,12 @@ final class RecordingCoordinator {
         // next — so it can legitimately land while this is still arming, and
         // returning here would leave the HUD stuck on "Starting…" and the menu
         // bar item hidden from capture for the rest of the session.
-        guard state != .idle else { return }
+        //
+        // `.finishing` does not count, though: the take is already being
+        // finalised by `stop`, and a second `engine.finish()` on a cleared
+        // engine reports the recording as lost and puts an alert in front of a
+        // user whose file is fine.
+        guard state == .arming || state == .recording else { return }
         Log.record.error("""
             recording stopped on its own: \(error.localizedDescription, privacy: .public)
             """)

@@ -218,7 +218,12 @@ nonisolated final class SCKLatch: @unchecked Sendable {
                 return true
             }
             guard ContinuousClock.now < deadline else { return false }
-            try? await Task.sleep(for: poll)
+            // A cancelled task cannot sleep: `Task.sleep` throws immediately.
+            // Swallowing that and going round again turns this poll into a
+            // full-speed spin for the rest of the timeout (measured: 8.2M
+            // iterations over a 2 s window), so cancellation reports as a
+            // timeout instead. `--selftest-latch-cancel` pins this down.
+            do { try await Task.sleep(for: poll) } catch { return false }
         }
     }
 }

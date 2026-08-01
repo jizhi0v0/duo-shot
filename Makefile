@@ -216,6 +216,7 @@ test: verify
 	run "preferences"            --selftest-preferences; \
 	run "selection zones"        --selftest-selection-zones; \
 	run "pixel mapping"          --selftest-pixel-mapping; \
+	run "latch cancellation"     --selftest-latch-cancel; \
 	run "settings window"        --selftest-settings-window $(TEST_OUT); \
 	run "settings tab resize"    --selftest-settings-resize; \
 	run "overlay lifecycle"      --selftest-lifecycle 10; \

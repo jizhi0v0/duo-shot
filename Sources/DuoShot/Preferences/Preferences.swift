@@ -168,6 +168,36 @@ final class Preferences {
         }
     }
 
+    /// Binds `combo` to `action`, taking it off whatever else held it. A nil
+    /// combo clears the action.
+    ///
+    /// Two actions holding one combo is not a state the app can honour: Carbon
+    /// registers a combo once, so `HotKeyManager.register` refuses the second
+    /// and that action silently does nothing. Writing straight into `hotkeys`
+    /// let the user create exactly that, and *which* action lost was decided by
+    /// Dictionary iteration order — i.e. it could change on the next launch.
+    /// Stealing is what System Settings does with its own duplicates, and it
+    /// leaves the loser visibly unbound in the list rather than dead.
+    ///
+    /// One assignment, so the `didSet` persists once.
+    func bind(_ combo: KeyCombo?, to action: HotKeyAction) {
+        var updated = hotkeys
+        guard let combo else {
+            updated.removeValue(forKey: action)
+            hotkeys = updated
+            return
+        }
+        for (other, existing) in updated where other != action && existing == combo {
+            updated.removeValue(forKey: other)
+            Log.hotkeys.notice("""
+                \(combo.displayString, privacy: .public) taken from \
+                \(other.rawValue, privacy: .public) by \(action.rawValue, privacy: .public)
+                """)
+        }
+        updated[action] = combo
+        hotkeys = updated
+    }
+
     /// Fires whenever a binding changes, so `AppDelegate` can re-register.
     @ObservationIgnored var onHotkeysChanged: (() -> Void)?
     /// Fires when the menu-bar icon setting changes.

@@ -168,11 +168,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Hotkeys
 
+    /// Registration order is `HotKeyAction.allCases`, not the dictionary's.
+    ///
+    /// `HotKeyManager.register` refuses a combo that is already bound, so with
+    /// two actions holding one combo exactly one of them wins — and iterating
+    /// `Preferences.hotkeys` directly meant *which* one varied from launch to
+    /// launch, because a Dictionary's order depends on its seed. Settings now
+    /// takes a duplicate off the other action (`Preferences.bind`), so this
+    /// should never have to arbitrate; a fixed order is what makes that
+    /// "should" verifiable rather than a hope.
     private func registerHotkeys() {
         let manager = HotKeyManager.shared
         manager.unregisterAll()
 
-        for (action, combo) in Preferences.shared.hotkeys {
+        let bindings = HotKeyAction.allCases.compactMap { action in
+            Preferences.shared.hotkeys[action].map { (action, $0) }
+        }
+        for (action, combo) in bindings {
             do {
                 try manager.register(action, combo: combo) { [weak self] in
                     Task { await self?.statusItem.perform(action) }
@@ -221,4 +233,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
+
+    // MARK: - Termination
+
+    /// Quitting mid-take must not cost the take.
+    ///
+    /// The status item offers Quit while a recording is running — deliberately,
+    /// since it is also the menu that offers Stop — and terminating there kills
+    /// the writer with the file unfinalised: an .mp4 with no moov atom, which is
+    /// as good as lost to most players. So the quit is deferred and the take is
+    /// ended through the coordinator's ordinary stop path, which finalises the
+    /// file, moves it to the save folder and marks it incomplete if it is.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard recorder.hasTakeInFlight else { return .terminateNow }
+
+        Log.app.notice("quit requested during a take; finalising before exit")
+        Task {
+            await recorder.settle()
+            replyToTermination()
+        }
+        // A quit that can never complete is worse than a lost recording, and
+        // this is a deadline nothing below it enforces end to end: the engine
+        // caps its own finalise at 15 s, so this only fires when something under
+        // that hangs. `.terminateLater` waits forever on its own.
+        Task {
+            try? await Task.sleep(for: .seconds(Self.terminationStopTimeout))
+            if !hasRepliedToTermination {
+                Log.app.error("""
+                    the recording did not finish within \
+                    \(Self.terminationStopTimeout, privacy: .public) s; quitting anyway
+                    """)
+            }
+            replyToTermination()
+        }
+        return .terminateLater
+    }
+
+    private static let terminationStopTimeout: Int = 20
+    private var hasRepliedToTermination = false
+
+    /// `reply(toApplicationShouldTerminate:)` is answered exactly once — the
+    /// stop and its deadline race, and both arrive.
+    private func replyToTermination() {
+        guard !hasRepliedToTermination else { return }
+        hasRepliedToTermination = true
+        NSApp.reply(toApplicationShouldTerminate: true)
+    }
 }

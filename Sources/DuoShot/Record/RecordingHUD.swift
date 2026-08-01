@@ -47,6 +47,9 @@ final class RecordingHUDView: NSView {
 
     private static let dotSize: CGFloat = 9
     private static let timeWidth: CGFloat = 46
+    /// The mic-off indicator's slot. Present only in the takes that need it —
+    /// see `microphoneOff`.
+    private static let micWidth: CGFloat = 16
     /// The clock's slot borrows the gap before the divider when it has to say
     /// "Starting…" instead of a time. The bar's width is fixed by then, so the
     /// word has to fit in the space the clock already had.
@@ -62,10 +65,17 @@ final class RecordingHUDView: NSView {
 
     /// One size for both phases, so nothing about the window changes when the
     /// take begins.
-    static var barSize: CGSize { CGSize(width: width, height: HUDMetrics.height) }
+    ///
+    /// `microphoneOff` is decided before the bar appears — `showStarting` runs
+    /// before `engine.start` — precisely so that it is *not* something that
+    /// changes when the take begins.
+    static func barSize(microphoneOff: Bool = false) -> CGSize {
+        CGSize(width: width(microphoneOff: microphoneOff), height: HUDMetrics.height)
+    }
 
-    static var width: CGFloat {
+    static func width(microphoneOff: Bool = false) -> CGFloat {
         HUDMetrics.margin + Self.dotSize + 8 + Self.timeWidth
+            + (microphoneOff ? Self.micWidth + HUDMetrics.gap : 0)
             + HUDMetrics.groupGap + 1 + HUDMetrics.groupGap
             + HUDPill.width(for: Self.stopTitle) + HUDMetrics.gap
             + HUDMetrics.iconWidth + HUDMetrics.margin
@@ -74,14 +84,19 @@ final class RecordingHUDView: NSView {
     private var callbacks = Callbacks()
     private let dot = NSView()
     private let timeLabel = NSTextField(labelWithString: "0:00")
+    private var micOffIcon: NSImageView?
     private var stopPill: HUDPill?
     private var discardButton: NSButton?
     private var timeOriginX: CGFloat = 0
     private var slowStartTimer: Timer?
+    /// The take asked for the microphone and did not get it. Fixed for the life
+    /// of the bar; it decides the bar's width.
+    private let microphoneOff: Bool
 
-    init(callbacks: Callbacks) {
+    init(callbacks: Callbacks, microphoneOff: Bool = false) {
         self.callbacks = callbacks
-        super.init(frame: CGRect(origin: .zero, size: Self.barSize))
+        self.microphoneOff = microphoneOff
+        super.init(frame: CGRect(origin: .zero, size: Self.barSize(microphoneOff: microphoneOff)))
         wantsLayer = true
         buildSubviews()
     }
@@ -108,7 +123,7 @@ final class RecordingHUDView: NSView {
 
         var x = HUDMetrics.margin
         dot.frame = CGRect(
-            x: x, y: ((Self.barSize.height - Self.dotSize) / 2).rounded(),
+            x: x, y: ((HUDMetrics.height - Self.dotSize) / 2).rounded(),
             width: Self.dotSize, height: Self.dotSize)
         dot.wantsLayer = true
         dot.layer?.backgroundColor = NSColor.systemRed.cgColor
@@ -126,7 +141,27 @@ final class RecordingHUDView: NSView {
         timeOriginX = x
         placeTimeLabel(width: Self.timeWidth)
         addSubview(timeLabel)
-        x += Self.timeWidth + HUDMetrics.groupGap
+        x += Self.timeWidth
+
+        // On the clock's side of the divider: it states something about the take
+        // itself, like the dot, rather than offering an action. The slot exists
+        // only when the take needs it — the bar is sized without it otherwise —
+        // because `RecordingEngine.start` drops an ungranted microphone silently
+        // and a log line is not a place the user will ever look.
+        if microphoneOff {
+            x += HUDMetrics.gap
+            let mic = NSImageView(frame: CGRect(
+                x: x, y: ((HUDMetrics.height - Self.micWidth) / 2).rounded(),
+                width: Self.micWidth, height: Self.micWidth))
+            mic.image = HUDMetrics.symbol("mic.slash.fill", pointSize: 12)
+            mic.contentTintColor = .secondaryLabelColor
+            mic.imageScaling = .scaleProportionallyDown
+            mic.toolTip = "Recording without the microphone — DuoShot has no microphone access"
+            addSubview(mic)
+            micOffIcon = mic
+            x += Self.micWidth
+        }
+        x += HUDMetrics.groupGap
 
         // Kept lit in both phases. It is part of the bar's shape rather than
         // one of its controls, and a rule that blinks out and back is one more
@@ -136,7 +171,7 @@ final class RecordingHUDView: NSView {
 
         let stop = HUDPill(title: Self.stopTitle, mark: .symbol("stop.fill"), tint: .systemRed)
         stop.setFrameOrigin(CGPoint(
-            x: x, y: ((Self.barSize.height - HUDMetrics.controlHeight) / 2).rounded()))
+            x: x, y: ((HUDMetrics.height - HUDMetrics.controlHeight) / 2).rounded()))
         stop.onClick = { [weak self] in self?.callbacks.stop() }
         stop.toolTip = "Stop and keep the recording"
         addSubview(stop)
@@ -144,7 +179,7 @@ final class RecordingHUDView: NSView {
         x += stop.frame.width + HUDMetrics.gap
 
         let discard = FirstMouseButton(frame: CGRect(
-            x: x, y: ((Self.barSize.height - HUDMetrics.controlHeight) / 2).rounded(),
+            x: x, y: ((HUDMetrics.height - HUDMetrics.controlHeight) / 2).rounded(),
             width: HUDMetrics.iconWidth, height: HUDMetrics.controlHeight))
         discard.bezelStyle = .accessoryBarAction
         discard.isBordered = false
@@ -175,6 +210,7 @@ final class RecordingHUDView: NSView {
         if animated {
             HUDMetrics.crossfade(timeLabel)
             if let discardButton { HUDMetrics.crossfade(discardButton) }
+            if let micOffIcon { HUDMetrics.crossfade(micOffIcon) }
         }
         switch phase {
         case .starting:
@@ -188,6 +224,7 @@ final class RecordingHUDView: NSView {
             stopPill?.setLive(false, animated: animated)
             discardButton?.isEnabled = false
             discardButton?.contentTintColor = .tertiaryLabelColor
+            micOffIcon?.contentTintColor = .tertiaryLabelColor
             scheduleSlowStartText()
         case .recording:
             HUDMetrics.fill(dot, with: .systemRed, animated: animated)
@@ -197,6 +234,7 @@ final class RecordingHUDView: NSView {
             stopPill?.setLive(true, animated: animated)
             discardButton?.isEnabled = true
             discardButton?.contentTintColor = .secondaryLabelColor
+            micOffIcon?.contentTintColor = .secondaryLabelColor
         }
     }
 
@@ -239,7 +277,7 @@ final class RecordingHUDView: NSView {
     private func placeTimeLabel(width: CGFloat) {
         let height = ceil(timeLabel.font?.boundingRectForFont.height ?? 18)
         timeLabel.frame = CGRect(
-            x: timeOriginX, y: ((Self.barSize.height - height) / 2).rounded(),
+            x: timeOriginX, y: ((HUDMetrics.height - height) / 2).rounded(),
             width: width, height: height)
     }
 
@@ -258,6 +296,15 @@ final class RecordingHUDView: NSView {
         // On the render server, like the marching ants: a Timer redrawing this
         // every frame would be measurable cost for the whole length of a take.
         dot.layer?.add(animation, forKey: "pulse")
+    }
+
+    /// The stream's verdict on the microphone, once there is a stream.
+    ///
+    /// Only ever *hides* a reserved slot: the bar's width was fixed when it
+    /// appeared, so an indicator that was not asked for at that point has
+    /// nowhere to go — see `barSize(microphoneOff:)`.
+    func setMicrophoneOff(_ off: Bool) {
+        micOffIcon?.isHidden = !off
     }
 
     func update(elapsed: TimeInterval) {
@@ -286,6 +333,9 @@ final class RecordingHUD {
     /// the selection toolbar did, so starting a take does not teleport it to the
     /// bottom of the screen.
     private var anchor: (rect: CGRect, screen: NSScreen)?
+    /// The take is running without the microphone it asked for. Read by
+    /// `placedFrame`, which has to agree with the face about how wide the bar is.
+    private var microphoneOff = false
 
     var onStop: () -> Void = {}
     var onDiscard: () -> Void = {}
@@ -303,14 +353,19 @@ final class RecordingHUD {
     /// `adopting` is the bar the selection was just using. Given one, nothing
     /// appears and nothing is dismissed: that window stays exactly where it is,
     /// swaps its controls, and narrows to the width the take needs.
+    /// `microphoneOff` is asked for here, before the stream exists, because it
+    /// changes the bar's width — and the one thing this bar must not do is
+    /// change width when the take begins.
     func showStarting(
         on screen: NSScreen?, under region: CGRect? = nil,
-        adopting handedOver: FloatingBarPanel? = nil, hiddenFromCapture: Bool = true
+        adopting handedOver: FloatingBarPanel? = nil, hiddenFromCapture: Bool = true,
+        microphoneOff: Bool = false
     ) {
         // A retried start re-enters here with the bar already up and already
         // grey. Replaying the entrance would make a retry — the one case the grey
         // phase exists to cover — flash.
         let isNew = panel == nil
+        if isNew { self.microphoneOff = microphoneOff }
         show(on: screen, elapsed: nil, adopting: handedOver,
              hiddenFromCapture: hiddenFromCapture)
         if let region, let screen = panel?.screen ?? screen {
@@ -342,7 +397,13 @@ final class RecordingHUD {
     /// Nothing moves and nothing resizes. The bar has been the size it will keep
     /// since it appeared, and a resize at this moment is what used to make the
     /// first second of a take read as a third, separate window.
-    func beginRecording(elapsed: @escaping () -> TimeInterval) {
+    ///
+    /// `microphoneOff` is the running stream's own answer. It can differ from
+    /// what `showStarting` predicted only across a retried start, where the
+    /// grant changed between attempts; the slot is already reserved either way,
+    /// so this decides what is drawn in it and never the width.
+    func beginRecording(elapsed: @escaping () -> TimeInterval, microphoneOff: Bool = false) {
+        view?.setMicrophoneOff(microphoneOff)
         view?.setPhase(.recording, animated: true)
         elapsedProvider = elapsed
         startTicker()
@@ -351,7 +412,7 @@ final class RecordingHUD {
     /// Where the bar belongs: under the recorded region when there is one, and
     /// otherwise centred on wherever it already sits.
     private func placedFrame() -> CGRect {
-        let size = RecordingHUDView.barSize
+        let size = RecordingHUDView.barSize(microphoneOff: microphoneOff)
         guard let panel else { return CGRect(origin: .zero, size: size) }
         let origin: CGPoint = if let anchor {
             HUDPlacement.origin(for: size, under: anchor.rect, on: anchor.screen)
@@ -369,13 +430,12 @@ final class RecordingHUD {
         hiddenFromCapture: Bool = true
     ) {
         guard panel == nil else { return }
-        let screen = screen ?? NSScreen.main ?? NSScreen.screens[0]
-        let size = RecordingHUDView.barSize
+        let size = RecordingHUDView.barSize(microphoneOff: microphoneOff)
 
         var callbacks = RecordingHUDView.Callbacks()
         callbacks.stop = { [weak self] in self?.onStop() }
         callbacks.discard = { [weak self] in self?.onDiscard() }
-        let view = RecordingHUDView(callbacks: callbacks)
+        let view = RecordingHUDView(callbacks: callbacks, microphoneOff: microphoneOff)
 
         let panel: FloatingBarPanel
         if let handedOver {
@@ -386,12 +446,21 @@ final class RecordingHUD {
             panel.assume(.recording)
             panel.setHiddenFromCapture(hiddenFromCapture)
         } else {
+            // `NSScreen.screens` is empty while every display is asleep and for
+            // the moment a clamshell close takes effect, so the `screens[0]`
+            // this used to fall through to was a trap on the path that runs at
+            // the start of every take. A take with no bar on it is survivable —
+            // the menu bar item still stops it — and a crash is not.
+            guard let home = screen ?? NSScreen.main ?? NSScreen.screens.first else {
+                Log.record.error("no screen to place the recording bar on; running without it")
+                return
+            }
             panel = FloatingBarPanel(
                 role: .recording, size: size,
                 usesGlass: !RecordingHUDView.debugFillsMagenta,
                 hiddenFromCapture: hiddenFromCapture)
             panel.setFrame(
-                CGRect(origin: HUDPlacement.origin(for: size, atBottomOf: screen), size: size),
+                CGRect(origin: HUDPlacement.origin(for: size, atBottomOf: home), size: size),
                 display: false)
             panel.orderFrontRegardless()
         }
@@ -434,6 +503,7 @@ final class RecordingHUD {
         ticker?.invalidate()
         ticker = nil
         elapsedProvider = nil
+        microphoneOff = false
         guard let panel else { return }
         self.panel = nil
         view = nil

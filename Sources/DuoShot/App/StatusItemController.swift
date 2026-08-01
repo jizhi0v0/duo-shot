@@ -5,9 +5,17 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private let coordinator: CaptureCoordinator
     private let recorder: RecordingCoordinator
-    private var lastOutput: OutputPipeline.Output?
-    private var lastRecording: OutputPipeline.RecordingOutput?
+    /// Just the URLs, not the `OutputPipeline.Output` they came in.
+    ///
+    /// That struct carries the whole `CaptureResult`, and with it the CGImage —
+    /// ~59 MB for one 5K screen, held for the rest of the session by a menu that
+    /// reads a last path component and reveals a file.
+    private var lastOutputURL: URL?
+    private var lastRecordingURL: URL?
     private var recordingTicker: Timer?
+    /// What `setHiddenFromCapture` was last told, so an item installed part-way
+    /// through a take is created in the state the take left the old one in.
+    private var isHiddenFromCapture = false
 
     var onOpenSettings: () -> Void = {}
 
@@ -17,14 +25,19 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         super.init()
     }
 
+    /// A fresh status item arrives capturable (`sharingType` defaults to
+    /// `.readOnly`), clockless and with an idle menu, so installing one during a
+    /// take — "Show menu bar icon" toggled off and back on mid-recording — used
+    /// to put the ticking timer back into the video that `setHiddenFromCapture`
+    /// exists to keep it out of. The running state is therefore re-applied here
+    /// rather than only on the next `refreshRecordingState`.
     func install() {
         guard statusItem == nil else { return }
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.image = NSImage(
-            systemSymbolName: "camera.viewfinder", accessibilityDescription: "DuoShot")
-        item.button?.image?.isTemplate = true
-        item.menu = buildMenu()
-        statusItem = item
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        setHiddenFromCapture(isHiddenFromCapture)
+        // Sets the image, the timer and the menu, for whichever state the
+        // recorder is actually in.
+        refreshRecordingState()
     }
 
     func remove() {
@@ -46,16 +59,17 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// left alone — it is deliberately capturable, and `--selftest-window`
     /// asserts as much.
     func setHiddenFromCapture(_ hidden: Bool) {
+        isHiddenFromCapture = hidden
         statusItem?.button?.window?.sharingType = hidden ? .none : .readOnly
     }
 
     func noteOutput(_ output: OutputPipeline.Output) {
-        lastOutput = output
+        lastOutputURL = output.url
         statusItem?.menu = buildMenu()
     }
 
     func noteRecording(_ output: OutputPipeline.RecordingOutput) {
-        lastRecording = output
+        lastRecordingURL = output.url
         statusItem?.menu = buildMenu()
     }
 
@@ -143,18 +157,18 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        if let lastRecording {
+        if let lastRecordingURL {
             let reveal = NSMenuItem(
-                title: "Show \"\(lastRecording.url.lastPathComponent)\" in Finder",
+                title: "Show \"\(lastRecordingURL.lastPathComponent)\" in Finder",
                 action: #selector(revealLastRecording), keyEquivalent: "")
             reveal.target = self
             menu.addItem(reveal)
             menu.addItem(.separator())
         }
 
-        if let lastOutput {
+        if let lastOutputURL {
             let reveal = NSMenuItem(
-                title: "Show \"\(lastOutput.url.lastPathComponent)\" in Finder",
+                title: "Show \"\(lastOutputURL.lastPathComponent)\" in Finder",
                 action: #selector(revealLast), keyEquivalent: "")
             reveal.target = self
             menu.addItem(reveal)
@@ -210,13 +224,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     @objc private func revealLastRecording() {
-        guard let lastRecording else { return }
-        OutputPipeline.shared.reveal(lastRecording.url)
+        guard let lastRecordingURL else { return }
+        OutputPipeline.shared.reveal(lastRecordingURL)
     }
 
     @objc private func revealLast() {
-        guard let lastOutput else { return }
-        OutputPipeline.shared.reveal(lastOutput.url)
+        guard let lastOutputURL else { return }
+        OutputPipeline.shared.reveal(lastOutputURL)
     }
 
     @objc private func openSaveFolder() {

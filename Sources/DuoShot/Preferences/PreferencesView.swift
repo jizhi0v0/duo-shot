@@ -235,11 +235,14 @@ struct ShortcutsSettingsView: View {
                             ShortcutRecorder(
                                 combo: combo,
                                 onRecord: { newCombo in
-                                    if let newCombo {
-                                        preferences.hotkeys[action] = newCombo
-                                    } else {
-                                        preferences.hotkeys.removeValue(forKey: action)
-                                    }
+                                    // `bind` rather than a write into `hotkeys`:
+                                    // a combo another action already holds is
+                                    // taken off it, so the two can never both
+                                    // claim it. The row above or below goes
+                                    // blank, which is the whole point — the
+                                    // alternative is a binding that looks set
+                                    // and never fires.
+                                    preferences.bind(newCombo, to: action)
                                     onHotkeysChanged()
                                 },
                                 onRecordingChanged: onRecordingChanged

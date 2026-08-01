@@ -27,7 +27,10 @@ enum ScreenPermission {
         let deadline = ContinuousClock.now.advanced(by: timeout)
         while ContinuousClock.now < deadline {
             if isGranted { return true }
-            try? await Task.sleep(for: .milliseconds(500))
+            // A cancelled task cannot sleep: `Task.sleep` throws immediately,
+            // and looping on that would poll TCC at full speed for the rest of
+            // the two minutes. Cancellation means nobody wants the answer.
+            do { try await Task.sleep(for: .milliseconds(500)) } catch { break }
         }
         return isGranted
     }

@@ -36,6 +36,13 @@ nonisolated enum RecordingError: Error, LocalizedError {
 final class ActiveRecording {
     let request: RecordingRequest
     let options: RecordingOptions
+    /// The take asked for the microphone and is running without it.
+    ///
+    /// `options` holds what the stream was actually built with, so the request
+    /// is otherwise unrecoverable once `start` has dropped it — and a silent
+    /// downgrade is the one failure the user cannot notice until the take is
+    /// over and the narration is missing. The HUD shows it.
+    let microphoneDenied: Bool
     let pointSize: CGSize
     let pixelSize: CGSize
     let scale: CGFloat
@@ -48,11 +55,13 @@ final class ActiveRecording {
 
     fileprivate init(
         session: SCKRecordingSession, request: RecordingRequest, options: RecordingOptions,
-        pointSize: CGSize, pixelSize: CGSize, scale: CGFloat, sourceDescription: String
+        microphoneDenied: Bool, pointSize: CGSize, pixelSize: CGSize, scale: CGFloat,
+        sourceDescription: String
     ) {
         self.session = session
         self.request = request
         self.options = options
+        self.microphoneDenied = microphoneDenied
         self.pointSize = pointSize
         self.pixelSize = pixelSize
         self.scale = scale
@@ -95,6 +104,17 @@ final class RecordingEngine {
 
     // MARK: - Start
 
+    /// Whether a take built from these options will run without the microphone
+    /// it asked for.
+    ///
+    /// `start` settles this question below, and this is the same predicate — but
+    /// the answer is needed before the stream exists, because the HUD is on
+    /// screen by then and has to be laid out for the mic-off indicator. One
+    /// predicate rather than two readings of the TCC status that could disagree.
+    static func microphoneWillBeDropped(_ options: RecordingOptions) -> Bool {
+        options.capturesMicrophone && !MicrophonePermission.isGranted
+    }
+
     func start(
         _ request: RecordingRequest,
         options: RecordingOptions = .default,
@@ -116,7 +136,8 @@ final class RecordingEngine {
         // outcome than a take that never starts, so this degrades rather than
         // fails — the Settings toggle is where the user is actually asked.
         var options = options
-        if options.capturesMicrophone, !MicrophonePermission.isGranted {
+        let microphoneDenied = Self.microphoneWillBeDropped(options)
+        if microphoneDenied {
             Log.record.error("""
                 microphone requested but the grant is \
                 \(MicrophonePermission.statusDescription, privacy: .public); \
@@ -209,8 +230,29 @@ final class RecordingEngine {
         // was waiting on a first frame that a still screen never produced
         // (`SCFrameStatusIdle` is a documented state, so no frame is a thing
         // that happens).
-        guard try await session.writerStarted.wait(timeout: .seconds(5)) else {
-            _ = try? await session.stop()
+        // `wait` *throws* when the writer reported a startup error — and by
+        // then `startCapture` has already returned, so the stream is live.
+        // Both exits must stop the session: an error that skipped the teardown
+        // would leave an SCStream capturing with no `active` handle to stop
+        // it by.
+        //
+        // And both must delete the file, as `cancel()` does. A start that
+        // throws hands the caller no recording, so nothing will ever finish or
+        // reveal this URL — but the writer may already have put a header on
+        // disk, and a retried start reserves a *new* name, so every failed
+        // attempt would otherwise leave an unopenable stub in staging with
+        // nobody left holding a reference to it.
+        let writerStarted: Bool
+        do {
+            writerStarted = try await session.writerStarted.wait(timeout: .seconds(5))
+        } catch {
+            _ = await session.stop()
+            try? FileManager.default.removeItem(at: url)
+            throw error
+        }
+        guard writerStarted else {
+            _ = await session.stop()
+            try? FileManager.default.removeItem(at: url)
             throw RecordingError.writerNeverStarted
         }
         let writerLatency = captureStarted.duration(to: .now).milliseconds
@@ -221,6 +263,7 @@ final class RecordingEngine {
             session: session,
             request: request,
             options: options,
+            microphoneDenied: microphoneDenied,
             pointSize: region.size,
             pixelSize: CGSize(width: pixelSize.width, height: pixelSize.height),
             scale: scale,
@@ -364,7 +407,7 @@ final class RecordingEngine {
     func cancel() async {
         guard let recording = active else { return }
         active = nil
-        _ = try? await recording.session.stop()
+        _ = await recording.session.stop()
         try? FileManager.default.removeItem(at: recording.url)
         Log.record.notice("recording cancelled and discarded")
     }

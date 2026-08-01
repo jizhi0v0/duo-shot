@@ -46,6 +46,9 @@ enum SelfTest {
         /// second display introduces. Headless, and the only way to test them on
         /// a one-screen machine.
         case pixelMapping
+        /// A cancelled task polling `SCKLatch.wait` must give up promptly, not
+        /// spin at full speed until the deadline. Headless.
+        case latchCancel
         /// Opens the real Settings window and captures it, so the SwiftUI layout
         /// can actually be looked at.
         case settingsWindow(directory: URL)
@@ -127,6 +130,8 @@ enum SelfTest {
                 self = .selectionZones
             case "--selftest-pixel-mapping":
                 self = .pixelMapping
+            case "--selftest-latch-cancel":
+                self = .latchCancel
             case "--selftest-hud-appearance":
                 FloatingBarPanel.usesSharingTypeNone = false
                 self = .hudAppearance(
@@ -270,6 +275,7 @@ enum SelfTest {
             case .preferences: return preferencesCheck()
             case .selectionZones: return selectionZonesCheck()
             case .pixelMapping: return pixelMappingCheck()
+            case .latchCancel: return await latchCancelCheck()
             case .settingsWindow(let directory): return try await settingsWindow(into: directory)
             case .settingsResize: return try await settingsResize()
             case .lifecycle(let iterations): return try await lifecycle(iterations: iterations)
@@ -1915,6 +1921,20 @@ enum SelfTest {
         for line in hud.debugSubviewFrames { print("    hud: \(line)") }
         hud.hide()
 
+        // The same bar for a take whose microphone was refused. It is the only
+        // way this state is ever looked at: producing it for real needs the TCC
+        // grant to be missing, which no test can arrange. The slot is added at
+        // `showStarting` — the bar cannot widen once it is up — so a wrong width
+        // here shows as a clipped or floating indicator rather than as a crash.
+        let micOff = RecordingHUD()
+        micOff.showStarting(on: screen, under: anchor, microphoneOff: true)
+        micOff.beginRecording(elapsed: { 754 }, microphoneOff: true)
+        try await Task.sleep(for: .milliseconds(350))
+        guard let micOffFrame = micOff.frameForTest else { return 1 }
+        try await shoot("hud-recording-mic-off", frame: micOffFrame)
+        for line in micOff.debugSubviewFrames { print("    mic: \(line)") }
+        micOff.hide()
+
         let toolbar = SelectionToolbar()
         toolbar.show(under: anchor, on: screen)
         guard let bar = toolbar.frameForTest else { return 1 }
@@ -1943,6 +1963,16 @@ enum SelfTest {
         if !starting.equalTo(running) {
             failures.append("the bar changed shape when the take started: "
                 + "\(rectString(starting)) -> \(rectString(running))")
+        }
+        // The mic-off bar is the same bar with one more thing in it: same
+        // height, same top edge, and wider — an indicator squeezed into the
+        // width the clock already had would overlap the divider.
+        if abs(micOffFrame.height - running.height) >= 0.5
+            || abs(micOffFrame.maxY - running.maxY) >= 0.5 {
+            failures.append("the mic-off bar is placed differently: \(rectString(micOffFrame))")
+        }
+        if micOffFrame.width <= running.width {
+            failures.append("the mic-off bar made no room for the indicator")
         }
         print("placement:     anchor \(rectString(anchor))")
         print("               toolbar \(rectString(bar))")
@@ -2104,6 +2134,54 @@ enum SelfTest {
               "the centre of a 160 pt patch is the centre of its image")
         check(CGPoint(x: 0, y: 0), pixel(CGPoint(x: 784, y: 639), in: patch, scale: 2),
               "and its top-left corner is pixel 0,0")
+
+        print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.count) of the above")")
+        return failures.isEmpty ? 0 : 1
+    }
+
+    // MARK: - Latch cancellation
+
+    /// `SCKLatch.wait` polls with `Task.sleep`, and a cancelled task cannot
+    /// sleep — the sleep throws immediately. If the loop swallowed that and
+    /// went round again, the poll would degenerate into a full-speed spin for
+    /// the rest of the timeout: a whole core burnt for up to 15 s on a stop,
+    /// 120 s on a permission wait. So cancellation must read as a timeout,
+    /// promptly.
+    ///
+    /// Reverse control: put `try? await Task.sleep` back in `wait` and the
+    /// cancelled case below runs to its full 3 s deadline instead of returning
+    /// at once — the elapsed-time assertion goes red.
+    private static func latchCancelCheck() async -> Int32 {
+        var failures: [String] = []
+        func check(_ condition: Bool, _ description: String) {
+            print("  \(condition ? "ok  " : "FAIL") \(description)")
+            if !condition { failures.append(description) }
+        }
+
+        // Positive controls first: the latch still does its actual job.
+        let opened = SCKLatch()
+        opened.signal()
+        check((try? await opened.wait(timeout: .seconds(1))) == true,
+              "a signalled latch reports true")
+
+        struct Boom: Error {}
+        let failed = SCKLatch()
+        failed.signal(Boom())
+        var threw = false
+        do { _ = try await failed.wait(timeout: .seconds(1)) } catch { threw = true }
+        check(threw, "a latch signalled with an error throws")
+
+        // The case under test: cancelled while waiting on a latch that never
+        // opens. Must come back long before the 3 s deadline, reporting timeout.
+        let never = SCKLatch()
+        let started = ContinuousClock.now
+        let waiter = Task { try? await never.wait(timeout: .seconds(3)) }
+        waiter.cancel()
+        let result = await waiter.value
+        let elapsed = started.duration(to: .now)
+        check(result == false, "a cancelled wait reports timeout, not success")
+        check(elapsed < .seconds(1),
+              "and returns promptly (\(elapsed.milliseconds) ms of a 3000 ms deadline)")
 
         print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.count) of the above")")
         return failures.isEmpty ? 0 : 1
@@ -3579,6 +3657,37 @@ enum SelfTest {
             failures.append("settings did not persist to UserDefaults")
         }
 
+        // 5. Duplicate combos. Carbon registers a combo once, so two actions
+        // holding one means the second registration is refused and that action
+        // silently never fires — and which of the two lost was decided by
+        // Dictionary iteration order, i.e. it could change from launch to
+        // launch. Recording a combo must therefore take it off whoever held it.
+        // The user's real bindings are restored at the end of the block.
+        let originalHotkeys = preferences.hotkeys
+        let contested = KeyCombo(keyCode: UInt16(kVK_ANSI_6), modifiers: [.shift, .command])
+        let bystander = KeyCombo(keyCode: UInt16(kVK_ANSI_7), modifiers: [.shift, .command])
+        preferences.hotkeys = [:]
+        preferences.bind(bystander, to: .captureWindow)
+        preferences.bind(contested, to: .captureArea)
+        preferences.bind(contested, to: .recordArea)
+        let holders = HotKeyAction.allCases.filter { preferences.hotkeys[$0] == contested }
+        print("steal:         \(contested.displayString) held by "
+            + "\(holders.isEmpty ? "<nobody>" : holders.map(\.rawValue).joined(separator: ", "))")
+        if holders != [.recordArea] {
+            failures.append("\(contested.displayString) is claimed by \(holders.count) actions")
+        }
+        if preferences.hotkeys[.captureWindow] != bystander {
+            failures.append("stealing a combo disturbed an unrelated binding")
+        }
+        preferences.bind(nil, to: .recordArea)
+        if preferences.hotkeys[.recordArea] != nil {
+            failures.append("clearing a binding left it in place")
+        }
+        if preferences.hotkeys[.captureWindow] != bystander {
+            failures.append("clearing a binding took another one with it")
+        }
+        preferences.hotkeys = originalHotkeys
+
         failures.append(contentsOf: loginItemChecks(preferences))
         return report(failures)
     }
@@ -4051,6 +4160,28 @@ enum SelfTest {
         check(!FileManager.default.fileExists(atPath: discarded?.path ?? "/nonexistent"),
               "discard deleted the file")
 
+        // --- a trigger arriving during the finalise -------------------------
+        // `stop` hands control back for as long as the writer takes to close the
+        // file, which is seconds for a long take. The state used to read `.idle`
+        // for that whole window, so a hotkey landing in it walked past the guard
+        // in `perform` and built a second stream on top of one still tearing
+        // down.
+        await recorder.perform(.recordFullscreen)
+        check(recorder.isRecording, "a third recording started")
+        try await Task.sleep(for: .seconds(1))
+        let stopping = Task { await recorder.stop() }
+        // Lets `stop` run as far as its first suspension, which is inside the
+        // finalise. If the scheduler hands control back before it gets there the
+        // trigger below simply acts as the toggle it is, and every assertion
+        // still holds — the state is never `.idle` with a live take either way.
+        await Task.yield()
+        check(recorder.hasTakeInFlight, "the take counts as in flight while it finalises")
+        await recorder.perform(.recordFullscreen)
+        check(!recorder.isRecording, "a trigger during the finalise started nothing")
+        await stopping.value
+        check(!recorder.hasTakeInFlight, "the finalise finished and the state is idle again")
+        check(outputs.count == 2, "the third take produced one more output (got \(outputs.count))")
+
         print("result:        \(failures.isEmpty ? "PASS" : "FAIL — " + failures.joined(separator: "; "))")
         return failures.isEmpty ? 0 : 1
     }
@@ -4073,7 +4204,7 @@ enum SelfTest {
     /// nothing at all.
     /// A plain magenta window, as ordinary as AppKit allows.
     private static func makePlainMagentaWindow(on screen: NSScreen?) -> NSWindow {
-        let size = RecordingHUDView.barSize
+        let size = RecordingHUDView.barSize()
         let target = screen ?? NSScreen.main ?? NSScreen.screens[0]
         let window = NSWindow(
             contentRect: CGRect(

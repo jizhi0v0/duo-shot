@@ -20,6 +20,8 @@ final class ShortcutRecorderView: NSView {
         didSet { needsDisplay = true }
     }
     private var monitor: Any?
+    /// Lives exactly as long as the armed state does — see `beginRecording`.
+    private var closeObserver: (any NSObjectProtocol)?
 
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -46,6 +48,20 @@ final class ShortcutRecorderView: NSView {
             guard let self, self.isRecording else { return event }
             return self.handle(event)
         }
+
+        // Closing Settings while armed is the one exit that reaches none of the
+        // others. The window is `isReleasedWhenClosed = false` and the
+        // controller holds it, so `close()` only orders it out: the view stays
+        // in a live hierarchy, keeps first-responder status and never sees
+        // `viewWillMove(toWindow:)`. Without this the bindings released above
+        // stay released for the rest of the session.
+        if let window {
+            closeObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification, object: window, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.endRecording() }
+            }
+        }
     }
 
     private func endRecording() {
@@ -53,6 +69,8 @@ final class ShortcutRecorderView: NSView {
         isRecording = false
         if let monitor { NSEvent.removeMonitor(monitor) }
         monitor = nil
+        if let closeObserver { NotificationCenter.default.removeObserver(closeObserver) }
+        closeObserver = nil
         onRecordingChanged?(false)
     }
 
@@ -89,6 +107,21 @@ final class ShortcutRecorderView: NSView {
     override func resignFirstResponder() -> Bool {
         endRecording()
         return true
+    }
+
+    /// Being taken out of the window ends the recording too.
+    ///
+    /// Every other way out — a keypress, Esc, a click, resigning first responder
+    /// — needs this view to still be in a live hierarchy, and an armed recorder
+    /// that disappears leaves `onRecordingChanged(true)` unanswered: every
+    /// global binding then stays unregistered for the rest of the session,
+    /// because `AppDelegate` only re-registers them when this says it stopped.
+    ///
+    /// This does NOT cover the Settings window merely closing — that window is
+    /// `isReleasedWhenClosed = false` and keeps its views. See `beginRecording`.
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if newWindow == nil { endRecording() }
     }
 
     // MARK: - Drawing
