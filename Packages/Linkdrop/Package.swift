@@ -7,8 +7,11 @@ let package = Package(
     // the least platform-specific thing in a screenshot tool -- URLSession, the
     // Keychain and ImageIO have all been stable for a decade -- and pinning it
     // to the host app's macOS 26 floor would make it unusable to everyone else
-    // for no technical reason.
-    platforms: [.macOS(.v13), .iOS(.v16)],
+    // for no technical reason. The floor that IS here is a technical one:
+    // `AVAssetExportSession.export(to:as:)`, which the faststart remux uses
+    // because its predecessor is deprecated and cannot be called from Swift 6
+    // concurrency without a warning, arrived in macOS 15 / iOS 18.
+    platforms: [.macOS(.v15), .iOS(.v18)],
     products: [
         .library(name: "Linkdrop", targets: ["Linkdrop"])
     ],

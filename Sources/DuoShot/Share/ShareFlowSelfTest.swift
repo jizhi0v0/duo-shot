@@ -149,10 +149,14 @@ enum ShareFlowSelfTest {
         check("history has every successful upload",
               created.allSatisfy(history.contains), "history=\(history.count) created=\(created.count)")
 
-        let menu = StatusItemController(
+        // Held in a local for the duration of the checks: menu items point back
+        // at their controller weakly, so inspecting the menu of an
+        // already-deallocated controller would be checking rows whose targets
+        // are gone -- and the compiler rightly warned about exactly that.
+        let statusController = StatusItemController(
             coordinator: CaptureCoordinator(),
-            recorder: RecordingCoordinator(overlay: OverlayController())
-        ).menuForTest()
+            recorder: RecordingCoordinator(overlay: OverlayController()))
+        let menu = statusController.menuForTest()
         let recent = menu.items.first { $0.title == "Recent Links" }
         check("menu bar has a Recent Links submenu", recent != nil)
         if let submenu = recent?.submenu {
@@ -163,6 +167,7 @@ enum ShareFlowSelfTest {
             check("each row has an ⌥ delete alternate", deletable.count == copyable.count,
                   "\(deletable.count) alternates for \(copyable.count) rows")
         }
+        withExtendedLifetime(statusController) {}
 
         // MARK: - Put the bucket back
 

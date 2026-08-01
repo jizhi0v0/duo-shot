@@ -92,23 +92,18 @@ public enum MP4Layout {
             .appendingPathComponent("linkdrop-faststart-\(UUID().uuidString.prefix(8))")
             .appendingPathExtension(url.pathExtension.isEmpty ? "mp4" : url.pathExtension)
 
-        session.outputURL = destination
-        session.outputFileType = url.pathExtension.lowercased() == "mov" ? .mov : .mp4
         // The whole point.
         session.shouldOptimizeForNetworkUse = true
 
-        let succeeded = await withCheckedContinuation { continuation in
-            session.exportAsynchronously {
-                continuation.resume(returning: session.status == .completed)
-            }
-        }
-
-        guard succeeded else {
+        do {
+            try await session.export(
+                to: destination, as: url.pathExtension.lowercased() == "mov" ? .mov : .mp4)
+            return destination
+        } catch {
             LinkdropLog.gate.notice(
                 "faststart remux failed; uploading the original as recorded")
             try? FileManager.default.removeItem(at: destination)
             return nil
         }
-        return destination
     }
 }

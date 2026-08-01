@@ -316,19 +316,37 @@ nonisolated final class SCKRecordingSession: NSObject, @unchecked Sendable,
         }
 
         let started = SCKLatch()
-        stream.startCapture { error in started.signal(error) }
+        begin(stream, signaling: started)
 
         guard try await started.wait(timeout: timeout) else {
             // Tear the half-started stream down, or it keeps writing to a file
             // nobody is holding a handle to.
             lock.withLock { isStopping = true }
-            stream.stopCapture { _ in }
+            stopAndForget(stream)
             lock.withLock {
                 self.stream = nil
                 self.recordingOutput = nil
             }
             throw CaptureError.recordingStartTimedOut(timeout.seconds)
         }
+    }
+
+    /// The completion-handler form of `startCapture` is the point, not an
+    /// oversight: the async alternative is precisely the unbounded await that
+    /// the deadline in `start` exists to avoid (see the measurement above --
+    /// with the microphone grant undecided, the answer never comes). Called
+    /// through a synchronous method because the compiler only suggests the
+    /// async form from async contexts, and the suggestion is declined.
+    private func begin(_ stream: SCStream, signaling latch: SCKLatch) {
+        stream.startCapture { error in latch.signal(error) }
+    }
+
+    /// Fire-and-forget teardown for a stream whose start was already given up
+    /// on. Same reason as `begin` for taking the completion-handler form: there
+    /// is nothing to await -- whatever `stopCapture` has to say, the caller has
+    /// already thrown.
+    private func stopAndForget(_ stream: SCStream) {
+        stream.stopCapture { _ in }
     }
 
     /// Live counters, safe to poll from the HUD's timer.
