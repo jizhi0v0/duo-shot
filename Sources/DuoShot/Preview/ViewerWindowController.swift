@@ -1,4 +1,3 @@
-import AVKit
 import AppKit
 
 /// DuoShot's own window for looking at a capture.
@@ -37,6 +36,12 @@ final class ViewerWindowController {
     /// one would also have to know when there is nothing to find.
     var onImageRedacted: ((URL, NSImage) -> Void)?
 
+    /// The same for a recording that has been trimmed: the URL, and a poster
+    /// frame decoded from the file as it is now. Separate from the still's hook
+    /// rather than one "edited" callback, because the two are wired to the same
+    /// place today and there is no reason a card must always treat them alike.
+    var onVideoTrimmed: ((URL, NSImage) -> Void)?
+
     func show(_ entry: PreviewEntry) {
         if let existing = windows[entry.url] {
             bringToFront(existing)
@@ -74,7 +79,7 @@ final class ViewerWindowController {
         // Space plays and pauses a recording, and the arrow keys step it — but
         // only while AVPlayerView holds the keyboard, and it does not take it on
         // its own.
-        window.initialFirstResponder = content.view
+        window.initialFirstResponder = content.keyView ?? content.view
         place(window, onDisplay: entry.sourceDisplayID)
 
         windows[entry.url] = window
@@ -99,9 +104,8 @@ final class ViewerWindowController {
         // player is still running keeps decoding audio into a window nobody can
         // see — the file is a screen recording, so that is a real possibility
         // rather than a theoretical one.
-        if let window = windows.removeValue(forKey: url),
-           let player = (window.contentView as? AVPlayerView)?.player {
-            player.pause()
+        if let window = windows.removeValue(forKey: url) {
+            (window.contentView as? VideoTrimEditor)?.playerView.player?.pause()
         }
     }
 
@@ -120,6 +124,10 @@ final class ViewerWindowController {
         var view: NSView
         /// The size the window should open at, in points.
         var size: CGSize
+        /// What the window should hand the keyboard to, when that is not the
+        /// content view itself: a recording's player is inside a container now,
+        /// and Space and the arrow keys are the player's, not the container's.
+        var keyView: NSView?
         /// Run once the window is on screen. Playback starts here rather than at
         /// build time so the first frame is not decoded into an unmapped window.
         var onShown: (() -> Void)?
@@ -142,19 +150,15 @@ final class ViewerWindowController {
     /// answer — it chose the frame size — and a viewer that opens at the right
     /// size immediately is worth more than one that re-derives it.
     private func videoContent(for url: URL, pointSize: CGSize) -> Content? {
-        let view = AVPlayerView()
-        let player = AVPlayer(playerItem: AVPlayerItem(asset: AVURLAsset(url: url)))
-        view.player = player
-        // `.inline` rather than `.floating`: floating controls are the
-        // full-screen player chrome, which fades out and takes the scrubber with
-        // it. In a window this size the scrubber is the whole point.
-        view.controlsStyle = .inline
-        view.videoGravity = .resizeAspect
-        view.showsFullScreenToggleButton = true
-
         let size = pointSize.width >= 1 && pointSize.height >= 1
             ? pointSize
             : CGSize(width: 960, height: 540)
+        let editor = VideoTrimEditor(
+            url: url, frame: CGRect(origin: .zero, size: fitted(size)))
+        editor.onTrimmed = { [weak self] poster in
+            self?.onVideoTrimmed?(url, poster)
+        }
+
         // Exactly the video's aspect, with no allowance for the transport
         // controls. Reserving 40 pt for them was the obvious guess and it was
         // wrong: `.inline` controls are an auto-hiding overlay over the bottom of
@@ -162,7 +166,9 @@ final class ViewerWindowController {
         // bought nothing but a black band above and below the video. Caught by
         // looking at `--selftest-viewer`'s screenshot; every number in that test
         // was green.
-        return Content(view: view, size: fitted(size), onShown: { player.play() })
+        return Content(
+            view: editor, size: fitted(size), keyView: editor.playerView,
+            onShown: { editor.play() })
     }
 
     private func imageContent(for url: URL) -> Content? {
@@ -251,6 +257,10 @@ final class ViewerWindowController {
 
     func editorForTest(_ url: URL) -> RedactionEditor? {
         windows[url]?.contentView as? RedactionEditor
+    }
+
+    func trimEditorForTest(_ url: URL) -> VideoTrimEditor? {
+        windows[url]?.contentView as? VideoTrimEditor
     }
 }
 

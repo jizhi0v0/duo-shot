@@ -97,6 +97,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ViewerWindowController.shared.onImageRedacted = { [weak self] url, thumbnail in
             self?.previews.refreshThumbnail(thumbnail, for: url)
         }
+        // And the same for a trim, which replaces the recording the card's poster
+        // frame was taken from. The card's duration pill is left as it was: it is
+        // built once at card time and the card is a six-second affordance over a
+        // file that has already changed.
+        ViewerWindowController.shared.onVideoTrimmed = { [weak self] url, poster in
+            self?.previews.refreshThumbnail(poster, for: url)
+        }
         recorder.onRecordingLost = { [weak self] error in
             self?.reportRecordingLost(error)
         }

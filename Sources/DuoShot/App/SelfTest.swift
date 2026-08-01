@@ -41,6 +41,9 @@ enum SelfTest {
         /// Redaction, image in and image out: the point-to-pixel mapping at 2×,
         /// and whether the bytes under a rectangle are really gone.
         case redact(directory: URL)
+        /// Trimming a recording: whether the export, the swap and the reload
+        /// leave one shorter file where the long one was.
+        case trim(directory: URL)
         /// Window-picker hit-testing, filtering and window capture geometry.
         case windowMode(directory: URL)
         /// Fullscreen capture with `includeMenuBar` both ways.
@@ -282,6 +285,8 @@ enum SelfTest {
                     directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-redact":
                 self = .redact(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
+            case "--selftest-trim":
+                self = .trim(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-viewer":
                 self = .viewer(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-preview":
@@ -324,6 +329,7 @@ enum SelfTest {
                 return try await previewStack(count: count, into: directory)
             case .viewer(let directory): return try await viewerWindow(into: directory)
             case .redact(let directory): return try await redactCheck(into: directory)
+            case .trim(let directory): return try await trimCheck(into: directory)
             case .windowMode(let directory): return try await windowMode(into: directory)
             case .fullscreen(let directory): return try await fullscreenMode(into: directory)
             case .preferences: return preferencesCheck()
@@ -2494,8 +2500,14 @@ enum SelfTest {
             if !videoAspectOK {
                 failures.append("recording window aspect \(gotVideo) != video aspect \(wantedVideo)")
             }
-            if !(videoWindow.contentView is AVPlayerView) {
-                failures.append("recording window is not an AVPlayerView")
+            // The player is inside the trim editor now, so the content view is
+            // the container; what matters is still that a real AVPlayerView is
+            // what fills the window.
+            if !(videoWindow.contentView is VideoTrimEditor) {
+                failures.append("recording window is not a VideoTrimEditor")
+            }
+            if !(videoWindow.initialFirstResponder is AVPlayerView) {
+                failures.append("recording window does not hand the keyboard to the player")
             }
         } else {
             failures.append("no window for the recording")
@@ -2710,6 +2722,144 @@ enum SelfTest {
 
         print("result:        \(failures == 0 ? "PASS" : "FAIL (\(failures))")")
         return failures == 0 ? 0 : 1
+    }
+
+    /// Trimming a recording: the export, the replace, and what is left behind.
+    ///
+    /// Drives `VideoTrimEditor.trimForTest` rather than the handles, because the
+    /// handles are AVKit's — `beginTrimming` blocks on a person dragging them,
+    /// and a test that could drive that would be testing the system's UI. What
+    /// belongs to DuoShot starts at the range and ends at the file, and that is
+    /// exactly the span checked here.
+    ///
+    /// Against a real recording rather than a synthetic asset: the thing most
+    /// likely to break is the interaction between a passthrough export and what
+    /// `RecordingEngine` actually writes — keyframe spacing, the container, the
+    /// `moov` position — and none of that survives being faked.
+    private static func trimCheck(into directory: URL) async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+
+        var failures: [String] = []
+        func check(_ label: String, _ passed: Bool, _ detail: String = "") {
+            print("  \(passed ? "PASS" : "FAIL") \(label)\(detail.isEmpty ? "" : " — \(detail)")")
+            if !passed { failures.append(label) }
+        }
+
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        let displayID = ScreenIndex.screenUnderMouse().flatMap(ScreenIndex.displayID(of:))
+            ?? CGMainDisplayID()
+
+        let clip = directory.appendingPathComponent("trim-clip.mp4")
+        try? FileManager.default.removeItem(at: clip)
+        let recorder = RecordingEngine()
+        var options = RecordingOptions.default
+        options.capturesSystemAudio = false
+        _ = try await recorder.start(
+            .area(displayID: displayID, rectInAppKitGlobal:
+                    CGRect(x: 200, y: 200, width: 640, height: 360)),
+            options: options, to: clip)
+        try await Task.sleep(for: .seconds(5))
+        let recording = try await recorder.stop()
+
+        let before = CMTimeGetSeconds(
+            (try? await AVURLAsset(url: recording.url).load(.duration)) ?? .zero)
+        let sizeBefore = fileSize(recording.url)
+        print("recorded:      \(recording.url.lastPathComponent) "
+            + String(format: "%.2fs, %d bytes", before, sizeBefore))
+        guard before > 3 else {
+            print("result:        INCONCLUSIVE — the take is too short to trim")
+            return 0
+        }
+
+        let viewer = ViewerWindowController.shared
+        viewer.activatesOnShow = false
+        defer { viewer.closeAll() }
+        var posterURL: URL?
+        viewer.onVideoTrimmed = { url, _ in posterURL = url }
+
+        let poster = await VideoPoster.frame(for: recording.url) ?? VideoPoster.placeholder()
+        let entry = PreviewEntry(
+            OutputPipeline.RecordingOutput(result: recording, url: recording.url, wasSaved: false),
+            poster: poster)
+        viewer.show(entry)
+        try await Task.sleep(for: .milliseconds(600))
+
+        guard let editor = viewer.trimEditorForTest(recording.url) else {
+            print("result:        FAIL — the recording did not open in a trim editor")
+            return 1
+        }
+
+        // MARK: the cut
+
+        // A range that touches neither end, so a trim that silently did nothing
+        // and one that kept the head or the tail are all distinguishable from a
+        // trim that worked.
+        let wanted = CMTimeRange(
+            start: CMTime(seconds: 1, preferredTimescale: 600),
+            end: CMTime(seconds: 3, preferredTimescale: 600))
+        editor.trimForTest(wanted)
+        for _ in 0..<200 where editor.isExportingForTest {
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        check("the export finished", !editor.isExportingForTest)
+
+        let after = CMTimeGetSeconds(
+            (try? await AVURLAsset(url: recording.url).load(.duration)) ?? .zero)
+        print("trimmed:       " + String(format: "%.2fs -> %.2fs", before, after))
+
+        // Generously bounded, and deliberately not an equality. A passthrough
+        // export cuts on sync frames, so the result is allowed to start earlier
+        // than asked and therefore to run longer than the two seconds requested;
+        // what must not happen is the whole take surviving.
+        check("shorter than the take", after < before - 0.5,
+              String(format: "%.2fs", after))
+        check("about the requested span", after >= 1.5 && after <= before - 0.5,
+              String(format: "%.2fs for a 2.00s request", after))
+        check("the file was replaced in place, not renamed",
+              FileManager.default.fileExists(atPath: recording.url.path))
+        // Not "smaller", which this cannot promise: a screen that does not move
+        // costs almost nothing per second, so the seconds thrown away can weigh
+        // nothing at all — measured, a 5s take of a still desktop and its own
+        // middle two seconds came out within bytes of each other. What can be
+        // promised is that a cut never *adds* media, and the slack is the
+        // container's own index moving to the front.
+        check("no larger on disk", fileSize(recording.url) <= sizeBefore + 4096,
+              "\(fileSize(recording.url)) vs \(sizeBefore) bytes")
+
+        // MARK: what it left behind
+
+        // The export writes a dot-prefixed sibling and swaps it in. One left
+        // lying next to the recording is a whole second copy of a take the user
+        // asked to make shorter.
+        let strays = (try? FileManager.default.contentsOfDirectory(
+            atPath: directory.path))?.filter { $0.hasPrefix(".duoshot-trim-") } ?? []
+        check("no temporary file left beside it", strays.isEmpty, strays.joined(separator: ", "))
+
+        // The link path re-checks this and would remux again at upload time, so
+        // a trimmed file that lost its front `moov` costs the whole file's worth
+        // of work twice.
+        let fastStart = MP4Layout.isFastStart(recording.url)
+        check("still faststart", fastStart != false,
+              fastStart.map { $0 ? "moov first" : "moov at the end" } ?? "not parseable")
+
+        // MARK: the window
+
+        check("the card was told", posterURL == recording.url,
+              posterURL?.lastPathComponent ?? "no callback")
+        let reloaded = CMTimeGetSeconds(
+            editor.playerView.player?.currentItem?.duration ?? .zero)
+        check("the player reloaded the trimmed file", abs(reloaded - after) < 0.2,
+              String(format: "player says %.2fs, file says %.2fs", reloaded, after))
+
+        for failure in failures { print("FAIL:          \(failure)") }
+        print("result:        \(failures.isEmpty ? "PASS" : "FAIL")")
+        return failures.isEmpty ? 0 : 1
+    }
+
+    private static func fileSize(_ url: URL) -> Int {
+        (try? FileManager.default.attributesOfItem(atPath: url.path))
+            .flatMap { $0[.size] as? Int } ?? 0
     }
 
     /// Two-pixel black-and-white vertical stripes: maximum contrast at the

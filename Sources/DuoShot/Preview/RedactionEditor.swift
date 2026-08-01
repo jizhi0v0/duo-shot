@@ -29,7 +29,7 @@ final class RedactionEditor: NSView {
     private let imageView: NSImageView
     private let canvas: RedactionCanvas
     private let bar: RedactionBar
-    private let notice: RedactionNotice
+    private let notice: ViewerNotice
 
     private var isRedacting = false
     /// True from Apply until the file has been rewritten. A second press in that
@@ -62,7 +62,7 @@ final class RedactionEditor: NSView {
         canvas = RedactionCanvas(frame: bounds)
         scrollView = ZoomingScrollView(frame: CGRect(origin: .zero, size: frame.size))
         bar = RedactionBar()
-        notice = RedactionNotice()
+        notice = ViewerNotice()
         super.init(frame: frame)
 
         imageView.image = image
@@ -520,73 +520,5 @@ private final class RedactionBar: NSView {
             x += cancel.frame.width + HUDMetrics.gap
             apply.setFrameOrigin(CGPoint(x: x, y: midY))
         }
-    }
-}
-
-/// A sentence in the window, and at most one thing to do about it.
-///
-/// Not an `NSAlert`. The viewer's whole idiom is a floating strip over the
-/// picture, and the sentence this exists to say — that a link made before the
-/// redaction still serves what was redacted — is one the user needs to be able
-/// to read twice and act on, which is exactly what a modal takes away.
-private final class RedactionNotice: NSView {
-    private let content: NSView
-    private let label = NSTextField(wrappingLabelWithString: "")
-    private var pill: HUDPill?
-    private var action: (() -> Void)?
-
-    private static let verticalPadding: CGFloat = 10
-
-    init() {
-        let box = CGRect(x: 0, y: 0, width: 360, height: HUDMetrics.height)
-        let chrome = HUDMetrics.chrome(in: box)
-        content = chrome.content
-        super.init(frame: box)
-        addSubview(chrome.glass)
-
-        label.font = .systemFont(ofSize: 12)
-        label.textColor = .labelColor
-        content.addSubview(label)
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError("not used") }
-
-    func show(message: String, action: (title: String, run: () -> Void)?) {
-        label.stringValue = message
-        pill?.removeFromSuperview()
-        pill = nil
-        self.action = action?.run
-        guard let action else { return }
-        let button = HUDPill(
-            title: action.title, mark: .symbol("link.badge.plus"),
-            tint: NSColor(white: 1, alpha: 0.16))
-        button.onClick = { [weak self] in self?.action?() }
-        content.addSubview(button)
-        pill = button
-    }
-
-    func setBusy(_ busy: Bool) { pill?.setLive(!busy, animated: false) }
-
-    /// Sized against the width it will be given, because the message wraps and
-    /// its height is therefore a function of that width rather than a constant.
-    func fittingSize(inWidth available: CGFloat) -> CGSize {
-        let pillWidth = pill.map { $0.frame.width + HUDMetrics.groupGap } ?? 0
-        let textLimit = max(120, min(420, available - HUDMetrics.margin * 2 - pillWidth))
-        let height = label.sizeThatFits(
-            CGSize(width: textLimit, height: .greatestFiniteMagnitude)).height
-        label.frame = CGRect(x: HUDMetrics.margin, y: Self.verticalPadding,
-                             width: textLimit, height: height)
-        let boxHeight = max(HUDMetrics.height, height + Self.verticalPadding * 2)
-        label.setFrameOrigin(CGPoint(
-            x: HUDMetrics.margin, y: ((boxHeight - height) / 2).rounded()))
-        if let pill {
-            pill.setFrameOrigin(CGPoint(
-                x: HUDMetrics.margin + textLimit + HUDMetrics.groupGap,
-                y: ((boxHeight - pill.frame.height) / 2).rounded()))
-        }
-        return CGSize(
-            width: (HUDMetrics.margin * 2 + textLimit + pillWidth).rounded(),
-            height: boxHeight.rounded())
     }
 }

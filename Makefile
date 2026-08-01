@@ -234,6 +234,7 @@ test: verify
 	run "preview stack + scroll" --selftest-preview-stack $(TEST_OUT) --count 14; \
 	run "viewer window"          --selftest-viewer $(TEST_OUT); \
 	run "redaction"              --selftest-redact $(TEST_OUT); \
+	run "recording trim"         --selftest-trim $(TEST_OUT); \
 	run "recording area"         --selftest-record $(TEST_OUT) --seconds 2 --rect 400,300,640,400; \
 	run "recording fullscreen"   --selftest-record $(TEST_OUT) --seconds 2; \
 	run "hud recorded (readOnly)" --selftest-record-hud $(TEST_OUT) --seconds 2; \
