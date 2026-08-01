@@ -458,6 +458,22 @@ final class RecordingEngine {
         // hands frames straight to the writer, so headroom against a hitch is
         // worth more here than in a preview stream.
         configuration.queueDepth = 8
+        // Without this the buffers come out in **the display's** colour space —
+        // the SDK says so outright: "If not set the output buffer uses the same
+        // color space as the display" (SCStream.h:288). The writer then tags the
+        // file BT.709 regardless, so on any display whose profile is not sRGB the
+        // recording is wrong: measured on an LG UltraFine, pure magenta
+        // (255,0,255) on screen came out (218,90,245) in the file. Desaturated,
+        // hue-shifted, and invisible to whoever recorded it because their own
+        // player shows the same shift in reverse.
+        //
+        // This is also the answer to M9's open question in
+        // eager-shimmying-crayon.md — "为什么会得到 0，尚未查明", the run that
+        // counted zero magenta twice and full magenta the next time. It was never
+        // about which windows a stream renders. The window was always there; its
+        // colour depended on the display profile in effect, and an exact-match
+        // magenta predicate flips with it.
+        configuration.colorSpaceName = CGColorSpace.sRGB
         configuration.scalesToFit = false
         configuration.preservesAspectRatio = true
         configuration.streamName = "DuoShot Recording"
