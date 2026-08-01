@@ -1,0 +1,293 @@
+import { SELF, env } from "cloudflare:test";
+import { describe, expect, it } from "vitest";
+import { presignPut } from "../src/presign";
+import type { Env } from "../src/types";
+
+const TOKEN = "test-token";
+const BASE = "https://s.test";
+
+/// A real 1x1 PNG. Bytes matter here: half these tests are about whether the
+/// exact same bytes come back out.
+const PNG = Uint8Array.from(
+  atob(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+  ),
+  (c) => c.charCodeAt(0),
+);
+
+async function upload(
+  body: BodyInit = PNG,
+  query = "ext=png&name=shot.png",
+  token: string | null = TOKEN,
+): Promise<Response> {
+  const headers = new Headers();
+  if (token !== null) headers.set("Authorization", `Bearer ${token}`);
+  return SELF.fetch(`${BASE}/api/put?${query}`, { method: "PUT", headers, body });
+}
+
+async function uploadedKey(query?: string): Promise<string> {
+  const response = await upload(PNG, query);
+  expect(response.status).toBe(201);
+  return ((await response.json()) as { key: string }).key;
+}
+
+describe("auth", () => {
+  it("refuses an upload with no token", async () => {
+    expect((await upload(PNG, "ext=png", null)).status).toBe(401);
+  });
+
+  it("refuses an upload with the wrong token", async () => {
+    expect((await upload(PNG, "ext=png", "not-the-token")).status).toBe(401);
+  });
+
+  // The control for the two above. If this ever fails they prove nothing --
+  // a route that rejects everything also rejects a bad token.
+  it("accepts an upload with the right token", async () => {
+    expect((await upload()).status).toBe(201);
+  });
+});
+
+describe("round trip", () => {
+  it("returns the exact bytes that were uploaded", async () => {
+    const key = await uploadedKey();
+    const response = await SELF.fetch(`${BASE}/f/${key}.png`);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe("image/png");
+    expect(response.headers.get("Accept-Ranges")).toBe("bytes");
+    expect(response.headers.get("X-Robots-Tag")).toBe("noindex, nofollow");
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(PNG);
+  });
+
+  it("answers HEAD with the size and no body", async () => {
+    const key = await uploadedKey();
+    const response = await SELF.fetch(`${BASE}/f/${key}.png`, { method: "HEAD" });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Length")).toBe(String(PNG.byteLength));
+    expect(await response.text()).toBe("");
+  });
+
+  it("404s an unknown key", async () => {
+    expect((await SELF.fetch(`${BASE}/f/aaaaaaaaaaaa.png`)).status).toBe(404);
+    expect((await SELF.fetch(`${BASE}/aaaaaaaaaaaa`)).status).toBe(404);
+  });
+});
+
+describe("range requests", () => {
+  // Without this Safari does not merely fail to seek a video -- it declines to
+  // play it at all. It is the first thing that breaks and the last thing anyone
+  // thinks to check.
+  it("answers a byte range with 206 and a correct Content-Range", async () => {
+    const key = await uploadedKey();
+    const response = await SELF.fetch(`${BASE}/f/${key}.png`, {
+      headers: { Range: "bytes=0-9" },
+    });
+
+    expect(response.status).toBe(206);
+    expect(response.headers.get("Content-Range")).toBe(`bytes 0-9/${PNG.byteLength}`);
+    expect(response.headers.get("Content-Length")).toBe("10");
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(PNG.slice(0, 10));
+  });
+
+  it("answers a suffix range", async () => {
+    const key = await uploadedKey();
+    const response = await SELF.fetch(`${BASE}/f/${key}.png`, {
+      headers: { Range: "bytes=-5" },
+    });
+
+    expect(response.status).toBe(206);
+    expect(response.headers.get("Content-Range")).toBe(
+      `bytes ${PNG.byteLength - 5}-${PNG.byteLength - 1}/${PNG.byteLength}`,
+    );
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(PNG.slice(-5));
+  });
+
+  it("sends the whole body for a range header it will not parse", async () => {
+    const key = await uploadedKey();
+    const response = await SELF.fetch(`${BASE}/f/${key}.png`, {
+      headers: { Range: "bytes=0-9,20-29" },
+    });
+
+    expect(response.status).toBe(200);
+    expect((await response.arrayBuffer()).byteLength).toBe(PNG.byteLength);
+  });
+});
+
+describe("conditional requests", () => {
+  it("answers 304 when the client already has the bytes", async () => {
+    const key = await uploadedKey();
+    const first = await SELF.fetch(`${BASE}/f/${key}.png`);
+    const etag = first.headers.get("ETag");
+    expect(etag).toBeTruthy();
+
+    const second = await SELF.fetch(`${BASE}/f/${key}.png`, {
+      headers: { "If-None-Match": etag! },
+    });
+    expect(second.status).toBe(304);
+  });
+});
+
+describe("content types are an allowlist, not a suggestion", () => {
+  // Serving an uploaded file as text/html on this origin would be stored XSS
+  // against every other link ever shared from this domain.
+  it("refuses to accept an html upload", async () => {
+    expect((await upload(PNG, "ext=html")).status).toBe(400);
+  });
+
+  it("refuses to accept an svg upload", async () => {
+    expect((await upload(PNG, "ext=svg")).status).toBe(400);
+  });
+
+  it("refuses to serve a stored object under a different extension", async () => {
+    const key = await uploadedKey();
+    expect((await SELF.fetch(`${BASE}/f/${key}.html`)).status).toBe(404);
+  });
+
+  it("rejects a key that tries to walk out of its prefix", async () => {
+    expect((await SELF.fetch(`${BASE}/f/..%2F..%2Fm%2Fabc.png`)).status).toBe(404);
+  });
+});
+
+describe("viewer page", () => {
+  it("carries the og:image an unfurl needs", async () => {
+    const key = await uploadedKey("ext=png&name=shot.png&w=800&h=600");
+    const response = await SELF.fetch(`${BASE}/${key}`);
+    const html = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toContain("text/html");
+    expect(html).toContain(`<meta property="og:image" content="${BASE}/f/${key}.png">`);
+    expect(html).toContain(`<img src="${BASE}/f/${key}.png"`);
+    expect(html).toContain("800×600");
+  });
+
+  it("escapes a filename chosen to break out of the markup", async () => {
+    const hostile = '"><script>alert(1)</script>';
+    const key = await uploadedKey(`ext=png&name=${encodeURIComponent(hostile)}`);
+    const html = await SELF.fetch(`${BASE}/${key}`).then((r: Response) => r.text());
+
+    expect(html).not.toContain("<script>alert(1)</script>");
+    expect(html).toContain("&lt;script&gt;");
+  });
+
+  // A record with no object has two causes that must not be told the same way:
+  // an expiry, and an upload that never finished because the app was quit
+  // mid-transfer. Age is the only thing that separates them.
+  it("says expired for an old record whose object is gone", async () => {
+    const key = await uploadedKey();
+    await (env as Env).BUCKET.delete(`p/${key}`);
+    // Backdate the sidecar past the incomplete window.
+    const meta = await (env as Env).BUCKET.get(`m/${key}`);
+    const record = (await meta!.json()) as { createdAt: string };
+    record.createdAt = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
+    await (env as Env).BUCKET.put(`m/${key}`, JSON.stringify(record));
+
+    const response = await SELF.fetch(`${BASE}/${key}`);
+    expect(response.status).toBe(410);
+    expect(await response.text()).toContain("expired");
+  });
+
+  it("does not claim a just-abandoned upload expired", async () => {
+    const key = await uploadedKey();
+    // What quitting the app mid-upload leaves behind: a fresh record, no bytes.
+    await (env as Env).BUCKET.delete(`p/${key}`);
+
+    const response = await SELF.fetch(`${BASE}/${key}`);
+    expect(response.status).toBe(404);
+    const html = await response.text();
+    expect(html).toContain("did not finish");
+    expect(html).not.toContain("expired");
+  });
+
+  it("leaves the record alone so an upload in flight can still land", async () => {
+    const key = await uploadedKey();
+    await (env as Env).BUCKET.delete(`p/${key}`);
+    await SELF.fetch(`${BASE}/${key}`);
+
+    // Reading the page must not clean up: a large presigned upload looks
+    // identical to an abandoned one while it is still running.
+    expect(await (env as Env).BUCKET.head(`m/${key}`)).not.toBeNull();
+  });
+});
+
+describe("delete", () => {
+  it("removes the object and then serves nothing", async () => {
+    const key = await uploadedKey();
+    const response = await SELF.fetch(`${BASE}/api/o/${key}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+
+    expect(response.status).toBe(200);
+    expect((await SELF.fetch(`${BASE}/f/${key}.png`)).status).toBe(404);
+    expect((await SELF.fetch(`${BASE}/${key}`)).status).toBe(404);
+  });
+
+  it("refuses an unauthenticated delete", async () => {
+    const key = await uploadedKey();
+    expect((await SELF.fetch(`${BASE}/api/o/${key}`, { method: "DELETE" })).status).toBe(401);
+    expect((await SELF.fetch(`${BASE}/f/${key}.png`)).status).toBe(200);
+  });
+});
+
+describe("uploads that cannot be streamed", () => {
+  it("asks for a Content-Length rather than failing inside R2", async () => {
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(PNG);
+        controller.close();
+      },
+    });
+    const response = await SELF.fetch(`${BASE}/api/put?ext=png`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${TOKEN}` },
+      body: stream,
+    });
+    expect(response.status).toBe(411);
+  });
+});
+
+describe("list", () => {
+  it("returns recent uploads without a read per item", async () => {
+    const key = await uploadedKey("ext=png&name=listed.png");
+    const response = await SELF.fetch(`${BASE}/api/list?limit=50`, {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { items: { key: string; name: string }[] };
+    const found = body.items.find((item) => item.key === key);
+    expect(found?.name).toBe("listed.png");
+  });
+});
+
+describe("presigned PUT", () => {
+  const FIXED = new Date("2026-08-01T12:00:00.000Z");
+
+  it("builds a URL with every parameter SigV4 requires", async () => {
+    const url = new URL(await presignPut(env as Env, "p/abcdefghijkl", { now: FIXED }));
+
+    expect(url.host).toBe("accountid.r2.cloudflarestorage.com");
+    expect(url.pathname).toBe("/duoshot/p/abcdefghijkl");
+    expect(url.searchParams.get("X-Amz-Algorithm")).toBe("AWS4-HMAC-SHA256");
+    expect(url.searchParams.get("X-Amz-Credential")).toBe(
+      "AKIAIOSFODNN7EXAMPLE/20260801/auto/s3/aws4_request",
+    );
+    expect(url.searchParams.get("X-Amz-Date")).toBe("20260801T120000Z");
+    expect(url.searchParams.get("X-Amz-SignedHeaders")).toBe("host");
+    expect(url.searchParams.get("X-Amz-Signature")).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  // A regression lock, not a conformance test: it pins the canonicalisation so
+  // an "innocent" edit to the encoder or the parameter order shows up here
+  // rather than as an intermittent SignatureDoesNotMatch from R2 months later.
+  it("signs deterministically", async () => {
+    const a = await presignPut(env as Env, "p/abcdefghijkl", { now: FIXED });
+    const b = await presignPut(env as Env, "p/abcdefghijkl", { now: FIXED });
+    expect(a).toBe(b);
+
+    const other = await presignPut(env as Env, "p/abcdefghijkm", { now: FIXED });
+    expect(other).not.toBe(a);
+  });
+});

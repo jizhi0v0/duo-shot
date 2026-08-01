@@ -1,0 +1,36 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "duoshot-share",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "observability": { "enabled": true },
+
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "duoshot",
+      // Used by `wrangler dev` and by the test suite, so neither can touch
+      // anything that has actually been shared.
+      "preview_bucket_name": "duoshot-dev"
+    }
+  ],
+
+  "vars": {
+    // No trailing slash. Every link the API returns is built from this, so a
+    // wrong value produces links that 404 while uploads keep succeeding.
+    "PUBLIC_BASE": "https://s.example.com",
+    "R2_BUCKET_NAME": "duoshot"
+  },
+
+  // Secrets, set with `wrangler secret put <NAME>` -- never in this file:
+  //   UPLOAD_TOKEN           the only credential the DuoShot client holds
+  //   R2_ACCOUNT_ID          \
+  //   R2_ACCESS_KEY_ID        > only needed for POST /api/new (presigned PUT)
+  //   R2_SECRET_ACCESS_KEY   /
+  //
+  // Uncomment once the domain is on Cloudflare. Without a route the Worker is
+  // reachable only at *.workers.dev, where responses do not go through the
+  // zone cache -- which is exactly what keeps a video's range requests off R2.
+  //
+  "routes": [{ "pattern": "s.example.com", "custom_domain": true }]
+}
