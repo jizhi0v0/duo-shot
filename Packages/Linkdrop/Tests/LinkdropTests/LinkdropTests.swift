@@ -93,6 +93,37 @@ struct GateTests {
     }
 }
 
+@Suite("Object keys")
+struct KeyTests {
+    // The key comes back from the server and is then interpolated into request
+    // paths and a temp filename. These are the strings that would turn a bad
+    // endpoint into path influence.
+    @Test("refuses anything that could steer a path", arguments: [
+        "../../etc/passwd", "a/b", "a..b", "..", "a b", "a%2fb", "a?b", "a.jpg", "a-b", "ä",
+    ])
+    func refusesPathy(key: String) {
+        #expect(throws: LinkdropError.self) { try LinkdropUploader.validate(key: key) }
+    }
+
+    @Test("refuses an empty key and one longer than the bound")
+    func refusesLengths() {
+        #expect(throws: LinkdropError.self) { try LinkdropUploader.validate(key: "") }
+        #expect(throws: LinkdropError.self) {
+            try LinkdropUploader.validate(
+                key: String(repeating: "a", count: LinkdropUploader.maximumKeyLength + 1))
+        }
+    }
+
+    // The bound is the client's, not the server's: a service that lengthens its
+    // keys must keep working without a new build.
+    @Test("accepts what the service actually mints", arguments: [
+        "aB3xY9kL2mQ7", "a", "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ12",
+    ])
+    func acceptsPlainKeys(key: String) throws {
+        try LinkdropUploader.validate(key: key)
+    }
+}
+
 @Suite("Errors")
 struct ErrorTests {
     @Test("maps a lost connection to something a person can act on")

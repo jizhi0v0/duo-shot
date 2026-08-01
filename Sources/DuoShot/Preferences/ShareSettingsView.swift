@@ -79,9 +79,9 @@ struct ShareSettingsView: View {
         }
         .formStyle(.grouped)
         .onAppear { token = ShareService.credentials.load() ?? "" }
-        .onChange(of: token) { _, _ in
-            status = .idle
-            saveToken()
+        .onChange(of: token) { _, _ in status = .idle }
+        .onDisappear {
+            if !token.isEmpty { saveToken() }
         }
     }
 
@@ -103,8 +103,16 @@ struct ShareSettingsView: View {
         }
     }
 
+    /// Saved on submit, and on the way out only when the field still holds
+    /// something.
+    ///
+    /// This used to run on every keystroke, which meant half-typed tokens in the
+    /// Keychain and — because an empty string deletes the item — a working token
+    /// destroyed the moment someone selected all and started retyping. Submitting
+    /// an emptied field is still how you clear it: that one is deliberate, and
+    /// leaving on a blank field is not.
     private func saveToken() {
-        ShareService.credentials.save(token)
+        settings.saveToken(token)
     }
 
     private func test() {

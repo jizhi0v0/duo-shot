@@ -6,7 +6,21 @@ import Foundation
 /// observe progress without making the session stateful, and it is why the
 /// uploader can stay a plain actor with no delegate queue of its own.
 private final class ProgressReporter: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    /// The smallest advance worth telling anyone about.
+    ///
+    /// URLSession calls the delegate per body write, which for a
+    /// multi-hundred-megabyte upload is thousands of calls describing motion no
+    /// progress ring can render. Half a percent is finer than a pixel on any ring
+    /// this drives.
+    private static let step = 0.005
+
     private let onProgress: @Sendable (Double) -> Void
+
+    /// Guards `lastReported`. The delegate runs on URLSession's own queue, which
+    /// makes no serialisation promise to anything here, so the class is
+    /// `@unchecked Sendable` and this is what earns that.
+    private let lock = NSLock()
+    private var lastReported = -1.0
 
     init(_ onProgress: @escaping @Sendable (Double) -> Void) {
         self.onProgress = onProgress
@@ -17,7 +31,17 @@ private final class ProgressReporter: NSObject, URLSessionTaskDelegate, @uncheck
         totalBytesSent: Int64, totalBytesExpectedToSend: Int64
     ) {
         guard totalBytesExpectedToSend > 0 else { return }
-        onProgress(Double(totalBytesSent) / Double(totalBytesExpectedToSend))
+        let fraction = Double(totalBytesSent) / Double(totalBytesExpectedToSend)
+
+        lock.lock()
+        // 1.0 always gets through, whatever the step would say: "finished" is the
+        // one value a caller cannot infer from the ones before it.
+        let forward = fraction >= lastReported + Self.step || (fraction >= 1 && lastReported < 1)
+        if forward { lastReported = fraction }
+        lock.unlock()
+
+        guard forward else { return }
+        onProgress(fraction)
     }
 }
 
@@ -97,9 +121,11 @@ public actor LinkdropUploader {
 
         var request = URLRequest(url: endpoint.url(path: "/api/put", query: query))
         request.httpMethod = "PUT"
-        return try decode(
+        let link: LinkdropLink = try decode(
             await send(endpoint.authorized(request), fromFile: plan.fileURL,
                        onProgress: onProgress))
+        try Self.validate(key: link.key)
+        return link
     }
 
     /// Two requests, and the bytes never touch the service.
@@ -126,13 +152,25 @@ public actor LinkdropUploader {
             width: d.width, height: d.height, duration: d.duration))
 
         let reply: Reply = try decode(await send(endpoint.authorized(request)))
+        try Self.validate(key: reply.key)
 
         // No Authorization header on this one. The signature is in the URL, and
         // sending the service's bearer token to the storage host would hand a
         // third party a credential it has no need for.
         var put = URLRequest(url: reply.uploadURL)
         put.httpMethod = "PUT"
-        _ = try await send(put, fromFile: plan.fileURL, onProgress: onProgress)
+        do {
+            _ = try await send(put, fromFile: plan.fileURL, onProgress: onProgress)
+        } catch LinkdropError.unauthorized {
+            // This request never carried the token, so a 401/403 here is not the
+            // token being wrong. It is the storage host refusing the signature the
+            // service just minted, and "the server rejected the token" would send
+            // the user off to rotate a credential that is fine.
+            throw LinkdropError.server(
+                status: 403,
+                message: "The storage host rejected the presigned upload. That is a "
+                    + "signature or clock problem on the server, not your token.")
+        }
 
         return LinkdropLink(key: reply.key, pageURL: reply.pageURL, fileURL: reply.fileURL)
     }
@@ -151,6 +189,7 @@ public actor LinkdropUploader {
 
     /// Makes the link stop working, everywhere, for everyone.
     public func delete(key: String, from endpoint: LinkdropEndpoint) async throws {
+        try Self.validate(key: key)
         var request = URLRequest(url: endpoint.url(path: "/api/o/\(key)"))
         request.httpMethod = "DELETE"
         _ = try await send(endpoint.authorized(request))
@@ -161,9 +200,37 @@ public actor LinkdropUploader {
     public func attachPoster(
         _ imageURL: URL, toKey key: String, at endpoint: LinkdropEndpoint
     ) async throws {
+        try Self.validate(key: key)
         var request = URLRequest(url: endpoint.url(path: "/api/poster/\(key)"))
         request.httpMethod = "PUT"
         _ = try await send(endpoint.authorized(request), fromFile: imageURL)
+    }
+
+    // MARK: - Keys
+
+    /// Longest key this client will carry. Deliberately far above the length the
+    /// server happens to mint today: the client has no business owning that
+    /// constant, and only has to know that a key is a short opaque word.
+    static let maximumKeyLength = 64
+
+    /// Checked at every boundary a key crosses, because the key is a server-supplied
+    /// string that then gets interpolated into request paths and into a temp
+    /// filename. One containing `/` or `..` — from an endpoint that is hostile,
+    /// compromised, or merely typo'd into the settings field — would let whoever
+    /// answers those requests steer paths on this machine and on the service.
+    /// ASCII alphanumerics leave nothing to interpret.
+    static func validate(key: String) throws {
+        guard (1...maximumKeyLength).contains(key.count),
+              key.utf8.allSatisfy({
+                  (0x30...0x39).contains($0) || (0x41...0x5A).contains($0)
+                      || (0x61...0x7A).contains($0)
+              })
+        else {
+            throw LinkdropError.server(
+                status: 0,
+                message: "The server returned an object key that is not a plain "
+                    + "alphanumeric name, so this upload was not trusted.")
+        }
     }
 
     // MARK: - Transport

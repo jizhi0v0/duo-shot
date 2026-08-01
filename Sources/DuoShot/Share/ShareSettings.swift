@@ -67,6 +67,15 @@ final class ShareSettings {
         didSet { defaults.set(ephemeralScreenshots, forKey: Key.ephemeralScreenshots) }
     }
 
+    /// The upload token, mirrored in memory.
+    ///
+    /// The Keychain stays the source of truth and fills this at launch, but it
+    /// cannot be read on every access: `endpoint` is asked from menu construction
+    /// and from SwiftUI bodies, and each read is up to two `SecItemCopyMatching`
+    /// round trips. `saveToken(_:)` is the only writer, which is what keeps the
+    /// two in step.
+    private var token: String?
+
     private init() {
         defaults.register(defaults: [
             Key.endpoint: "",
@@ -82,12 +91,22 @@ final class ShareSettings {
         linkToClipboard = defaults.bool(forKey: Key.linkToClipboard)
         ephemeralRecordings = defaults.bool(forKey: Key.ephemeralRecordings)
         ephemeralScreenshots = defaults.bool(forKey: Key.ephemeralScreenshots)
+        token = ShareService.credentials.load()
+    }
+
+    /// The only supported way to change the token: it writes through to the
+    /// Keychain and updates the cached copy in one step, so nothing can be left
+    /// reading a token the Keychain no longer holds. An empty string clears both.
+    func saveToken(_ newToken: String) {
+        let trimmed = newToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        ShareService.credentials.save(trimmed)
+        token = trimmed.isEmpty ? nil : trimmed
     }
 
     /// nil whenever sharing is not usable, which is also the check the UI uses
     /// to decide whether to offer it at all.
     var endpoint: LinkdropEndpoint? {
-        guard let token = ShareService.credentials.load() else { return nil }
+        guard let token else { return nil }
         return LinkdropEndpoint(base: endpointString, token: token)
     }
 

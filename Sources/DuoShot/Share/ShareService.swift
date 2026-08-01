@@ -130,7 +130,7 @@ final class ShareService {
             let link = try await uploader.upload(plan, to: endpoint) { fraction in
                 // Progress arrives on URLSession's queue.
                 Task { @MainActor [weak self] in
-                    self?.publish(.uploading(fraction), for: url)
+                    self?.publishProgress(fraction, for: url)
                 }
             }
 
@@ -204,6 +204,16 @@ final class ShareService {
     }
 
     // MARK: -
+
+    /// Drops a fraction lower than the one already on screen.
+    ///
+    /// Each callback is hopped onto the main actor as its own task and nothing
+    /// orders them against each other, so an out-of-order pair reads as the
+    /// transfer having gone backwards. It did not; the ring should not say so.
+    private func publishProgress(_ fraction: Double, for url: URL) {
+        if case .uploading(let shown) = states[url], fraction < shown { return }
+        publish(.uploading(fraction), for: url)
+    }
 
     private func publish(_ state: State, for url: URL) {
         states[url] = state
