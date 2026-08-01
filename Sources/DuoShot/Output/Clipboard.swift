@@ -1,4 +1,5 @@
 import AppKit
+import Linkdrop
 
 enum Clipboard {
     /// Puts both the image and its file URL on the pasteboard.
@@ -46,6 +47,38 @@ enum Clipboard {
         pasteboard.clearContents()
         pasteboard.setString(url.absoluteString, forType: .string)
         pasteboard.setString(url.absoluteString, forType: .URL)
+    }
+
+    /// The same link as Markdown.
+    ///
+    /// A still points at `fileURL`, because `![]()` only renders if the address
+    /// resolves to bytes; anything else points at `pageURL`, which is where the
+    /// player and the title live — an `.mp4` behind a bare `[]()` would download
+    /// rather than play.
+    ///
+    /// **Unlike `write(link:)` this sets `public.string` and nothing else.**
+    /// There the URL was the whole payload, so advertising `public.url` as well
+    /// let Finder and browser tab bars take it. Here the payload is a sentence
+    /// that contains a URL and is not one: a target reading `public.url` would
+    /// be handed `![shot.png](https://…)` as an address and fail to open it.
+    static func write(markdown link: LinkdropLink, name: String, isImage: Bool) {
+        let target = isImage ? link.fileURL : link.pageURL
+        let text = "\(isImage ? "!" : "")[\(markdownLabel(name))](\(target.absoluteString))"
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+    }
+
+    /// Filenames are free to contain the two characters that delimit a Markdown
+    /// label, and an unescaped `]` ends the label early — turning the rest of the
+    /// name into stray text and the link into nothing. Escaped rather than
+    /// stripped so the label still reads as the file's actual name; the leading
+    /// backslash pass has to come first or it would escape the backslashes this
+    /// adds.
+    private static func markdownLabel(_ name: String) -> String {
+        name.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "[", with: "\\[")
+            .replacingOccurrences(of: "]", with: "\\]")
     }
 
     /// The same thing, from the staged file rather than from memory.

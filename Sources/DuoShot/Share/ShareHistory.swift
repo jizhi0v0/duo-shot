@@ -1,6 +1,7 @@
 import Foundation
 import Linkdrop
 import Observation
+import UniformTypeIdentifiers
 
 /// The last few links, for the menu bar.
 ///
@@ -19,6 +20,19 @@ final class ShareHistory {
         let name: String
         let uploadedAt: Date
         var id: String { link.key }
+
+        /// Whether the upload was a still, which is what decides between an
+        /// embed and a plain link when the row is copied as Markdown.
+        ///
+        /// Read back out of the name because that is all a history row keeps,
+        /// and adding a stored flag would leave every entry saved by an earlier
+        /// build undecodable. Asked of `UTType` rather than matched against a
+        /// list of extensions: the image format is a preference, so the list
+        /// would have to be kept in step with `Preferences.imageFormat` for ever.
+        var isImage: Bool {
+            UTType(filenameExtension: (name as NSString).pathExtension)?
+                .conforms(to: .image) ?? false
+        }
     }
 
     private static let maximum = 10

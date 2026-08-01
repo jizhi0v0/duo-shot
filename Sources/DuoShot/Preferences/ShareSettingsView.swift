@@ -65,14 +65,30 @@ struct ShareSettingsView: View {
 
             Section {
                 Toggle("Put the link on the clipboard", isOn: $settings.linkToClipboard)
+                Picker("Copy as", selection: $settings.linkFormat) {
+                    ForEach(ShareLinkFormat.allCases) { format in
+                        Text(format.title).tag(format)
+                    }
+                }
                 Toggle("Expire recordings", isOn: $settings.ephemeralRecordings)
                 Toggle("Expire screenshots", isOn: $settings.ephemeralScreenshots)
             } header: {
                 Text("After uploading")
             } footer: {
-                Text("Expiring uploads are deleted by your bucket's lifecycle rule — "
-                     + "30 days unless you changed it. Recordings default to expiring "
-                     + "because a handful of them fills the free 10 GB; screenshots do not.")
+                // Verbatim, because a `Text` string literal is a
+                // `LocalizedStringKey` and SwiftUI parses those as Markdown: the
+                // two examples below would be swallowed and rendered as a broken
+                // image and a live link rather than shown as what they are.
+                Text(verbatim: """
+                    Markdown copies a screenshot as ![name](link) so it renders as the \
+                    image itself, and anything else as [name](link) — a recording has no \
+                    Markdown embed, so it stays a link to its page. The format applies to \
+                    the Recent Links menu too.
+
+                    Expiring uploads are deleted by your bucket's lifecycle rule — 30 days \
+                    unless you changed it. Recordings default to expiring because a handful \
+                    of them fills the free 10 GB; screenshots do not.
+                    """)
                 .font(.caption)
                 .foregroundStyle(.secondary)
             }

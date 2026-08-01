@@ -161,7 +161,7 @@ final class ShareService {
             publish(.done(link), for: entry.url)
             ShareHistory.shared.record(link, name: entry.url.lastPathComponent)
             if ShareSettings.shared.linkToClipboard {
-                Clipboard.write(link: link.pageURL)
+                Self.copy(link, name: entry.url.lastPathComponent, isImage: !entry.isVideo)
             }
             if Preferences.shared.playsSound { NSSound(named: "Morse")?.play() }
         } catch {
@@ -190,6 +190,23 @@ final class ShareService {
             try await uploader.attachPoster(file, toKey: link.key, at: endpoint)
         } catch {
             Log.share.notice("poster upload skipped: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// The only way a link reaches the pasteboard.
+    ///
+    /// Two places copy links — the upload that has just finished, and a row of
+    /// the Recent Links menu — and the format preference has to reach both. They
+    /// go through here so that the preference cannot end up honoured in one and
+    /// not the other, which is the failure mode a second call site invites.
+    ///
+    /// `isImage` is asked for rather than derived from `name`: the caller that
+    /// has the capture knows, and only the caller that has nothing but a history
+    /// row has to guess.
+    static func copy(_ link: LinkdropLink, name: String, isImage: Bool) {
+        switch ShareSettings.shared.linkFormat {
+        case .plain: Clipboard.write(link: link.pageURL)
+        case .markdown: Clipboard.write(markdown: link, name: name, isImage: isImage)
         }
     }
 

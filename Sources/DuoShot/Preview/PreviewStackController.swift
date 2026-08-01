@@ -143,7 +143,8 @@ final class PreviewStackController {
             guard let item else { return }
             switch ShareService.shared.state(for: entry.url) {
             case .done(let link):
-                Clipboard.write(link: link.pageURL)
+                ShareService.copy(
+                    link, name: entry.url.lastPathComponent, isImage: !entry.isVideo)
             case .failed:
                 ShareService.shared.retry(entry)
             default:

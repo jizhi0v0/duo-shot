@@ -133,7 +133,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             let item = NSMenuItem(
                 title: entry.name, action: #selector(copyRecentLink(_:)), keyEquivalent: "")
             item.target = self
-            item.representedObject = entry.link.pageURL.absoluteString
+            // The whole entry, not the URL string it used to carry: writing the
+            // link as Markdown needs the name and the file URL as well, and a
+            // row that carried only one of the two URLs could not honour the
+            // format preference without going back to the history to find the
+            // other.
+            item.representedObject = entry
             item.toolTip = entry.link.pageURL.absoluteString
 
             // The alternate is the same row, shown only while ⌥ is held. A
@@ -163,9 +168,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     @objc private func copyRecentLink(_ sender: NSMenuItem) {
-        guard let string = sender.representedObject as? String,
-              let url = URL(string: string) else { return }
-        Clipboard.write(link: url)
+        guard let entry = sender.representedObject as? ShareHistory.Entry else { return }
+        ShareService.copy(entry.link, name: entry.name, isImage: entry.isImage)
     }
 
     @objc private func deleteRecentLink(_ sender: NSMenuItem) {

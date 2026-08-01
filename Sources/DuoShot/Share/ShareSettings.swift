@@ -2,6 +2,29 @@ import Foundation
 import Linkdrop
 import Observation
 
+/// The shape a copied link takes.
+///
+/// Nothing about the upload changes with this; it decides only what string ends
+/// up on the pasteboard, which is why it lives beside the clipboard preference
+/// rather than anywhere near the uploader.
+nonisolated enum ShareLinkFormat: String, CaseIterable, Identifiable, Sendable {
+    /// The page URL on its own -- what a chat window, a text field and a commit
+    /// message all take, and the only format that survives being pasted
+    /// somewhere that does not render Markdown.
+    case plain
+    /// An embed for a still, an ordinary link for anything else.
+    case markdown
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .plain: "Plain URL"
+        case .markdown: "Markdown"
+        }
+    }
+}
+
 /// Share settings, kept out of `Preferences` on purpose.
 ///
 /// Everything in `Preferences` is a local, offline choice. These are the only
@@ -20,6 +43,7 @@ final class ShareSettings {
         static let autoUploadScreenshots = "share.autoUploadScreenshots"
         static let autoUploadRecordings = "share.autoUploadRecordings"
         static let linkToClipboard = "share.linkToClipboard"
+        static let linkFormat = "share.linkFormat"
         static let ephemeralRecordings = "share.ephemeralRecordings"
         static let ephemeralScreenshots = "share.ephemeralScreenshots"
     }
@@ -48,6 +72,16 @@ final class ShareSettings {
     /// seconds later, and "what did I just copy" has no good answer.
     var linkToClipboard: Bool {
         didSet { defaults.set(linkToClipboard, forKey: Key.linkToClipboard) }
+    }
+
+    /// Which of `ShareLinkFormat` a copied link is written in.
+    ///
+    /// Stored as the raw value rather than an index so a format removed or
+    /// reordered in a later build cannot silently turn into a different one, and
+    /// so an unrecognised string falls back to `.plain` -- the format every
+    /// paste target understands.
+    var linkFormat: ShareLinkFormat {
+        didSet { defaults.set(linkFormat.rawValue, forKey: Key.linkFormat) }
     }
 
     /// Recordings land under the Worker's `e/` prefix, which an R2 lifecycle
@@ -82,6 +116,7 @@ final class ShareSettings {
             Key.autoUploadScreenshots: false,
             Key.autoUploadRecordings: false,
             Key.linkToClipboard: true,
+            Key.linkFormat: ShareLinkFormat.plain.rawValue,
             Key.ephemeralRecordings: true,
             Key.ephemeralScreenshots: false,
         ])
@@ -89,6 +124,8 @@ final class ShareSettings {
         autoUploadScreenshots = defaults.bool(forKey: Key.autoUploadScreenshots)
         autoUploadRecordings = defaults.bool(forKey: Key.autoUploadRecordings)
         linkToClipboard = defaults.bool(forKey: Key.linkToClipboard)
+        linkFormat = ShareLinkFormat(rawValue: defaults.string(forKey: Key.linkFormat) ?? "")
+            ?? .plain
         ephemeralRecordings = defaults.bool(forKey: Key.ephemeralRecordings)
         ephemeralScreenshots = defaults.bool(forKey: Key.ephemeralScreenshots)
         token = ShareService.credentials.load()
