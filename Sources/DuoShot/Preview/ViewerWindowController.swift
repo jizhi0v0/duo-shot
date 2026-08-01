@@ -169,7 +169,17 @@ final class ViewerWindowController {
         imageView.imageScaling = .scaleAxesIndependently
         imageView.animates = false
 
+        // On both views, and on purpose. The image view is the hit view over the
+        // picture itself, the scroll view over the letterboxing around it, and a
+        // right-click that works on one but not the other reads as the menu
+        // being broken rather than as a boundary anyone can see. Recognition
+        // runs against `url`, not against `image`, so zoom cannot affect it.
+        let menu = NSMenu()
+        menu.addItem(.action("Copy Text") { CopyText.run(fileAt: url) })
+        imageView.menu = menu
+
         let scrollView = ZoomingScrollView(frame: CGRect(origin: .zero, size: fitted(image.size)))
+        scrollView.menu = menu
         scrollView.documentView = imageView
         scrollView.naturalSize = image.size
         scrollView.hasVerticalScroller = true

@@ -102,6 +102,9 @@ enum SelfTest {
         case shareCard(directory: URL)
         /// ⌘V in a text field, which an LSUIElement app does not get for free.
         case editMenu
+        /// On-device OCR: whether Vision reads a drawn page back as its words,
+        /// in order, onto the clipboard.
+        case copyText(directory: URL)
         /// The share pipeline against a local `wrangler dev`. Endpoint and token
         /// are arguments, never Settings: a test that read the live
         /// configuration would upload to the real bucket.
@@ -151,6 +154,9 @@ enum SelfTest {
                 self = .shareCard(directory: URL(fileURLWithPath: positional() ?? "build/share-ui"))
             case "--selftest-edit-menu":
                 self = .editMenu
+            case "--selftest-copy-text":
+                self = .copyText(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-share":
                 let configured = rest.contains("--configured")
                 let endpoint = value(for: "--endpoint")
@@ -320,6 +326,7 @@ enum SelfTest {
                     endpoint: endpoint, token: token, file: file, bigMegabytes: big)
             case .shareCompat(let url): return await ShareSelfTest.compatibility(of: url)
             case .editMenu: return await editMenuCheck()
+            case .copyText(let d): return try await copyTextCheck(into: d)
             case .shareCard(let d): return try await shareCardStates(into: d)
             case .shareCredentials: return await ShareSelfTest.credentials()
             case .shareFlow: return await ShareFlowSelfTest.run()
@@ -985,6 +992,113 @@ enum SelfTest {
         window.orderOut(nil)
         print("result:        \(failures == 0 ? "PASS" : "FAIL (\(failures))")")
         return failures == 0 ? 0 : 1
+    }
+
+    // MARK: - Copy Text
+
+    /// Whether Vision reads a picture of words back as those words, and whether
+    /// the two menus that ask it to are there to be clicked.
+    ///
+    /// Headless and offline by construction: the picture is drawn here rather
+    /// than captured, so this asserts the same thing on a locked screen as on a
+    /// busy one, and the recognition never leaves the machine.
+    ///
+    /// The ordering assertion is the one worth having. Vision returns
+    /// observations in an order it does not promise to be geometric, and a
+    /// transcript with its paragraphs shuffled looks perfectly plausible — there
+    /// is nothing in the pasted text to say it came out wrong.
+    private static func copyTextCheck(into directory: URL) async throws -> Int32 {
+        var failures = 0
+        func check(_ label: String, _ passed: Bool, _ detail: String = "") {
+            print("  \(passed ? "PASS" : "FAIL") \(label)\(detail.isEmpty ? "" : " — \(detail)")")
+            if !passed { failures += 1 }
+        }
+
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+
+        let lines = ["Refund issued", "Order 48213", "Thank you"]
+        let sample = directory.appendingPathComponent("copy-text-sample.png")
+        try ImageEncoder.write(wordsImage(lines), to: sample)
+
+        let recognised = await TextRecognition.text(inFileAt: sample) ?? ""
+        print("recognised:    \(recognised.replacingOccurrences(of: "\n", with: " / "))")
+        for line in lines {
+            check("read \"\(line)\"", recognised.contains(line))
+        }
+        // Positions rather than equality: language correction is free to alter
+        // spacing or a character, and a test that demanded the exact string
+        // would fail on a future Vision revision that read it *better*.
+        let positions = lines.compactMap { recognised.range(of: $0)?.lowerBound }
+        check("lines came back top to bottom",
+              positions.count == lines.count && positions == positions.sorted())
+
+        // An image with nothing to read must not silently leave the previous
+        // clipboard in place looking like a successful copy.
+        let blank = directory.appendingPathComponent("copy-text-blank.png")
+        try ImageEncoder.write(wordsImage([]), to: blank)
+        check("blank image recognises nothing", await TextRecognition.text(inFileAt: blank) == nil)
+
+        // Through the action, which is the part that reaches the pasteboard.
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString("sentinel", forType: .string)
+        let before = NSPasteboard.general.changeCount
+        CopyText.run(fileAt: sample)
+        // Polled rather than awaited: `CopyText.run` deliberately returns
+        // immediately — that is the whole point of it — so there is nothing to
+        // await, and a fixed sleep would either be flaky or slow.
+        for _ in 0..<80 where NSPasteboard.general.changeCount == before {
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        let pasted = NSPasteboard.general.string(forType: .string)
+        check("text reached the clipboard", pasted == recognised && !recognised.isEmpty,
+              "clipboard=\"\((pasted ?? "nil").prefix(40))\"")
+        check("no file came with it",
+              NSPasteboard.general.string(forType: .fileURL) == nil)
+
+        // The viewer's half of the entry points. The card's menu is deliberately
+        // not exercised here: building a `PreviewCardView` asks `ShareService`
+        // whether it is configured, which reads the Keychain, and a Keychain
+        // read in a headless run blocks on a prompt nobody is there to answer —
+        // which is why `--selftest-share-card` is not in `make test` either.
+        ViewerWindowController.shared.activatesOnShow = false
+        ViewerWindowController.shared.show(PreviewEntry(
+            kind: .image(pointSize: CGSize(width: 600, height: 400)),
+            thumbnail: NSImage(size: PreviewCardView.cardSize),
+            url: sample, sourceDisplayID: CGMainDisplayID()))
+        let viewerMenu = ViewerWindowController.shared.windowForTest(sample)?.contentView?.menu
+        check("viewer offers Copy Text",
+              viewerMenu?.items.contains { $0.title == "Copy Text" } == true)
+        ViewerWindowController.shared.closeAll()
+
+        print("result:        \(failures == 0 ? "PASS" : "FAIL (\(failures))")")
+        return failures == 0 ? 0 : 1
+    }
+
+    /// Black text on white at a size no OCR could reasonably miss.
+    ///
+    /// Deliberately not a screenshot of a real window: a test whose input is
+    /// whatever happens to be on screen cannot assert what came back.
+    private static func wordsImage(_ lines: [String]) -> CGImage {
+        let size = CGSize(width: 900, height: 500)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        NSColor.white.setFill()
+        NSRect(origin: .zero, size: size).fill()
+        for (index, line) in lines.enumerated() {
+            // Drawn top-down, which in AppKit's upward y means subtracting.
+            (line as NSString).draw(
+                at: CGPoint(x: 60, y: size.height - 120 - CGFloat(index) * 110),
+                withAttributes: [
+                    .font: NSFont.systemFont(ofSize: 64, weight: .regular),
+                    .foregroundColor: NSColor.black,
+                ])
+        }
+        image.unlockFocus()
+        var box = CGRect(origin: .zero, size: size)
+        // Force-unwrapped: the image was just drawn into, so a nil here is a
+        // broken run rather than a condition worth reporting.
+        return image.cgImage(forProposedRect: &box, context: nil, hints: nil)!
     }
 
     private static func outputPipeline(into directory: URL) async throws -> Int32 {

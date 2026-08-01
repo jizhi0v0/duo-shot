@@ -18,6 +18,9 @@ final class PreviewCardView: NSView {
         var open: () -> Void = {}
         var hoverChanged: (Bool) -> Void = { _ in }
         var beginDrag: (NSEvent, NSImage) -> Void = { _, _ in }
+        /// Recognise the text in this capture and put it on the clipboard. Only
+        /// ever reached from the context menu, and only on a still.
+        var copyText: () -> Void = {}
         /// Upload, or copy the link once there is one, or retry after a failure —
         /// the card decides which from its own share state, so the stack does not
         /// have to hand down three closures for one button.
@@ -624,6 +627,36 @@ final class PreviewCardView: NSView {
         }
         refreshUploadIndicator()
         callbacks.hoverChanged(hovering)
+    }
+
+    // MARK: - Context menu
+
+    /// The card's only right-click menu, and for now it holds one thing.
+    ///
+    /// Everything else a card does is a button in the action bar, and Copy Text
+    /// stays out of it: that bar is three buttons wide inside a 208 pt tile, and
+    /// a fourth glyph for an action taken once in fifty would crowd the three
+    /// that are not.
+    ///
+    /// A recording gets no menu at all rather than a disabled item. There is no
+    /// third thing this menu could offer a video, so an empty grey rectangle is
+    /// all a right-click would produce.
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard badge == nil else { return nil }
+        let menu = NSMenu()
+        menu.addItem(.action("Copy Text") { [weak self] in self?.callbacks.copyText() })
+        return menu
+    }
+
+    /// Raised by hand rather than left to `NSView`'s default handling.
+    ///
+    /// The card lives in a non-activating panel that never becomes key, and
+    /// AppKit's default right-click path routes through the responder chain of a
+    /// window that, here, is deliberately not in it. `popUpContextMenu` does not
+    /// care.
+    override func rightMouseDown(with event: NSEvent) {
+        guard let menu = menu(for: event) else { return }
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
     // MARK: - Gestures

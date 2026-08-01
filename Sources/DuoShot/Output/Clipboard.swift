@@ -108,6 +108,18 @@ enum Clipboard {
         writeFileURL(url, to: pasteboard, clearingFirst: false)
     }
 
+    /// Text recognised from a capture.
+    ///
+    /// `public.string` and nothing else, deliberately: the file this came out of
+    /// is not what was asked for. Adding its URL the way `write(fileAt:)` does
+    /// would mean a paste into Finder or Mail attached the screenshot instead of
+    /// inserting the words, which is the opposite of the request.
+    static func write(text: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+    }
+
     /// A recording goes on the pasteboard as a file reference and nothing else.
     ///
     /// There is no in-memory representation to offer the way a screenshot offers

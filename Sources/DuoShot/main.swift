@@ -36,6 +36,7 @@ if let mode = SelfTest.Mode(arguments: arguments) {
           --selftest-windows
           --selftest-preferences
           --selftest-edit-menu
+          --selftest-copy-text <dir>
           --selftest-share-card <dir>
           --selftest-capture <out.png> [--display N]
           --selftest-rect <x,y,w,h> [--display N] [--out <file.png>]

@@ -109,6 +109,11 @@ final class PreviewStackController {
         // how you decide whether to copy it, so consuming the card on the way in
         // would take the next action away.
         callbacks.open = { ViewerWindowController.shared.show(entry) }
+        // Does not dismiss the card, and does not restart its clock either: the
+        // pointer is on the card by definition — that is how the menu was raised
+        // — so the timers are already paused, and the recognition finishes long
+        // before the pointer leaves.
+        callbacks.copyText = { CopyText.run(fileAt: entry.url) }
         callbacks.hoverChanged = { [weak self, weak item] isInside in
             guard let self, let item else { return }
             // Timers pause for the whole stack while the pointer is in the

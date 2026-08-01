@@ -219,6 +219,7 @@ test: verify
 	run "fullscreen menu bar"    --selftest-fullscreen $(TEST_OUT); \
 	run "preferences"            --selftest-preferences; \
 	run "edit menu (paste)"      --selftest-edit-menu; \
+	run "copy text (OCR)"        --selftest-copy-text $(TEST_OUT); \
 	run "selection zones"        --selftest-selection-zones; \
 	run "pixel mapping"          --selftest-pixel-mapping; \
 	run "latch cancellation"     --selftest-latch-cancel; \
