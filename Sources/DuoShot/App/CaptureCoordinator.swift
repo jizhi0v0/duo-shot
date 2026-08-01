@@ -49,10 +49,11 @@ final class CaptureCoordinator {
 
     /// Interactive capture. Returns nil if the user cancelled.
     ///
-    /// One entry point for both modes because Space toggles between them mid-
-    /// interaction: which one the user ends up in is only known at confirm time.
+    /// One entry point, and one overlay: dragging gives a region, clicking takes
+    /// the window the overlay is suggesting. Which of the two the user ends up
+    /// with is only known at confirm time, so both outcomes are handled here.
     @discardableResult
-    func captureInteractive(startingIn mode: SelectionMode) async -> CaptureResult? {
+    func captureInteractive() async -> CaptureResult? {
         guard !isCapturing else {
             Log.capture.notice("capture already in progress; ignoring trigger")
             return nil
@@ -67,8 +68,7 @@ final class CaptureCoordinator {
             return nil
         }
 
-        let outcome = await overlay.present(
-            mode: mode, windows: engine.shareableContent.windows)
+        let outcome = await overlay.present(windows: engine.shareableContent.windows)
 
         switch outcome {
         case .cancelled:
@@ -138,12 +138,68 @@ final class CaptureCoordinator {
 
     @discardableResult
     func captureArea() async -> CaptureResult? {
-        await captureInteractive(startingIn: .area)
+        await captureInteractive()
     }
 
+    /// Captures the window under the pointer with no overlay at all.
+    ///
+    /// This used to open the overlay in window mode. Once hovering inside the
+    /// ordinary overlay suggests windows on its own, that was the same gesture
+    /// reached two ways — so this shortcut took the other half of the job
+    /// instead, and became the zero-interaction version the way
+    /// `captureLastArea` is the zero-interaction version of `captureArea`.
+    ///
+    /// The pointer has to already be over what you want, which is the whole
+    /// point: there is no selection step to get wrong, and the preview card that
+    /// lands a moment later is where you check the result.
     @discardableResult
     func captureWindow() async -> CaptureResult? {
-        await captureInteractive(startingIn: .window)
+        guard !isCapturing else {
+            Log.capture.notice("capture already in progress; ignoring trigger")
+            return nil
+        }
+        isCapturing = true
+        defer { isCapturing = false }
+
+        do {
+            try await engine.refreshContent()
+        } catch {
+            Log.capture.error("could not refresh shareable content: \(error, privacy: .public)")
+            return nil
+        }
+
+        // The same picker the overlay drives, with the same rejection rules — a
+        // window this cannot pick is one the overlay would not have offered
+        // either, and having the two disagree about what "the window under the
+        // pointer" means would be worse than either answer.
+        let picker = WindowPickerModel()
+        // The overlay keeps its own panels out; there are none here, but the
+        // floating previews from an earlier shot are on screen and are the one
+        // thing on this display that is certainly not what the user meant. Same
+        // second line of defence as the overlay's: they are `.none` and so
+        // normally invisible to the enumeration in the first place.
+        picker.excludedWindowIDs = additionalExcludedWindowIDs()
+        picker.load(engine.shareableContent.windows)
+        picker.reRank()
+        picker.updateHover(atAppKitGlobal: NSEvent.mouseLocation)
+
+        // Deliberately not falling through to whatever is behind. With an
+        // overlay up, a pointer over nothing pickable shows no highlight and the
+        // user simply does not click; with no overlay there is nothing to see,
+        // so capturing the window *underneath* the one being pointed at would be
+        // a wrong answer delivered silently.
+        guard let target = picker.hovered else {
+            Log.capture.notice("no pickable window under the pointer")
+            NSSound.beep()
+            return nil
+        }
+        Log.capture.notice("""
+            instant window capture: \(target.displayName, privacy: .public)
+            """)
+
+        var options = Preferences.shared.captureOptions
+        options.excludedWindowIDs = additionalExcludedWindowIDs()
+        return await perform(.window(target.id), options: options)
     }
 
     /// `afterCapture` runs the moment the image is in hand and before anything is

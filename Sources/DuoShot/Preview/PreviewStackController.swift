@@ -103,7 +103,11 @@ final class PreviewStackController {
         callbacks.close = { [weak self, weak item] in
             if let item { self?.dismiss(item) }
         }
-        callbacks.open = { NSWorkspace.shared.open(entry.url) }
+        // DuoShot's own window, not `NSWorkspace.shared.open`. Deliberately does
+        // NOT dismiss the card, unlike copy and reveal: looking at a capture is
+        // how you decide whether to copy it, so consuming the card on the way in
+        // would take the next action away.
+        callbacks.open = { ViewerWindowController.shared.show(entry) }
         callbacks.hoverChanged = { [weak self, weak item] isInside in
             guard let self, let item else { return }
             // Timers pause for the whole stack while the pointer is in the
@@ -134,7 +138,32 @@ final class PreviewStackController {
                 from: dragView, event: event, thumbnail: thumbnail,
                 frame: item.card.convert(item.card.bounds, to: dragView))
         }
+        callbacks.share = { [weak self, weak item] in
+            guard let item else { return }
+            switch ShareService.shared.state(for: entry.url) {
+            case .done(let link):
+                Clipboard.write(link: link.pageURL)
+            case .failed:
+                ShareService.shared.retry(entry)
+            default:
+                ShareService.shared.share(entry)
+            }
+            // Pressing it restarts the clock rather than consuming the card:
+            // unlike copy and reveal, the interesting part happens afterwards
+            // and the card is where it is reported.
+            self?.scheduleDismiss(item)
+        }
         card.apply(callbacks)
+
+        // Subscribing before the auto-upload call matters: a capture whose
+        // upload is already in flight (a retry, or an upload started from the
+        // menu bar) must show its ring the moment its card appears, not on the
+        // next progress callback.
+        ShareService.shared.observe(entry.url) { [weak card] state in
+            card?.setShareState(state)
+        }
+        if shouldAutoUpload(entry) { ShareService.shared.share(entry) }
+
 
         ensurePanel(on: ScreenIndex.screen(for: entry.sourceDisplayID) ?? NSScreen.main)
 
@@ -153,6 +182,23 @@ final class PreviewStackController {
         }
         scrollToNewest(animated: false)
         scheduleDismiss(item)
+    }
+
+    /// Whether this capture goes up without being asked.
+    ///
+    /// Two settings rather than one, because the two answers differ: a
+    /// screenshot is small and shared constantly, a recording is hundreds of
+    /// megabytes and often personal. Both default to off — turning either on
+    /// means every capture of that kind leaves the machine unprompted.
+    private func shouldAutoUpload(_ entry: PreviewEntry) -> Bool {
+        guard ShareService.shared.isConfigured else { return false }
+        // A capture that failed to save is still in staging awaiting pruning;
+        // uploading it would publish a file the user has already been told did
+        // not survive.
+        guard !entry.saveFailed else { return false }
+        return entry.isVideo
+            ? ShareSettings.shared.autoUploadRecordings
+            : ShareSettings.shared.autoUploadScreenshots
     }
 
     // MARK: - Panel
@@ -424,6 +470,11 @@ final class PreviewStackController {
         item.dismissTask?.cancel()
         item.dismissTask = nil
         item.dragSource = nil
+        // Stops the card being told about progress. Deliberately does NOT cancel
+        // the upload: being pushed out by a thirteenth capture is not a reason to
+        // abandon a transfer, and the link still reaches the clipboard and the
+        // menu bar without a card to land on.
+        ShareService.shared.stopObserving(item.entry.url)
 
         let card = item.card
         CATransaction.begin()
@@ -489,7 +540,14 @@ final class PreviewStackController {
             // The timer has elapsed, but the card under the pointer is never
             // taken away. Hold until the pointer leaves *this card*, then give a
             // short grace so it does not vanish the instant the mouse moves off.
-            while !Task.isCancelled, let self, let item, self.isPointerOver(item) {
+            // Two reasons to hold: the pointer is on this card, or its share is
+            // unfinished. The second is not cosmetic — the card is the only place
+            // progress and failure are reported, and a six-second timer against a
+            // minute-long upload would take that away every time. A *failed*
+            // card is pinned too, until it is dismissed or retried by hand.
+            while !Task.isCancelled, let self, let item,
+                  self.isPointerOver(item)
+                    || ShareService.shared.isPinned(item.entry.url) {
                 try? await Task.sleep(for: .milliseconds(150))
             }
             guard !Task.isCancelled else { return }
@@ -590,6 +648,15 @@ final class PreviewStackController {
     var count: Int { items.count }
 
     /// Card frames converted to AppKit global points, newest first.
+    /// Pushes a share state onto every card, for `--selftest-share-card`.
+    ///
+    /// The three states are otherwise unreachable without a configured server
+    /// and a real upload in flight, which is exactly the kind of thing a
+    /// screenshot test must not depend on.
+    func setShareStateForTest(_ state: ShareService.State?) {
+        for item in items { item.card.setShareState(state) }
+    }
+
     var panelFrames: [CGRect] {
         guard let panel else { return [] }
         return items.reversed().map { item in
@@ -629,6 +696,35 @@ final class PreviewStackController {
         let target = panel.convertPoint(toScreen: inWindow)
         pointerLocation = { target }
         return isPointerOver(ordered[index])
+    }
+
+    /// The middle of the newest card, in that card's own coordinates.
+    var newestCardCentreForTest: CGPoint? {
+        items.last.map { CGPoint(x: $0.card.bounds.midX, y: $0.card.bounds.midY) }
+    }
+
+    /// Synthesises a press-release on the newest card, in card coordinates.
+    ///
+    /// Real `NSEvent`s through the real handlers. What is under test is the
+    /// decision in `PreviewCardView.mouseUp` — a click on the disc in the middle
+    /// opens the viewer, a click anywhere else does not, and a press that travels
+    /// is a drag-out instead of either — and a hook that reached past those
+    /// methods would leave exactly that decision uncovered.
+    @discardableResult
+    func clickNewestCardForTest(at pointInCard: CGPoint) -> Bool {
+        guard let panel, let card = items.last?.card else { return false }
+        let inWindow = card.convert(pointInCard, to: nil)
+        func event(_ type: NSEvent.EventType) -> NSEvent? {
+            NSEvent.mouseEvent(
+                with: type, location: inWindow, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: panel.windowNumber, context: nil,
+                eventNumber: 0, clickCount: 1, pressure: 1)
+        }
+        guard let down = event(.leftMouseDown), let up = event(.leftMouseUp) else { return false }
+        card.mouseDown(with: down)
+        card.mouseUp(with: up)
+        return true
     }
 
     /// Which cards (newest first) the substituted pointer currently holds.

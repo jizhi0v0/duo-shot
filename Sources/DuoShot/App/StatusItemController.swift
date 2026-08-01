@@ -115,6 +115,71 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     // MARK: - Menu
 
+    /// The links this Mac has handed out lately.
+    ///
+    /// The menu bar rather than only the preview cards, because an upload
+    /// outlives its card: a recording can still be transferring long after the
+    /// six-second timer took the card away, and without this the link would have
+    /// existed only on the clipboard until the next ⌘C overwrote it.
+    ///
+    /// Plain click copies. ⌥-click deletes — and it really deletes, server-side,
+    /// which is why it is behind a modifier and says so.
+    private func recentLinksItem() -> NSMenuItem? {
+        let entries = ShareHistory.shared.entries
+        guard !entries.isEmpty else { return nil }
+
+        let submenu = NSMenu()
+        for entry in entries {
+            let item = NSMenuItem(
+                title: entry.name, action: #selector(copyRecentLink(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = entry.link.pageURL.absoluteString
+            item.toolTip = entry.link.pageURL.absoluteString
+
+            // The alternate is the same row, shown only while ⌥ is held. A
+            // separate always-visible "Delete" row per link would double the
+            // length of a menu whose whole purpose is to be glanced at.
+            let delete = NSMenuItem(
+                title: "Delete \"\(entry.name)\" from the server",
+                action: #selector(deleteRecentLink(_:)), keyEquivalent: "")
+            delete.target = self
+            delete.representedObject = entry.link.key
+            delete.isAlternate = true
+            delete.keyEquivalentModifierMask = .option
+
+            submenu.addItem(item)
+            submenu.addItem(delete)
+        }
+        submenu.addItem(.separator())
+        let clear = NSMenuItem(
+            title: "Clear This List", action: #selector(clearRecentLinks), keyEquivalent: "")
+        clear.target = self
+        clear.toolTip = "Only forgets them here. The links keep working."
+        submenu.addItem(clear)
+
+        let item = NSMenuItem(title: "Recent Links", action: nil, keyEquivalent: "")
+        item.submenu = submenu
+        return item
+    }
+
+    @objc private func copyRecentLink(_ sender: NSMenuItem) {
+        guard let string = sender.representedObject as? String,
+              let url = URL(string: string) else { return }
+        Clipboard.write(link: url)
+    }
+
+    @objc private func deleteRecentLink(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
+        ShareService.shared.revoke(key)
+    }
+
+    @objc private func clearRecentLinks() {
+        ShareHistory.shared.clear()
+    }
+
+    /// For `--selftest-share-flow`, which has no way to click a menu bar item.
+    func menuForTest() -> NSMenu { buildMenu() }
+
     private func buildMenu() -> NSMenu {
         let menu = NSMenu()
         menu.delegate = self
@@ -139,7 +204,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             return menu
         }
 
-        var actions: [HotKeyAction] = [.captureArea, .captureWindow, .captureFullscreen]
+        // `.captureWindow` is deliberately absent, and it is not an oversight:
+        // it captures whatever is under the pointer, and choosing it from a menu
+        // puts the pointer on the menu. The menu is layer 101 and so unpickable,
+        // so the hit-test would fall through to whatever window happens to be
+        // behind the status menu and capture *that* — a wrong answer delivered
+        // silently, which is the one thing this shortcut is written to avoid.
+        // It stays on its hotkey, where the pointer is wherever the user left it.
+        var actions: [HotKeyAction] = [.captureArea, .captureFullscreen]
         if coordinator.hasPreviousArea { actions.append(.captureLastArea) }
         actions.append(contentsOf: [.recordArea, .recordFullscreen])
         for action in actions {
@@ -172,6 +244,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 action: #selector(revealLast), keyEquivalent: "")
             reveal.target = self
             menu.addItem(reveal)
+            menu.addItem(.separator())
+        }
+
+        if let recent = recentLinksItem() {
+            menu.addItem(recent)
             menu.addItem(.separator())
         }
 

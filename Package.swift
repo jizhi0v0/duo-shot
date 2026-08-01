@@ -4,13 +4,22 @@ import PackageDescription
 let package = Package(
     name: "DuoShot",
     platforms: [.macOS(.v26)],
+    dependencies: [
+        // Local path, and it stays local until it earns its own repository.
+        // Pure Swift with no resources, so it links straight into the executable
+        // and `make bundle`'s "no nested code" rule is untouched.
+        .package(path: "Packages/Linkdrop")
+    ],
     targets: [
         // One ObjC file, existing only because Swift cannot @catch. Compiled into
         // the same binary, so it adds no nested code for `make sign` to handle.
         .target(name: "ObjCException", path: "Sources/ObjCException"),
         .executableTarget(
             name: "DuoShot",
-            dependencies: ["ObjCException"],
+            dependencies: [
+                "ObjCException",
+                .product(name: "Linkdrop", package: "Linkdrop"),
+            ],
             path: "Sources/DuoShot",
             swiftSettings: [
                 .swiftLanguageMode(.v6),

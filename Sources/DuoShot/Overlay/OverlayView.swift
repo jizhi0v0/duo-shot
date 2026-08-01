@@ -2,7 +2,7 @@ import AppKit
 import Carbon.HIToolbox
 
 /// One screen's worth of selection UI: the dim, the crosshair, the rubber band,
-/// the window highlight, the readout, the loupe and the armed rect's grips.
+/// the suggested window, the readout, the loupe and the armed rect's grips.
 ///
 /// All geometry exchanged with `SelectionModel` and `WindowPickerModel` is in
 /// AppKit global points; the only conversion here is the constant offset to the
@@ -12,7 +12,6 @@ final class OverlayView: NSView {
         var confirmArea: () -> Void = {}
         var confirmWindow: (CGWindowID) -> Void = { _ in }
         var cancel: () -> Void = {}
-        var toggleMode: () -> Void = {}
         /// A fresh drag has begun. Only meaningful when the caller asked for a
         /// confirmation step: it means the armed selection is being replaced and
         /// its toolbar has to go.
@@ -24,25 +23,21 @@ final class OverlayView: NSView {
     /// the SCContentFilter failed.
     static var drawsDebugSelectionBorder = false
 
-    /// Whether Space offers to switch into window mode.
+    /// Whether hovering suggests the window under the pointer.
     ///
     /// Off for recordings. A window moves, resizes and closes while a take is
-    /// running and none of those have a defined answer yet, so offering the
-    /// mode would be promising something the recorder cannot do. The hint text
-    /// follows this, because a shortcut that silently does nothing is worse
+    /// running and none of those have a defined answer yet, so suggesting one
+    /// would be offering something the recorder cannot deliver. The hint text
+    /// follows this, because an affordance that silently does nothing is worse
     /// than one that is not advertised.
-    var allowsWindowMode = true {
-        didSet { if allowsWindowMode != oldValue { refresh() } }
+    var suggestsWindows = true {
+        didSet { if suggestsWindows != oldValue { refresh() } }
     }
     /// The selection is committed and the toolbar is up. Only changes the hint —
     /// every other interaction stays live, which is the point: the rect can
     /// still be nudged and the whole thing still abandoned with Escape.
     var isArmed = false {
         didSet { if isArmed != oldValue { refresh() } }
-    }
-
-    var mode: SelectionMode = .area {
-        didSet { if mode != oldValue { refresh() } }
     }
 
     /// The photograph the loupe magnifies, once it arrives. Nil means no loupe:
@@ -111,11 +106,15 @@ final class OverlayView: NSView {
     // exactly where a dangling view segfaulted (see PreviewStackController.retire).
 
     override func resetCursorRects() {
-        let cursor: NSCursor = mode == .area ? .crosshair : .arrow
+        // The crosshair everywhere, including over a suggested window. Window
+        // mode used to swap in the arrow, and losing that is deliberate: the
+        // pointer now means the same thing everywhere on the overlay, because a
+        // press everywhere on the overlay can start the same drag.
+        let cursor: NSCursor = .crosshair
         // Over an armed selection the pointer says which of the three gestures a
         // press would start: a resize cursor on each edge and corner, an open
         // hand in the middle, the crosshair outside.
-        guard mode == .area, isArmed, let rect = model.rectInAppKitGlobal else {
+        guard isArmed, let rect = model.rectInAppKitGlobal else {
             addCursorRect(bounds, cursor: cursor)
             return
         }
@@ -196,22 +195,48 @@ final class OverlayView: NSView {
 
     override func mouseMoved(with event: NSEvent) {
         let point = toGlobal(convert(event.locationInWindow, from: nil))
-        switch mode {
-        case .area: model.pointerMoved(to: point)
-        case .window: picker.updateHover(atAppKitGlobal: point)
-        }
+        model.pointerMoved(to: point)
+        if isSuggesting { picker.updateHover(atAppKitGlobal: point) }
     }
 
-    /// Where a press landed while the selection was armed, until it either
-    /// travels far enough to be a new drag or is released as a plain click.
-    private var armedPressOrigin: CGPoint?
+    /// Whether a window is currently being offered under the pointer.
+    ///
+    /// Only while nothing else is going on: mid-drag the rubber band is the
+    /// answer, and once armed the rect is already decided. Both are states in
+    /// which a second highlight would be claiming to be the selection.
+    private var isSuggesting: Bool {
+        suggestsWindows && !isArmed && model.phase == .idle
+    }
 
-    /// Below this a press is a click, not a new selection.
+    /// The window a click would take, or nil.
+    private var suggestedWindow: WindowInfo? {
+        isSuggesting ? picker.hovered : nil
+    }
+
+    /// The same answer, for `--selftest-window`.
+    var suggestedWindowForTest: WindowInfo? { suggestedWindow }
+
+    /// Where a press landed, until it either travels far enough to be a drag or
+    /// is released as a plain click.
+    ///
+    /// One property for both states, armed and not, because the two now decide
+    /// the same question: this press is not yet anything, and committing to a
+    /// reading of it before it has travelled would throw away whichever
+    /// interpretation the user actually meant.
+    private var pressOrigin: CGPoint?
+
+    /// Below this a press is a click, not a selection.
     ///
     /// Without it, an armed selection was destroyed by any click anywhere:
     /// `SelectionModel.isUsable` passes at 1×1 pt, so the pixel of travel in an
     /// ordinary click was a complete, confirmable rect, and the toolbar
     /// re-armed itself wherever the pointer happened to be.
+    ///
+    /// The un-armed path had the same bug with a quieter symptom, and it is what
+    /// the click gesture is now built on: a press with one point of hand-shake in
+    /// it went all the way through `confirmArea` and saved a 1×1 PNG. A click is
+    /// how you take the suggested window, so it had to stop being a selection
+    /// first.
     private static let restartSlop: CGFloat = 5
 
     /// A press inside the armed selection: where it started, and where the rect
@@ -226,37 +251,33 @@ final class OverlayView: NSView {
     private var resizePress: (handle: SelectionZones.Handle, rect: CGRect)?
 
     override func mouseDown(with event: NSEvent) {
-        guard mode == .area else { return }
-        guard let screen = window?.screen else { return }
         let point = toGlobal(convert(event.locationInWindow, from: nil))
-        // Armed, so this press is not yet anything. Deciding here would throw
-        // the selection away before knowing whether the user meant to.
-        if isArmed {
-            // On an edge or corner it means "resize", elsewhere inside it means
-            // "move this", outside it means "start again". Which is the only
-            // reading that leaves all three available: before this, a press
-            // anywhere — including on the selection the user had just carefully
-            // placed — could only destroy it, so nudging a rect two points to
-            // the left meant redrawing it.
-            if let rect = model.rectInAppKitGlobal {
-                let zones = SelectionZones(rect: rect)
-                if let handle = zones.handle(at: point) {
-                    resizePress = (handle: handle, rect: rect)
-                    return
-                }
-                if rect.contains(point) {
-                    movePress = (pointer: point, origin: rect.origin)
-                    return
-                }
+        // On an armed selection's edge or corner a press means "resize", and
+        // elsewhere inside it means "move this". Which is the only reading that
+        // leaves all three gestures available: before this, a press anywhere —
+        // including on the selection the user had just carefully placed — could
+        // only destroy it, so nudging a rect two points to the left meant
+        // redrawing it.
+        if isArmed, let rect = model.rectInAppKitGlobal {
+            let zones = SelectionZones(rect: rect)
+            if let handle = zones.handle(at: point) {
+                resizePress = (handle: handle, rect: rect)
+                return
             }
-            armedPressOrigin = point
-            return
+            if rect.contains(point) {
+                movePress = (pointer: point, origin: rect.origin)
+                return
+            }
         }
-        model.beginDrag(at: point, on: screen)
+        // Everything else is a press that is not yet anything. Deliberately no
+        // `beginDrag` here: starting the drag on the press would put the model
+        // into `.dragging` and take the suggested window's outline off screen
+        // the instant the mouse went down, so a click — which is how you accept
+        // that window — would flicker the thing it is accepting.
+        pressOrigin = point
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard mode == .area else { return }
         let point = toGlobal(convert(event.locationInWindow, from: nil))
 
         if let press = resizePress {
@@ -273,13 +294,16 @@ final class OverlayView: NSView {
             return
         }
 
-        if let origin = armedPressOrigin {
+        if let origin = pressOrigin {
             guard hypot(point.x - origin.x, point.y - origin.y) > Self.restartSlop else { return }
             guard let screen = window?.screen else { return }
-            armedPressOrigin = nil
-            // Before `beginDrag`, so the toolbar is gone by the time the new
-            // rect starts being drawn under where it used to be.
+            pressOrigin = nil
+            // Before `beginDrag`, so an armed toolbar is gone by the time the new
+            // rect starts being drawn under where it used to be. A no-op when
+            // nothing was armed.
             callbacks.selectionRestarted()
+            // From the press, not from here: the rect the user drew starts where
+            // they put the mouse down, not five points into the gesture.
             model.beginDrag(at: origin, on: screen)
         }
 
@@ -287,26 +311,34 @@ final class OverlayView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
-        switch mode {
-        case .window:
-            if let hovered = picker.hovered { callbacks.confirmWindow(hovered.id) }
-        case .area:
-            // A press that never travelled, or one that moved or resized the
-            // selection rather than replacing it. Either way the armed rect stands and the
-            // click is discarded — clicking the dim to dismiss would be a second,
-            // undiscoverable way to lose a selection that Escape already handles
-            // visibly. The moved rect needs no confirming: it is still armed, and
-            // the bar over it is still the thing that starts the take.
-            if armedPressOrigin != nil || movePress != nil || resizePress != nil {
-                armedPressOrigin = nil
-                movePress = nil
-                resizePress = nil
-                return
-            }
-            model.updateDrag(to: toGlobal(convert(event.locationInWindow, from: nil)))
-            model.endDrag()
-            if model.isUsable { callbacks.confirmArea() }
+        let point = toGlobal(convert(event.locationInWindow, from: nil))
+
+        // A press that moved or resized the armed selection rather than
+        // replacing it. The rect stands and needs no confirming: it is still
+        // armed, and the bar over it is still the thing that starts the take.
+        if movePress != nil || resizePress != nil {
+            movePress = nil
+            resizePress = nil
+            return
         }
+
+        // A press that never travelled far enough to be a drag, so it is a
+        // click: it takes the suggested window, or it does nothing at all.
+        //
+        // Doing nothing is the right answer for a click on bare desktop, and for
+        // any click while armed. Dismissing on it would be a second,
+        // undiscoverable way to lose a selection that Escape already handles
+        // visibly.
+        if pressOrigin != nil {
+            pressOrigin = nil
+            if isSuggesting { picker.updateHover(atAppKitGlobal: point) }
+            if let suggested = suggestedWindow { callbacks.confirmWindow(suggested.id) }
+            return
+        }
+
+        model.updateDrag(to: point)
+        model.endDrag()
+        if model.isUsable { callbacks.confirmArea() }
     }
 
     // MARK: - Keyboard
@@ -320,10 +352,6 @@ final class OverlayView: NSView {
         let resizing = event.modifierFlags.contains(.option)
 
         switch Int(event.keyCode) {
-        case kVK_Space:
-            // Matches the system screenshot UI, where Space swaps between
-            // dragging a region and picking a window.
-            if allowsWindowMode { callbacks.toggleMode() }
         case kVK_Return, kVK_ANSI_KeypadEnter:
             confirmFromKeyboard()
         case kVK_Escape:
@@ -341,17 +369,24 @@ final class OverlayView: NSView {
         }
     }
 
+    /// Return takes whichever of the two things is on offer.
+    ///
+    /// A drawn rect wins over a suggested window, and not by accident: the two
+    /// are never both live (`isSuggesting` requires an idle model), so the order
+    /// only decides the case where a rect exists and the pointer happens to be
+    /// over a window — where the rect is plainly what the user has been working
+    /// on.
     private func confirmFromKeyboard() {
-        switch mode {
-        case .area:
-            if model.isUsable { callbacks.confirmArea() } else { NSSound.beep() }
-        case .window:
-            if let hovered = picker.hovered { callbacks.confirmWindow(hovered.id) } else { NSSound.beep() }
+        if model.isUsable {
+            callbacks.confirmArea()
+        } else if let suggested = suggestedWindow {
+            callbacks.confirmWindow(suggested.id)
+        } else {
+            NSSound.beep()
         }
     }
 
     private func apply(_ delta: CGVector, resizing: Bool) {
-        guard mode == .area else { return }
         if resizing { model.resize(by: delta) } else { model.nudge(by: delta) }
     }
 
@@ -364,11 +399,11 @@ final class OverlayView: NSView {
     /// display leaves this view's entry nil before and after.
     private struct DrawInputs: Equatable {
         var highlight: CGRect?
+        var suggestion: CGRect?
         var pointer: CGPoint?
         var phase: SelectionModel.Phase
-        var mode: SelectionMode
         var isArmed: Bool
-        var allowsWindowMode: Bool
+        var suggestsWindows: Bool
         var badge: String?
         var hasBackdrop: Bool
         var backingScale: CGFloat
@@ -380,19 +415,20 @@ final class OverlayView: NSView {
         let highlight = highlightRect
         let local = model.pointerInAppKitGlobal
             .map { toLocal(CGRect(origin: $0, size: .zero)).origin }
-        let badge: String? = switch mode {
-        case .area: highlight.map { "\(Int($0.width)) × \(Int($0.height))" }
-        case .window: picker.hovered?.displayName
-        }
+        // The rect's size while there is a rect, the window's name while there
+        // is only a suggestion. Never both, and never nothing while something is
+        // highlighted.
+        let badge = highlight.map { "\(Int($0.width)) × \(Int($0.height))" }
+            ?? suggestedWindow?.displayName
         return DrawInputs(
             highlight: highlight,
+            suggestion: suggestionRect,
             // The same inset `placeLoupe` uses, so the two agree about which
             // screen the pointer is on.
             pointer: local.flatMap { bounds.insetBy(dx: -1, dy: -1).contains($0) ? $0 : nil },
             phase: model.phase,
-            mode: mode,
             isArmed: isArmed,
-            allowsWindowMode: allowsWindowMode,
+            suggestsWindows: suggestsWindows,
             badge: badge,
             hasBackdrop: backdrop != nil,
             backingScale: window?.backingScaleFactor ?? 2)
@@ -425,7 +461,7 @@ final class OverlayView: NSView {
     /// armed: by then the rect is decided and the bar over it is what the user is
     /// reading.
     private func placeLoupe() {
-        guard mode == .area, !isArmed, backdrop != nil,
+        guard !isArmed, backdrop != nil,
               let pointer = model.pointerInAppKitGlobal
         else {
             loupe.isHidden = true
@@ -452,31 +488,45 @@ final class OverlayView: NSView {
         loupe.setFrameOrigin(CGPoint(x: origin.x.rounded(), y: origin.y.rounded()))
     }
 
-    /// The un-dimmed region: the rubber band in area mode, the hovered window in
-    /// window mode.
+    /// The un-dimmed region: the rubber band, and only the rubber band.
+    ///
+    /// The suggested window deliberately does not come through here — see
+    /// `drawSuggestion` for why it gets its own, much weaker treatment.
     private var highlightRect: CGRect? {
-        switch mode {
-        case .area:
-            model.rectInAppKitGlobal.map(toLocal)
-        case .window:
-            picker.hoveredFrameInAppKitGlobal.map(toLocal)
-        }
+        model.rectInAppKitGlobal.map(toLocal)
+    }
+
+    /// The suggested window's frame in this view's coordinates, or nil.
+    private var suggestionRect: CGRect? {
+        guard suggestedWindow != nil else { return nil }
+        return picker.hoveredFrameInAppKitGlobal.map(toLocal)
     }
 
     override func draw(_ dirtyRect: NSRect) {
         let highlight = highlightRect
+        let hasHighlight = highlight.map { $0.width >= 1 && $0.height >= 1 } ?? false
+        // Only ever one of the two, and the rect wins — see `drawSuggestion`.
+        let suggestion = hasHighlight ? nil : suggestionRect
 
         NSColor(white: 0, alpha: 0.28).setFill()
         let path = NSBezierPath(rect: bounds)
-        if let highlight, highlight.width >= 1, highlight.height >= 1 {
-            path.appendRect(highlight)
+        // Both holes are cut the same way, and the difference between "what you
+        // have" and "what you would get" is how much dim goes back in after.
+        if let hole = hasHighlight ? highlight : suggestion {
+            path.appendRect(hole)
             path.windingRule = .evenOdd
         }
         path.fill()
 
-        guard let highlight, highlight.width >= 1, highlight.height >= 1 else {
-            if mode == .area, let pointer = model.pointerInAppKitGlobal, model.phase == .idle {
+        guard let highlight, hasHighlight else {
+            // The press-but-not-yet-moved instant. Nothing else is on screen
+            // yet, so this is the only frame where the crosshair stands alone.
+            if let pointer = model.pointerInAppKitGlobal, model.phase == .dragging {
                 drawCrosshair(at: toLocal(CGRect(origin: pointer, size: .zero)).origin)
+            }
+            if let suggestion, let suggested = suggestedWindow {
+                drawSuggestion(suggestion)
+                drawBadge(suggested.displayName, near: suggestion)
             }
             drawHint()
             return
@@ -495,16 +545,61 @@ final class OverlayView: NSView {
             )).fill()
         }
 
-        switch mode {
-        case .area:
-            if isArmed { drawHandles(on: highlight) }
-            drawBadge("\(Int(highlight.width)) × \(Int(highlight.height))", near: highlight)
-        case .window:
-            if let hovered = picker.hovered {
-                drawBadge(hovered.displayName, near: highlight)
-            }
+        // Through the drag, and clipped to outside the rect. The pointer *is* the
+        // moving corner, so the two lines run along the two edges the user is
+        // still placing and carry on to the screen edges — which is the whole
+        // use of them: they say what those edges line up with out in the rest of
+        // the screen. Letting them continue across the selection would draw a
+        // cross over the one region that has to be shown untouched.
+        if let pointer = model.pointerInAppKitGlobal, model.phase == .dragging {
+            NSGraphicsContext.saveGraphicsState()
+            let outside = NSBezierPath(rect: bounds)
+            outside.appendRect(highlight)
+            outside.windingRule = .evenOdd
+            outside.addClip()
+            drawCrosshair(at: toLocal(CGRect(origin: pointer, size: .zero)).origin)
+            NSGraphicsContext.restoreGraphicsState()
         }
+
+        if isArmed { drawHandles(on: highlight) }
+        drawBadge("\(Int(highlight.width)) × \(Int(highlight.height))", near: highlight)
         drawHint()
+    }
+
+    /// The window a click would take: a partial un-dim and an outline.
+    ///
+    /// Deliberately *not* the full un-dim a drawn selection gets, which is how
+    /// window mode used to draw this. That treatment could not survive the
+    /// merge for two reasons. It now fires on every hover as the pointer sweeps
+    /// the screen, and a window flashing to full brightness under the cursor
+    /// reads as the UI malfunctioning rather than as an offer. And it is the
+    /// same treatment the committed selection gets — these are precisely the
+    /// two states a user has to tell apart, since one is what they have and the
+    /// other is only what they would get.
+    ///
+    /// So it lands between the two: `draw` cuts this rect out of the dim, and
+    /// this puts back less than was taken. The first attempt did the arithmetic
+    /// the other way round — full dim, plus a wash of white on top — which is
+    /// not the same picture at all. Adding white lifts the black point without
+    /// touching the white one, so it flattens contrast and pulls every colour
+    /// towards grey: the window read as fogged rather than as lit, and a
+    /// screenshot tool showing you a washed-out version of what you are about
+    /// to shoot is lying about the shot. Removing dim instead leaves the
+    /// window's own colours intact and only turns them down.
+    private func drawSuggestion(_ rect: CGRect) {
+        NSColor(white: 0, alpha: 0.12).setFill()
+        NSBezierPath(rect: rect).fill()
+        // A dark hairline outside a light one, the pairing the grips and the
+        // badge already use: this lands on whatever the user happens to be
+        // pointing at, which can be any colour at all.
+        NSColor(white: 0, alpha: 0.45).setStroke()
+        let shadow = NSBezierPath(rect: rect.insetBy(dx: -0.5, dy: -0.5))
+        shadow.lineWidth = 1
+        shadow.stroke()
+        NSColor(white: 1, alpha: 0.9).setStroke()
+        let outline = NSBezierPath(rect: rect.insetBy(dx: 0.5, dy: 0.5))
+        outline.lineWidth = 1
+        outline.stroke()
     }
 
     /// Four corner grips, drawn only once the selection is armed.
@@ -532,6 +627,18 @@ final class OverlayView: NSView {
         }
     }
 
+    /// The two screen-spanning guide lines. Drawn only while the button is down.
+    ///
+    /// It used to be the other way round — shown while aiming, gone the moment a
+    /// drag started — and that stopped working when hovering began offering
+    /// windows. At idle the pointer now has something else to say: a window is
+    /// outlined under it, and two lines running out of that outline to the screen
+    /// edges break it up into four segments and read as clutter over a UI that is
+    /// already showing you the answer. The cursor is still the crosshair
+    /// everywhere (`resetCursorRects`), so "you can drag from here" has not gone
+    /// anywhere; what has gone is the full-screen version of it, which was doing
+    /// its real work — telling you what an edge lines up with — during the drag,
+    /// the one time it was not on screen.
     private func drawCrosshair(at point: CGPoint) {
         guard bounds.contains(point) else { return }
         NSColor(white: 1, alpha: 0.55).setStroke()
@@ -547,10 +654,8 @@ final class OverlayView: NSView {
     private func drawHint() {
         let text = if isArmed {
             "⏎ to record · drag to move, edges to resize · drag outside to reselect · Esc"
-        } else if mode != .area {
-            "Click a window · Space for area · Esc to cancel"
-        } else if allowsWindowMode {
-            "Drag to select · Space for window · Esc to cancel"
+        } else if suggestsWindows {
+            "Drag to select · click a window · Esc to cancel"
         } else {
             "Drag to select an area to record · Esc to cancel"
         }

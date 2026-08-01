@@ -18,6 +18,10 @@ final class PreviewCardView: NSView {
         var open: () -> Void = {}
         var hoverChanged: (Bool) -> Void = { _ in }
         var beginDrag: (NSEvent, NSImage) -> Void = { _, _ in }
+        /// Upload, or copy the link once there is one, or retry after a failure —
+        /// the card decides which from its own share state, so the stack does not
+        /// have to hand down three closures for one button.
+        var share: () -> Void = {}
     }
 
     static let cardSize = CGSize(width: 208, height: 132)
@@ -46,8 +50,17 @@ final class PreviewCardView: NSView {
     private var trackingAreaRef: NSTrackingArea?
 
     private var actionBar: NSVisualEffectView!
+    private var shareButton: NSButton?
+    private var buttonRing: ButtonRingView?
+    private var centerRing: ButtonRingView?
+    /// Non-nil only while uploading. The two rings are derived from this and
+    /// the hover state, never set directly — see `refreshUploadIndicator`.
+    private var uploadFraction: Double?
+    private var tickTask: Task<Void, Never>?
+    private var shareBadge: NSView?
+    private(set) var shareState: ShareService.State?
     private var closeButton: NSView!
-    private var playGlyph: NSView?
+    private var centerButton: CenterActionView!
     private var isHovering = false
 
     init(image: NSImage, badge: String? = nil, isIncomplete: Bool = false,
@@ -88,9 +101,54 @@ final class PreviewCardView: NSView {
     /// answers `hitTest` with itself even when it is a plain label, which would
     /// leave a corner of the card where drag and double-click quietly stop
     /// working.
-    private final class PassthroughView: NSView {
+    final class PassthroughView: NSView {
         override func hitTest(_ point: NSPoint) -> NSView? { nil }
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    }
+
+    /// The disc in the middle of the card.
+    ///
+    /// Deliberately not an `NSButton`, and not hit-testable at all: every mouse
+    /// event still falls through to `PreviewCardView`, which owns the gestures. A
+    /// real control here would swallow `mouseDown` and take drag-out away from
+    /// the middle of the card — which is exactly where a pointer reaching for a
+    /// small tile lands. The card decides on mouse-*up* whether the press was a
+    /// click on this disc or the beginning of a drag, and that is the only
+    /// reading that leaves both gestures available.
+    ///
+    /// It still gets its own tracking area, because tracking is geometric and
+    /// does not consult `hitTest`: the disc can light up under the pointer while
+    /// staying invisible to event routing.
+    private final class CenterActionView: NSView {
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+        private var trackingAreaRef: NSTrackingArea?
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let trackingAreaRef { removeTrackingArea(trackingAreaRef) }
+            // `.activeAlways` for the reason the card's own area is: this panel
+            // is never the key window.
+            let area = NSTrackingArea(
+                rect: .zero,
+                options: [.activeAlways, .mouseEnteredAndExited, .inVisibleRect],
+                owner: self)
+            addTrackingArea(area)
+            trackingAreaRef = area
+        }
+
+        override func mouseEntered(with event: NSEvent) { applyHighlight(true) }
+        override func mouseExited(with event: NSEvent) { applyHighlight(false) }
+
+        /// The only thing that says this disc is a target rather than a badge.
+        /// There is no pointing-hand cursor to lean on — cursor rects belong to
+        /// the window, and this one is a non-activating panel that never becomes
+        /// key.
+        func applyHighlight(_ on: Bool) {
+            layer?.backgroundColor = NSColor(white: 0.08, alpha: on ? 0.85 : 0.55).cgColor
+            layer?.borderColor = NSColor(white: 1, alpha: on ? 0.8 : 0.3).cgColor
+        }
     }
 
     private func buildSubviews() {
@@ -108,12 +166,18 @@ final class PreviewCardView: NSView {
         imageView.layer?.backgroundColor = NSColor(white: 0.09, alpha: 0.96).cgColor
         addSubview(imageView)
 
-        if let badge { buildVideoDecoration(duration: badge) }
+        buildCenterButton()
+        if let badge { buildDurationPill(badge) }
         if saveFailed { buildSaveWarning() }
 
+        // Viewing is not in this bar: it is the button in the middle of the card.
+        // These two are the actions that consume the card and send the capture
+        // somewhere else; opening it is what you do *before* deciding, so it gets
+        // the position your eye is already on.
         let specs: [(symbol: String, tip: String, action: Selector)] = [
             ("doc.on.doc", "Copy", #selector(copyTapped)),
             ("folder", "Show in Finder", #selector(revealTapped)),
+            ("square.and.arrow.up", "Upload and copy link", #selector(shareTapped)),
         ]
         let buttonWidth: CGFloat = 30
         let barWidth = CGFloat(specs.count) * buttonWidth + 6
@@ -146,7 +210,18 @@ final class PreviewCardView: NSView {
             button.target = self
             button.action = spec.action
             bar.addSubview(button)
+            if spec.symbol == "square.and.arrow.up" { shareButton = button }
         }
+        // One source of truth for how this button looks.
+        //
+        // It used to be set here at construction *and* in `setShareState`, and
+        // the two disagreed: a fresh card has no share state, so nothing ever
+        // pushes one and `setShareState` never ran — leaving whatever glyph was
+        // hard-coded here. The card shipped showing a link before anything had
+        // been uploaded. `--selftest-share-card` missed it because it reached
+        // "idle" by pushing `nil` explicitly, which is the one way a real card
+        // never gets there.
+        setShareState(nil)
 
         // Dismiss, top-left, the way CleanShot places it. The circle is drawn by
         // a container rather than the button's own layer: NSButton manages that
@@ -179,33 +254,56 @@ final class PreviewCardView: NSView {
         closeButton = closeWell
     }
 
-    /// The two marks that separate a recording from a screenshot: a play glyph
-    /// in the middle and the running time in the top-right.
+    /// The button in the middle of the card: open this capture in DuoShot's own
+    /// window.
     ///
-    /// Top-right for the pill specifically — the bottom edge belongs to the
-    /// action bar and the top-left to the close button, so it is the one corner
-    /// that is never occupied.
-    private func buildVideoDecoration(duration: String) {
-        let diameter: CGFloat = 34
-        let well = PassthroughView(frame: CGRect(
+    /// Dead centre because it is the primary thing you do with a card, and
+    /// because it is where the viewer will grow into an editor — a button that
+    /// moves once annotation lands would cost the muscle memory it is building
+    /// now.
+    ///
+    /// A recording gets the play glyph it already had rather than an eye. The
+    /// mark that says "this is a recording" and the target that says "open it"
+    /// want the same spot and mean the same thing, so they are one control.
+    private func buildCenterButton() {
+        let diameter: CGFloat = 36
+        let well = CenterActionView(frame: CGRect(
             x: ((bounds.width - diameter) / 2).rounded(),
             y: ((bounds.height - diameter) / 2).rounded(),
             width: diameter, height: diameter))
         well.autoresizingMask = [.minXMargin, .maxXMargin, .minYMargin, .maxYMargin]
         well.wantsLayer = true
         well.layer?.cornerRadius = diameter / 2
-        well.layer?.backgroundColor = NSColor(white: 0.08, alpha: 0.55).cgColor
         well.layer?.borderWidth = 1
-        well.layer?.borderColor = NSColor(white: 1, alpha: 0.3).cgColor
+        well.applyHighlight(false)
 
+        let isVideo = badge != nil
         let glyph = PassthroughImageView(frame: well.bounds)
-        glyph.image = Self.symbol("play.fill", pointSize: 14, description: "Recording")
+        // Two point sizes for one disc, because SF Symbols are sized by cap
+        // height rather than by how much room they take: `eye` is a wide, low
+        // glyph and `play.fill` a narrow, tall one, so the same number leaves the
+        // eye touching the ring while the triangle still has air around it.
+        glyph.image = isVideo
+            ? Self.symbol("play.fill", pointSize: 14, description: "Play")
+            : Self.symbol("eye", pointSize: 12, description: "View")
         glyph.contentTintColor = .white
         glyph.imageScaling = .scaleNone
         well.addSubview(glyph)
+        // A still's card is a picture, and a disc parked in the middle of it is
+        // in the way of the one thing the card is for. A recording's is not: the
+        // glyph is what distinguishes it from a screenshot of the same screen, so
+        // it has to be there before the pointer arrives.
+        well.alphaValue = isVideo ? 1 : 0
         addSubview(well)
-        playGlyph = well
+        centerButton = well
+    }
 
+    /// The running time, top-right.
+    ///
+    /// That corner specifically: the bottom edge belongs to the action bar, the
+    /// top-left to the close button and the middle to the open button, so it is
+    /// the one place that is never occupied.
+    private func buildDurationPill(_ duration: String) {
         let label = NSTextField(labelWithString: isIncomplete ? "⚠ \(duration)" : duration)
         label.font = .monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
         label.textColor = .white
@@ -234,8 +332,8 @@ final class PreviewCardView: NSView {
     }
 
     /// How much of the top-right corner the duration pill has already taken.
-    private var topRightUsedWidth: CGFloat = 0
-    private static let badgeInset: CGFloat = 6
+    var topRightUsedWidth: CGFloat = 0
+    static let badgeInset: CGFloat = 6
     private static let badgeGap: CGFloat = 5
 
     /// Says the file is not where the user thinks it is.
@@ -270,10 +368,191 @@ final class PreviewCardView: NSView {
         addSubview(pill)
     }
 
+    // MARK: - Share state
+
+    /// The card's appearance while its capture uploads, and after.
+    ///
+    /// Everything happens on the one button that started it: ring while
+    /// uploading, tick when it lands, retry glyph when it does not. The
+    /// alternative — a ring in the middle of the card — covered the open button,
+    /// which is the primary thing a card is for.
+    ///
+    /// The tick is not decoration. Without it "done" and "never uploaded" look
+    /// identical, so the one moment that confirms the link is on the clipboard
+    /// would pass with no sign at all.
+    ///
+    /// The glyphs go `square.and.arrow.up` → ring → `checkmark` →
+    /// `link.circle.fill`, and the last one is the interesting choice. "Copy the
+    /// link" is two ideas and there is no glyph for both: `doc.on.clipboard`
+    /// says copy but sits next to this bar's existing `doc.on.doc`, and two
+    /// copy-ish glyphs side by side is the one arrangement guaranteed to
+    /// confuse. So the button says *link* and lets **filled-vs-outline** carry
+    /// the state — every other glyph in the bar is an outline, so the filled one
+    /// reads as "this exists now", and pressing it is confirmed by the flash
+    /// rather than by the icon.
+    func setShareState(_ state: ShareService.State?) {
+        shareState = state
+
+        shareBadge?.removeFromSuperview()
+        shareBadge = nil
+        tickTask?.cancel()
+        tickTask = nil
+
+        switch state {
+        case .uploading(let fraction):
+            uploadFraction = fraction
+            refreshUploadIndicator()
+            shareButton?.isHidden = false
+            shareButton?.isEnabled = false
+            shareButton?.image = nil
+            shareButton?.toolTip = "Uploading… \(Int(fraction * 100))%"
+
+        case .done:
+            uploadFraction = nil
+            refreshUploadIndicator()
+            shareButton?.isHidden = false
+            shareButton?.isEnabled = true
+            shareButton?.toolTip = "Copy link"
+            shareButton?.image = Self.symbol(
+                "checkmark", pointSize: 12, weight: .semibold, description: "Uploaded")
+            shareButton?.contentTintColor = .systemGreen
+            // Back to the link glyph after a beat: the tick answers "did it
+            // work", and once answered the button should say what it does next.
+            tickTask = Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(1600))
+                guard !Task.isCancelled, let self else { return }
+                self.shareButton?.contentTintColor = .white
+                self.shareButton?.image = Self.symbol(
+                    "link", pointSize: 12, description: "Copy link")
+            }
+
+        case .failed(let message, let retryable):
+            uploadFraction = nil
+            refreshUploadIndicator()
+            shareButton?.isHidden = false
+            shareButton?.isEnabled = retryable
+            shareButton?.contentTintColor = .white
+            shareButton?.toolTip = message
+            shareButton?.image = Self.symbol(
+                retryable ? "arrow.clockwise" : "square.and.arrow.up", pointSize: 12,
+                description: retryable ? "Retry" : "Upload")
+            buildShareWarning(message)
+
+        case .none:
+            uploadFraction = nil
+            refreshUploadIndicator()
+            shareButton?.isHidden = !ShareService.shared.isConfigured
+            shareButton?.isEnabled = true
+            shareButton?.contentTintColor = .white
+            shareButton?.toolTip = "Upload and copy link"
+            // The platform's own glyph for this action. `arrow.up.circle` says
+            // "upload" to a developer; this says "share" to everyone, and that
+            // is what the button does.
+            shareButton?.image = Self.symbol(
+                "square.and.arrow.up", pointSize: 12, description: "Upload")
+        }
+    }
+
+    /// Where the progress is shown depends on whether the pointer is here.
+    ///
+    /// **Not hovering: a ring in the middle of the card.** This is the case that
+    /// matters most and the one the first design got wrong — the ring lived in
+    /// the action bar, which is `alpha = 0` until the pointer arrives, so an
+    /// automatic upload ran with nothing on screen to say so.
+    ///
+    /// **Hovering: a small ring on the share button, and the card's own controls
+    /// back.** Hovering is the moment someone is reaching for open or copy, so
+    /// the middle of the card has to be theirs again. The feedback moves to the
+    /// button that started it and stops covering the primary action.
+    ///
+    /// Both are derived from `uploadFraction` + `isHovering` rather than set at
+    /// the call sites, so the two ways in — a progress callback and the pointer
+    /// crossing the edge — cannot disagree.
+    private func refreshUploadIndicator() {
+        guard let fraction = uploadFraction else {
+            centerRing?.removeFromSuperview(); centerRing = nil
+            buttonRing?.removeFromSuperview(); buttonRing = nil
+            centerButton?.isHidden = false
+            return
+        }
+
+        if isHovering {
+            centerRing?.removeFromSuperview()
+            centerRing = nil
+            centerButton?.isHidden = false
+            showButtonRing(fraction)
+        } else {
+            buttonRing?.removeFromSuperview()
+            buttonRing = nil
+            // The open button and the ring want the same disc, and while the
+            // pointer is away the ring is the only thing worth saying.
+            centerButton?.isHidden = true
+            showCenterRing(fraction)
+        }
+    }
+
+    private func showCenterRing(_ fraction: Double) {
+        if centerRing == nil {
+            let diameter: CGFloat = 36
+            let ring = ButtonRingView(diameter: diameter)
+            ring.setFrameOrigin(CGPoint(
+                x: ((bounds.width - diameter) / 2).rounded(),
+                y: ((bounds.height - diameter) / 2).rounded()))
+            ring.autoresizingMask = [.minXMargin, .maxXMargin, .minYMargin, .maxYMargin]
+            addSubview(ring)
+            centerRing = ring
+        }
+        centerRing?.fraction = fraction
+    }
+
+    /// In the bar rather than on the button's own layer: `NSButton` manages that
+    /// layer itself and things added to it do not reliably survive — the same
+    /// reason the close button's circle is drawn by a container view.
+    private func showButtonRing(_ fraction: Double) {
+        guard let bar = actionBar, let button = shareButton else { return }
+        if buttonRing == nil {
+            let diameter: CGFloat = 20
+            let ring = ButtonRingView(diameter: diameter)
+            ring.setFrameOrigin(CGPoint(
+                x: (button.frame.midX - diameter / 2).rounded(),
+                y: (button.frame.midY - diameter / 2).rounded()))
+            bar.addSubview(ring)
+            buttonRing = ring
+        }
+        buttonRing?.fraction = fraction
+    }
+
+    /// Same corner and same shape as the "Not saved" badge, because it says the
+    /// same class of thing: something you would otherwise believe worked did not.
+    private func buildShareWarning(_ message: String) {
+        let label = NSTextField(labelWithString: "⚠ Not shared")
+        label.font = .systemFont(ofSize: 10, weight: .semibold)
+        label.textColor = .white
+        label.sizeToFit()
+
+        let padding = CGSize(width: 7, height: 3)
+        let pill = PassthroughView(frame: CGRect(
+            x: bounds.width - label.frame.width - padding.width * 2
+                - Self.badgeInset - topRightUsedWidth,
+            y: bounds.height - label.frame.height - padding.height * 2 - Self.badgeInset,
+            width: label.frame.width + padding.width * 2,
+            height: label.frame.height + padding.height * 2))
+        pill.autoresizingMask = [.minXMargin, .minYMargin]
+        pill.wantsLayer = true
+        pill.layer?.cornerRadius = pill.frame.height / 2
+        pill.layer?.cornerCurve = .continuous
+        pill.layer?.backgroundColor = NSColor.systemOrange.withAlphaComponent(0.9).cgColor
+        pill.toolTip = message
+        label.setFrameOrigin(CGPoint(x: padding.width, y: padding.height))
+        pill.addSubview(label)
+        addSubview(pill)
+        shareBadge = pill
+    }
+
     /// SF Symbols render at their natural size unless told otherwise, and
     /// `imageScaling` only ever scales *down*. Without an explicit point size the
     /// glyphs came out several times larger than their buttons.
-    private static func symbol(
+    static func symbol(
         _ name: String, pointSize: CGFloat, weight: NSFont.Weight = .medium,
         description: String
     ) -> NSImage? {
@@ -317,6 +596,8 @@ final class PreviewCardView: NSView {
         setHovering(hovering)
         actionBar.alphaValue = hovering ? 1 : 0
         closeButton.alphaValue = hovering ? 1 : 0
+        if badge == nil { centerButton.alphaValue = hovering ? 1 : 0 }
+        refreshUploadIndicator()
         displayIfNeeded()
     }
 
@@ -327,11 +608,13 @@ final class PreviewCardView: NSView {
             context.duration = 0.12
             actionBar.animator().alphaValue = hovering ? 1 : 0
             closeButton.animator().alphaValue = hovering ? 1 : 0
-            // Recedes rather than disappears: it is what marks the card as a
-            // recording, and hovering is exactly when you are deciding what the
-            // card is.
-            playGlyph?.animator().alphaValue = hovering ? 0.35 : 1
+            // A still's open button fades in with the rest of the controls. A
+            // recording's is already there and stays: it used to recede on hover,
+            // which made sense while it was only a marker, and is exactly
+            // backwards now that it is the thing being reached for.
+            if badge == nil { centerButton.animator().alphaValue = hovering ? 1 : 0 }
         }
+        refreshUploadIndicator()
         callbacks.hoverChanged(hovering)
     }
 
@@ -360,10 +643,58 @@ final class PreviewCardView: NSView {
             isDraggingOut = false
         }
         guard !isDraggingOut, mouseDownGlobal != nil else { return }
+        // A single click on the disc in the middle. Decided here rather than by
+        // making the disc a control — see `CenterActionView` for why.
+        //
+        // Unconditional on the disc's own visibility: on a still it only fades in
+        // on hover, and you cannot click a card you are not hovering, so the two
+        // can never disagree. A click in the middle means open either way.
+        let point = convert(event.locationInWindow, from: nil)
+        if centerButton.frame.contains(point) {
+            callbacks.open()
+            return
+        }
         if event.clickCount >= 2 { callbacks.open() }
     }
 
     // MARK: - Actions
+
+    @objc private func openTapped() { callbacks.open() }
+    @objc private func shareTapped() {
+        // The card confirms its own press. Copy and reveal get away without
+        // this because they consume the card — the card vanishing *is* the
+        // feedback. This one deliberately does not dismiss, so without a flash
+        // a successful copy is indistinguishable from a dead button.
+        if case .done = shareState { flashCopied() }
+        callbacks.share()
+    }
+
+    /// A tick and a quick pulse, then back to the link glyph.
+    private func flashCopied() {
+        guard let button = shareButton else { return }
+        tickTask?.cancel()
+
+        button.contentTintColor = .systemGreen
+        button.image = Self.symbol(
+            "checkmark", pointSize: 12, weight: .semibold, description: "Copied")
+
+        // Alpha rather than a layer transform: `NSButton` owns its layer and
+        // things done to it do not reliably survive, which is the same reason
+        // the close button's circle is drawn by a container view.
+        button.alphaValue = 0.25
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.18
+            button.animator().alphaValue = 1
+        }
+
+        tickTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(1100))
+            guard !Task.isCancelled, let self else { return }
+            self.shareButton?.contentTintColor = .white
+            self.shareButton?.image = Self.symbol(
+                "link", pointSize: 12, description: "Copy link")
+        }
+    }
 
     @objc private func copyTapped() { callbacks.copy() }
     @objc private func revealTapped() { callbacks.reveal() }

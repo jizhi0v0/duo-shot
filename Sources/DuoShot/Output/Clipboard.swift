@@ -35,6 +35,19 @@ enum Clipboard {
         if let fileURL { writeFileURL(fileURL, to: pasteboard, clearingFirst: false) }
     }
 
+    /// A share link.
+    ///
+    /// The plain string is written first and is what almost every target reads:
+    /// a chat window, a commit message, a text field. `public.url` goes on as
+    /// well so a browser's tab bar and Finder still recognise it as a link —
+    /// writing only the URL object leaves apps that ask for text with nothing.
+    static func write(link url: URL) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(url.absoluteString, forType: .string)
+        pasteboard.setString(url.absoluteString, forType: .URL)
+    }
+
     /// The same thing, from the staged file rather than from memory.
     ///
     /// What a preview card's Copy button uses. A card can sit on screen for

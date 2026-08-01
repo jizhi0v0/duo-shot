@@ -121,10 +121,10 @@ final class RecordingCoordinator {
         }
 
         // Area only. A window moves, resizes and closes mid-take and none of
-        // those have a defined answer yet, so Space is not offered rather than
-        // offered and quietly ignored.
+        // those have a defined answer yet, so no window is suggested rather than
+        // suggested and then refused on the click.
         let outcome = await overlay.present(
-            mode: .area, windows: [], allowsWindowMode: false, requiresConfirmation: true)
+            windows: [], suggestsWindows: false, requiresConfirmation: true)
         overlay.tearDown()
 
         guard case .area(let displayID, let rect) = outcome else { return }

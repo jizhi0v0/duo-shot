@@ -16,7 +16,7 @@ final class PreferencesWindowController {
     /// Order follows the life of a capture — take it, store it, look at it — with
     /// the two "settings about the app itself" tabs at the ends.
     enum Tab: String, CaseIterable {
-        case general, capture, recording, saving, preview, shortcuts
+        case general, capture, recording, saving, preview, share, shortcuts
 
         var label: String {
             switch self {
@@ -25,6 +25,7 @@ final class PreferencesWindowController {
             case .recording: "Recording"
             case .saving: "Saving"
             case .preview: "Preview"
+            case .share: "Share"
             case .shortcuts: "Shortcuts"
             }
         }
@@ -36,6 +37,7 @@ final class PreferencesWindowController {
             case .recording: "record.circle"
             case .saving: "folder"
             case .preview: "rectangle.stack"
+            case .share: "link"
             case .shortcuts: "command"
             }
         }
@@ -53,6 +55,7 @@ final class PreferencesWindowController {
             case .recording: 420
             case .saving: 420
             case .preview: 360
+            case .share: 480
             case .shortcuts: 420
             }
         }
@@ -193,6 +196,8 @@ final class PreferencesWindowController {
             SavingSettingsView(preferences: Preferences.shared)
         case .preview:
             PreviewSettingsView(preferences: Preferences.shared)
+        case .share:
+            ShareSettingsView(settings: ShareSettings.shared)
         case .shortcuts:
             ShortcutsSettingsView(
                 preferences: Preferences.shared,

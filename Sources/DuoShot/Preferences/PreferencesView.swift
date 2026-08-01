@@ -248,6 +248,12 @@ struct ShortcutsSettingsView: View {
                                 onRecordingChanged: onRecordingChanged
                             )
                             .frame(width: 132, height: 22)
+                            // An NSViewRepresentable has no text baseline, so
+                            // LabeledContent falls back to the view's bottom
+                            // edge and hangs the label above the button. Claim
+                            // a baseline near the centre instead — 4pt below it
+                            // is where a 13pt system font sits.
+                            .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 4 }
 
                             if let combo,
                                let owner = SystemHotKeyProbe.systemBinding(matching: combo) {

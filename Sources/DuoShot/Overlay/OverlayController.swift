@@ -1,20 +1,19 @@
 import AppKit
 import ObjCException
 
-nonisolated enum SelectionMode: Sendable {
-    case area
-    case window
-
-    var toggled: SelectionMode { self == .area ? .window : .area }
-}
-
 /// Owns one overlay panel per screen and exposes the whole interaction as a
 /// single `await`.
 ///
-/// `present(mode:windows:)` returning an async value is the most important
-/// structural decision in the UI layer: it collapses show / track / confirm /
-/// tear-down into one linear statement in `CaptureCoordinator` instead of a
-/// delegate web.
+/// `present(windows:)` returning an async value is the most important structural
+/// decision in the UI layer: it collapses show / track / confirm / tear-down
+/// into one linear statement in `CaptureCoordinator` instead of a delegate web.
+///
+/// There is one selection interaction, not two. It used to be two modes with
+/// Space between them — drag a region, or pick a window — and they were merged
+/// because the second was a strict subset of what the first could offer: hover
+/// suggests the window under the pointer, a click takes it, a drag ignores it
+/// and gives you a region. Nothing was lost except the need to know which mode
+/// you were in, which was the only thing modes ever cost.
 @MainActor
 final class OverlayController {
     enum Outcome: Sendable {
@@ -32,8 +31,7 @@ final class OverlayController {
     private var rankTimer: Timer?
     private var ticksSinceEnumeration = 0
     private var isEnumerating = false
-    private var mode: SelectionMode = .area
-    private var allowsWindowMode = true
+    private var suggestsWindows = true
     private let toolbar = SelectionToolbar()
     /// Frozen frames of each display, for the loupe. Filled after the panels are
     /// up — the capture has to exclude them, which means they have to exist.
@@ -84,7 +82,7 @@ final class OverlayController {
     /// laziness is that the loupe fades in a moment after the pointer first
     /// crosses onto a new screen, which is the same fade it does at the start.
     private func warmBackdropUnderPointer() {
-        guard mode == .area, !isArmed, let capture = captureBackdrop,
+        guard !isArmed, let capture = captureBackdrop,
               let pointer = model.pointerInAppKitGlobal,
               let screen = NSScreen.screens.first(where: { $0.frame.contains(pointer) })
         else { return }
@@ -128,7 +126,7 @@ final class OverlayController {
     /// the timer on its run loop — so a pointer sweep costs one assignment per
     /// move instead of an invalidate, an allocation and a run-loop insertion.
     private func scheduleFreshPatch() {
-        guard mode == .area, !isArmed, captureBackdrop != nil else {
+        guard !isArmed, captureBackdrop != nil else {
             patchTimer?.invalidate()
             patchTimer = nil
             return
@@ -153,7 +151,7 @@ final class OverlayController {
     }
 
     private func takeFreshPatch() {
-        guard mode == .area, !isArmed, let capture = captureBackdrop,
+        guard !isArmed, let capture = captureBackdrop,
               let pointer = model.pointerInAppKitGlobal,
               let screen = NSScreen.screens.first(where: { $0.frame.contains(pointer) })
         else { return }
@@ -193,8 +191,7 @@ final class OverlayController {
     }
 
     func present(
-        mode initialMode: SelectionMode, windows: [WindowInfo], allowsWindowMode: Bool = true,
-        requiresConfirmation: Bool = false
+        windows: [WindowInfo], suggestsWindows: Bool = true, requiresConfirmation: Bool = false
     ) async -> Outcome {
         if isPresenting { tearDown() }
         // A bar handed over by a previous presentation and never claimed would be
@@ -206,8 +203,7 @@ final class OverlayController {
 
         let frontmostBefore = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
 
-        mode = initialMode
-        self.allowsWindowMode = allowsWindowMode
+        self.suggestsWindows = suggestsWindows
         self.requiresConfirmation = requiresConfirmation
         isArmed = false
         model.reset()
@@ -233,7 +229,6 @@ final class OverlayController {
             confirmArea: { [weak self] in self?.confirmArea() },
             confirmWindow: { [weak self] id in self?.confirmWindow(id) },
             cancel: { [weak self] in self?.tearDown() },
-            toggleMode: { [weak self] in self?.toggleMode() },
             selectionRestarted: { [weak self] in self?.disarm() }
         )
 
@@ -243,8 +238,7 @@ final class OverlayController {
         for screen in NSScreen.screens {
             let view = OverlayView(
                 screen: screen, model: model, picker: picker, callbacks: callbacks)
-            view.mode = mode
-            view.allowsWindowMode = allowsWindowMode
+            view.suggestsWindows = suggestsWindows
             let panel = OverlayPanel(
                 screen: screen, view: view, hiddenFromCapture: hidden)
             // Registered BEFORE it goes on screen. Ordering a window can throw
@@ -344,22 +338,6 @@ final class OverlayController {
         return false
     }
 
-    // MARK: - Mode
-
-    private func toggleMode() {
-        guard allowsWindowMode else { return }
-        mode = mode.toggled
-        model.reset()
-        picker.reset()
-        views.forEach { $0.mode = self.mode }
-        // Ahead of the poll rather than waiting up to 120 ms for it: Space is a
-        // deliberate switch into window mode, and the first highlight should be
-        // right the moment it lands.
-        if mode == .window { picker.reRank() }
-        seedPointer()
-        Log.overlay.notice("selection mode -> \(String(describing: self.mode), privacy: .public)")
-    }
-
     // MARK: - Keeping the picker's z-order live
 
     /// Polls the window server's z-order while the overlay is up.
@@ -441,10 +419,14 @@ final class OverlayController {
     }
 
     private func poll() {
-        // Both modes: every key the overlay handles dies with key status, not
+        // Unconditional: every key the overlay handles dies with key status, not
         // just the picker's.
         restoreKeyboardIfLost()
-        guard mode == .window else { return }
+        // The picker only has to be right while it is being read, and it is read
+        // only while a suggestion could be shown. Mid-drag and once armed the
+        // rect is the answer, so re-ranking then would be a `CGWindowList` read
+        // and a redraw for a highlight nobody can see.
+        guard suggestsWindows, !isArmed, model.phase == .idle else { return }
 
         if picker.reRank() { seedPointer() }
 
@@ -466,9 +448,9 @@ final class OverlayController {
             let windows = await refreshWindows()
             guard let self else { return }
             isEnumerating = false
-            // The overlay can have been torn down or switched to area mode while
-            // the enumeration was in flight.
-            guard isPresenting, mode == .window else { return }
+            // The overlay can have been torn down, or a drag can have started,
+            // while the enumeration was in flight.
+            guard isPresenting, suggestsWindows, !isArmed, model.phase == .idle else { return }
             if picker.load(windows) { seedPointer() }
         }
     }
@@ -477,10 +459,8 @@ final class OverlayController {
     /// blank until the pointer happens to move.
     private func seedPointer() {
         let location = NSEvent.mouseLocation
-        switch mode {
-        case .area: model.pointerMoved(to: location)
-        case .window: picker.updateHover(atAppKitGlobal: location)
-        }
+        model.pointerMoved(to: location)
+        if suggestsWindows { picker.updateHover(atAppKitGlobal: location) }
         views.forEach { $0.refresh() }
     }
 
@@ -686,10 +666,13 @@ final class OverlayController {
         views.forEach { $0.displayIfNeeded() }
     }
 
-    func setMode(_ newMode: SelectionMode) {
-        guard newMode != mode else { return }
-        toggleMode()
-    }
+    /// Whether a click right now would take a window, and which one.
+    ///
+    /// Reads through the *view's* rule rather than `picker.hovered` directly, so
+    /// a test cannot pass on a hover the user would never have been shown — the
+    /// suggestion is suppressed mid-drag and once armed, and that suppression is
+    /// the interesting half of the merge.
+    var suggestedWindowForTest: WindowInfo? { views.first?.suggestedWindowForTest }
 
     /// Drives the confirm path without a mouse-up, for `--selftest-lifecycle`.
     func confirmForTest() {
@@ -756,5 +739,26 @@ final class OverlayController {
     func restartSelectionForTest(at pointInAppKitGlobal: CGPoint, on screen: NSScreen) {
         disarm()
         model.beginDrag(at: pointInAppKitGlobal, on: screen)
+    }
+
+    /// Leaves the overlay *mid-drag*: button down, rect grown, pointer on the
+    /// moving corner.
+    ///
+    /// `forceSelection` cannot produce this — it settles the rect — and until
+    /// this existed no photograph covered the mid-drag frame at all. That is the
+    /// one frame with drawing of its own: the crosshair, clipped to outside the
+    /// selection, which the model cannot tell you rendered.
+    func forceDragForTest(from: CGPoint, to: CGPoint, on screen: NSScreen) {
+        model.beginDrag(at: from, on: screen)
+        model.updateDrag(to: to)
+        views.forEach { $0.refresh() }
+        views.forEach { $0.displayIfNeeded() }
+    }
+
+    /// Abandons an in-flight drag without ending the presentation, so a test can
+    /// go back to the idle state it started from.
+    func cancelSelectionForTest() {
+        model.reset()
+        views.forEach { $0.refresh() }
     }
 }

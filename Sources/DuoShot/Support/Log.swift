@@ -7,6 +7,7 @@ enum Log {
     nonisolated static let overlay = Logger(subsystem: subsystem, category: "overlay")
     nonisolated static let hotkeys = Logger(subsystem: subsystem, category: "hotkeys")
     nonisolated static let record = Logger(subsystem: subsystem, category: "record")
+    nonisolated static let share = Logger(subsystem: subsystem, category: "share")
 
     nonisolated static let subsystem = "com.boli.duoshot"
 }

@@ -12,7 +12,7 @@ nonisolated enum HotKeyAction: String, CaseIterable, Codable, Sendable {
     var title: String {
         switch self {
         case .captureArea: "Capture Area"
-        case .captureWindow: "Capture Window"
+        case .captureWindow: "Capture Window Under Pointer"
         case .captureFullscreen: "Capture Fullscreen"
         case .captureLastArea: "Capture Previous Area"
         case .recordArea: "Record Area"

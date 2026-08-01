@@ -1,6 +1,8 @@
+import AVKit
 import AppKit
 import Carbon.HIToolbox
 import Darwin
+import Linkdrop
 import ScreenCaptureKit
 import ServiceManagement
 import UniformTypeIdentifiers
@@ -33,6 +35,9 @@ enum SelfTest {
         /// Presents several previews at once and photographs the stack, so the
         /// slot layout can be looked at rather than reasoned about.
         case previewStack(count: Int, directory: URL)
+        /// The in-app viewer: window geometry for a still, a full-screen still
+        /// and a recording, plus the one-window-per-file rule.
+        case viewer(directory: URL)
         /// Window-picker hit-testing, filtering and window capture geometry.
         case windowMode(directory: URL)
         /// Fullscreen capture with `includeMenuBar` both ways.
@@ -89,6 +94,20 @@ enum SelfTest {
         case recordFlow(directory: URL, seconds: Double)
         /// Whether the recording HUD — a window that appears *after* the stream
         /// is already running — ends up inside the recording.
+        /// The app-level share paths, against the real bucket.
+        case shareFlow
+        /// Keychain round trip, both synchronizable and not.
+        case shareCredentials
+        /// Photographs a preview card in each of the three share states.
+        case shareCard(directory: URL)
+        /// ⌘V in a text field, which an LSUIElement app does not get for free.
+        case editMenu
+        /// The share pipeline against a local `wrangler dev`. Endpoint and token
+        /// are arguments, never Settings: a test that read the live
+        /// configuration would upload to the real bucket.
+        case share(endpoint: String?, token: String?, file: URL?, bigMegabytes: Int?)
+        /// What is really inside a recording, which its settings cannot tell you.
+        case shareCompat(URL)
         case recordHUD(
             directory: URL, seconds: Double, sharingNone: Bool, hudFirst: Bool,
             plainWindow: Bool, statusItem: Bool, excludeIDs: Bool)
@@ -124,6 +143,26 @@ enum SelfTest {
                 )
             case "--selftest-output":
                 self = .output(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
+            case "--selftest-share-flow":
+                self = .shareFlow
+            case "--selftest-share-credentials":
+                self = .shareCredentials
+            case "--selftest-share-card":
+                self = .shareCard(directory: URL(fileURLWithPath: positional() ?? "build/share-ui"))
+            case "--selftest-edit-menu":
+                self = .editMenu
+            case "--selftest-share":
+                let configured = rest.contains("--configured")
+                let endpoint = value(for: "--endpoint")
+                let token = value(for: "--token")
+                guard configured || (endpoint != nil && token != nil) else { return nil }
+                self = .share(
+                    endpoint: endpoint, token: token,
+                    file: value(for: "--file").map { URL(fileURLWithPath: $0) },
+                    bigMegabytes: value(for: "--big").flatMap(Int.init))
+            case "--selftest-share-compat":
+                guard let path = positional() else { return nil }
+                self = .shareCompat(URL(fileURLWithPath: path))
             case "--selftest-preferences":
                 self = .preferences
             case "--selftest-selection-zones":
@@ -232,6 +271,8 @@ enum SelfTest {
                 self = .previewStack(
                     count: value(for: "--count").flatMap(Int.init) ?? 3,
                     directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
+            case "--selftest-viewer":
+                self = .viewer(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-preview":
                 PreviewPanel.usesSharingTypeNone = !rest.contains("--sharing-default")
                 self = .preview(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
@@ -270,9 +311,18 @@ enum SelfTest {
             case .preview(let directory): return try await previewPanel(into: directory)
             case .previewStack(let count, let directory):
                 return try await previewStack(count: count, into: directory)
+            case .viewer(let directory): return try await viewerWindow(into: directory)
             case .windowMode(let directory): return try await windowMode(into: directory)
             case .fullscreen(let directory): return try await fullscreenMode(into: directory)
             case .preferences: return preferencesCheck()
+            case .share(let endpoint, let token, let file, let big):
+                return await ShareSelfTest.run(
+                    endpoint: endpoint, token: token, file: file, bigMegabytes: big)
+            case .shareCompat(let url): return await ShareSelfTest.compatibility(of: url)
+            case .editMenu: return await editMenuCheck()
+            case .shareCard(let d): return try await shareCardStates(into: d)
+            case .shareCredentials: return await ShareSelfTest.credentials()
+            case .shareFlow: return await ShareFlowSelfTest.run()
             case .selectionZones: return selectionZonesCheck()
             case .pixelMapping: return pixelMappingCheck()
             case .latchCancel: return await latchCancelCheck()
@@ -675,12 +725,25 @@ enum SelfTest {
                 """)
             return 1
         case .none:
+            // Exit 0, like every other INCONCLUSIVE in this file.
+            //
+            // The rule: a non-zero exit means "the thing under test is broken".
+            // "The screen moved so nothing could be measured" is not that, and
+            // reporting it as failure trains people to ignore a red suite —
+            // which is how a real failure gets waved past. This one used to
+            // return 1 while `--selftest-rect` and `--selftest-record-hud`
+            // returned 0 for the same situation, so `make test` was red whenever
+            // a live window happened to be the largest one on screen.
+            //
+            // Silence is the other danger, so `make test` counts these and says
+            // how many there were: green with three inconclusive results is a
+            // different report from green.
             print("""
                 verdict:       INCONCLUSIVE — neither reading reproduced the crop. Most likely
                                the window repainted between the two captures; re-run against a
                                static window before drawing any conclusion.
                 """)
-            return 1
+            return 0
         }
     }
 
@@ -713,7 +776,7 @@ enum SelfTest {
         // while we drive the selection from here.
         let presentation = Task {
             await coordinator.overlay.present(
-                mode: .area, windows: coordinator.engine.shareableContent.windows)
+                windows: coordinator.engine.shareableContent.windows)
         }
         try await Task.sleep(for: .milliseconds(400))
 
@@ -761,6 +824,28 @@ enum SelfTest {
         }
         let withOverlay = try await coordinator.engine.capture(
             .area(displayID: displayID, rectInAppKitGlobal: rect), options: options)
+
+        // The mid-drag frame, photographed after every assertion above has taken
+        // its captures. It is the only frame that draws the crosshair — the guide
+        // lines moved from idle to button-down, and are clipped to outside the
+        // selection so they cannot run across the region being selected. "Clipped
+        // to nothing" and "clipped correctly" are the same answer from the model,
+        // so this is a picture or it is not checked at all.
+        OverlayView.drawsDebugSelectionBorder = false
+        coordinator.overlay.forceDragForTest(
+            from: rect.origin, to: CGPoint(x: rect.maxX, y: rect.maxY), on: screen)
+        try await Task.sleep(for: .milliseconds(200))
+        let midDrag = try? await coordinator.engine.capture(.display(displayID))
+        // The panel state goes next to the path on purpose: a mid-drag photo with
+        // nothing in it means either the drawing is wrong or the overlay had
+        // already gone (an Escape from whoever is at the keyboard does it), and
+        // the picture alone cannot tell those apart.
+        print("mid-drag:      \(coordinator.overlay.debugPanelState)")
+        if let midDrag, let output {
+            let url = output.deletingPathExtension().appendingPathExtension("middrag.png")
+            try? ImageEncoder.write(midDrag.image, to: url, as: .png, scale: midDrag.scale)
+            print("mid-drag png:  \(url.path)")
+        }
 
         coordinator.overlay.tearDown()
         presentation.cancel()
@@ -826,6 +911,81 @@ enum SelfTest {
     }
 
     // MARK: - Output pipeline
+
+    /// Proves ⌘V reaches a text field.
+    ///
+    /// Not a test of `NSTextField` — a test of the *routing*. With no main menu
+    /// installed, `NSApplication` has nothing to turn ⌘V into `paste:`, so the
+    /// field never hears about it. That is invisible in every screenshot of the
+    /// Settings window and shows up only when somebody tries to paste a token.
+    ///
+    /// Runs the real key-equivalent path (`NSMenu.performKeyEquivalent`) rather
+    /// than calling `paste:` directly, because calling `paste:` works fine with
+    /// no menu at all and would pass against the broken build.
+    private static func editMenuCheck() async -> Int32 {
+        var failures = 0
+        func check(_ label: String, _ passed: Bool, _ detail: String = "") {
+            print("  \(passed ? "PASS" : "FAIL") \(label)\(detail.isEmpty ? "" : " — \(detail)")")
+            if !passed { failures += 1 }
+        }
+
+        EditMenu.install()
+        check("main menu installed", NSApp.mainMenu != nil)
+
+        let window = NSWindow(
+            contentRect: CGRect(x: 0, y: 0, width: 320, height: 60),
+            styleMask: [.titled], backing: .buffered, defer: false)
+        let field = NSTextField(frame: CGRect(x: 10, y: 10, width: 300, height: 24))
+        window.contentView?.addSubview(field)
+
+        // The app has to be *active*, not merely have a window ordered in. A
+        // text field's editing session runs in the window's shared field editor,
+        // and that editor is only installed for a key window -- so in an
+        // unactivated accessory app `makeFirstResponder` returns true and yet
+        // there is nothing to paste into. This cost a wrong diagnosis: the first
+        // run of this check blamed the menu for a paste that never had anywhere
+        // to land.
+        NSApp.activate()
+        window.makeKeyAndOrderFront(nil)
+        try? await Task.sleep(for: .milliseconds(200))
+        check("field became first responder", window.makeFirstResponder(field))
+        check("field editor exists", field.currentEditor() != nil)
+
+        let secret = "pasted-\(UUID().uuidString.prefix(8))"
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(secret, forType: .string)
+
+        guard let event = NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0,
+            windowNumber: window.windowNumber, context: nil, characters: "v",
+            charactersIgnoringModifiers: "v", isARepeat: false, keyCode: 9)
+        else {
+            print("result:        FAIL — could not synthesise the event")
+            return 1
+        }
+
+        let handled = NSApp.mainMenu?.performKeyEquivalent(with: event) ?? false
+        check("menu claimed the key equivalent", handled)
+
+        // Read the field *editor*, not the field. While a text field is being
+        // edited its `stringValue` still holds the value from before the session
+        // started -- the live text lives in the shared field editor and is only
+        // written back when editing ends. The first version of this check read
+        // `stringValue`, saw "", and blamed the menu for a paste that had in fact
+        // worked.
+        let live = field.currentEditor()?.string ?? field.stringValue
+        check("text arrived in the field", live == secret, "field=\"\(live)\"")
+
+        // And once editing ends it must be in the field itself, which is what
+        // every binding and every read in the Settings window actually uses.
+        window.endEditing(for: field)
+        check("text survived end of editing", field.stringValue == secret,
+              "field=\"\(field.stringValue)\"")
+
+        window.orderOut(nil)
+        print("result:        \(failures == 0 ? "PASS" : "FAIL (\(failures))")")
+        return failures == 0 ? 0 : 1
+    }
 
     private static func outputPipeline(into directory: URL) async throws -> Int32 {
         guard ScreenPermission.isGranted else { return permissionHint() }
@@ -1103,7 +1263,7 @@ enum SelfTest {
         // Presenting for real exercises the same picker the user drives; the
         // hover is forced instead of moving the mouse.
         let presentation = Task {
-            await coordinator.overlay.present(mode: .window, windows: all)
+            await coordinator.overlay.present(windows: all)
         }
         try await Task.sleep(for: .milliseconds(400))
         defer { presentation.cancel() }
@@ -1111,16 +1271,37 @@ enum SelfTest {
         let pickable = coordinator.overlay.pickableWindowCount
         print("windows:       \(all.count) enumerated, \(pickable) pickable")
 
-        // The Space-key path: switching modes must reset the other mode's state
-        // and re-seed the pointer, or the overlay sits blank until the mouse moves.
-        coordinator.overlay.setMode(.area)
-        let afterAreaToggle = coordinator.overlay.hoveredWindow
-        coordinator.overlay.setMode(.window)
+        // The merged overlay's central rule, and the one the old Space-key test
+        // used to stand in for: a window is suggested while the mouse is idle,
+        // and no window is suggested the moment a drag is under way.
+        //
+        // They have to be mutually exclusive. The click that accepts a
+        // suggestion and the press that starts a rubber band are the *same*
+        // press, told apart only by how far it travels — so a suggestion still
+        // standing mid-drag is one that a short drag could commit on top of the
+        // rect the user was drawing, which is the merge's obvious way to fail.
+        //
+        // Hovered-but-not-suggested is the distinction under test, hence the two
+        // different accessors: `hoveredWindow` is the raw picker, and
+        // `suggestedWindowForTest` is what the view would actually offer.
         coordinator.overlay.forceHover(atAppKitGlobal: NSEvent.mouseLocation)
-        let afterWindowToggle = coordinator.overlay.hoveredWindow
-        let toggleOK = afterAreaToggle == nil
-        print("mode toggle:   ->area clears hover=\(toggleOK) "
-            + "->window rehovers=\(afterWindowToggle != nil ? "yes" : "no window under pointer")")
+        let idleSuggestion = coordinator.overlay.suggestedWindowForTest
+        var suppressionOK = true
+        if let screen = ScreenIndex.screenUnderMouse() {
+            coordinator.overlay.restartSelectionForTest(
+                at: NSEvent.mouseLocation, on: screen)
+            let mid = coordinator.overlay.suggestedWindowForTest
+            let stillHovered = coordinator.overlay.hoveredWindow
+            suppressionOK = mid == nil && stillHovered != nil
+            print("suggestion:    idle=\(idleSuggestion?.displayName ?? "none") "
+                + "mid-drag=\(mid?.displayName ?? "none") "
+                + "(picker still holds \(stillHovered?.displayName ?? "nothing")) "
+                + "\(suppressionOK ? "" : "MISMATCH")")
+            coordinator.overlay.cancelSelectionForTest()
+        } else {
+            print("suggestion:    idle=\(idleSuggestion?.displayName ?? "none") "
+                + "(no screen under pointer; suppression not exercised)")
+        }
 
         // Filtering rules that keep the picker usable.
         let ownBundleID = Bundle.main.bundleIdentifier
@@ -1225,7 +1406,7 @@ enum SelfTest {
         let enumerate = coordinator.overlay.refreshWindows
         coordinator.overlay.refreshWindows = nil
         let stalePresentation = Task {
-            await coordinator.overlay.present(mode: .window, windows: all.reversed())
+            await coordinator.overlay.present(windows: all.reversed())
         }
         try await Task.sleep(for: .milliseconds(400))
 
@@ -1249,7 +1430,6 @@ enum SelfTest {
         // picker is up looks like from in here.
         let missingPresentation = Task {
             await coordinator.overlay.present(
-                mode: .window,
                 windows: all.filter { $0.id != frontmost?.id })
         }
         // Long enough for the enumeration tick, which runs at a quarter of the
@@ -1287,7 +1467,7 @@ enum SelfTest {
         var ownWindowOK = true
         if let settingsID = settings.windowNumber {
             let ownPresentation = Task {
-                await coordinator.overlay.present(mode: .window, windows: withSettings)
+                await coordinator.overlay.present(windows: withSettings)
             }
             try await Task.sleep(for: .milliseconds(400))
             ownWindowOK = coordinator.overlay.pickableWindowIDs.contains(settingsID)
@@ -1304,6 +1484,9 @@ enum SelfTest {
 
         let furnitureOK = try await systemFurnitureIsPickable(coordinator, all)
         let opacityOK = try await invisibleWindowsAreNotPickable(coordinator)
+        let (clickAdoptsOK, dragOverridesOK) = try await mergedGestures(coordinator, all)
+        let instantOK = try await instantWindowCapture(coordinator)
+        try await photographSuggestion(coordinator, all, into: directory)
 
         let childOK = try await childWindowIsolation()
 
@@ -1395,7 +1578,8 @@ enum SelfTest {
         let geometryOK = sizes["ignoreShadows"].map {
             $0.width > 0 && $0.height > 0
         } ?? false
-        let pass = selfLeaked == 0 && hits == tested && tested > 0 && geometryOK && toggleOK
+        let pass = selfLeaked == 0 && hits == tested && tested > 0 && geometryOK && suppressionOK
+            && clickAdoptsOK && dragOverridesOK && instantOK
             && inversions.isEmpty && frontmostOK && recoveredOK && appearedOK && paddingOK
             && childOK && shadowOK && ownWindowOK && cardOK && menuBarOK && furnitureOK && opacityOK
         print("result:        \(pass ? "PASS" : "FAIL")")
@@ -1475,7 +1659,7 @@ enum SelfTest {
         let windows = coordinator.engine.shareableContent.windows
 
         let presentation = Task {
-            await coordinator.overlay.present(mode: .window, windows: windows)
+            await coordinator.overlay.present(windows: windows)
         }
         try await Task.sleep(for: .milliseconds(400))
         let pickable = coordinator.overlay.pickableWindowIDs
@@ -1500,6 +1684,251 @@ enum SelfTest {
     /// land on it, which is the frozen-picker failure all over again. It is
     /// offered against the strip it reserves instead, and the capture is cut to
     /// the same rect so the outline and the file cannot disagree.
+    /// Drives the one press that now has two meanings, both ways.
+    ///
+    /// Under the travel threshold it is a click and commits the suggested
+    /// window; over it, it is a rubber band and commits an area, ignoring the
+    /// suggestion entirely. That branch is the whole merge, and it lives inside
+    /// `mouseDown`/`mouseDragged`/`mouseUp` — so this goes through `dragForTest`,
+    /// which synthesises real `NSEvent`s into those handlers, rather than
+    /// reaching past them to the model. A hook that skipped the handlers would
+    /// leave the only interesting line untested.
+    ///
+    /// Returns (click committed the suggested window, drag committed an area).
+    private static func mergedGestures(
+        _ coordinator: CaptureCoordinator, _ windows: [WindowInfo]
+    ) async throws -> (clickOK: Bool, dragOK: Bool) {
+        guard let screen = NSScreen.main else {
+            print("gestures:      no main screen — not exercised")
+            return (true, true)
+        }
+        // Well inside the screen, so the 120×80 drag below has room and the
+        // point is over whatever is stacked in the middle of the display.
+        let anchor = CGPoint(x: screen.frame.midX - 60, y: screen.frame.midY - 40)
+
+        // MARK: click
+        let clickBox = OutcomeBox()
+        let clickFlag = CompletionFlag()
+        Task {
+            clickBox.outcome = await coordinator.overlay.present(windows: windows)
+            clickFlag.markDone()
+        }
+        try await Task.sleep(for: .milliseconds(400))
+        coordinator.overlay.forceHover(atAppKitGlobal: anchor)
+        // Read the offer *before* clicking rather than asserting a particular
+        // window: which window is frontmost at the middle of the screen is not
+        // this test's business, and pinning it would make the test a report on
+        // whatever the machine happens to have open.
+        let offered = coordinator.overlay.suggestedWindowForTest
+        // Zero travel — the gesture is a click.
+        coordinator.overlay.dragForTest(from: anchor, to: anchor)
+        _ = await clickFlag.wait(upTo: .milliseconds(600))
+        coordinator.overlay.tearDown()
+        try await Task.sleep(for: .milliseconds(200))
+
+        var clickOK: Bool
+        if let offered {
+            if case .window(let id) = clickBox.outcome, id == offered.id {
+                clickOK = true
+            } else {
+                clickOK = false
+            }
+            print("click:         over \(offered.displayName) -> "
+                + "\(describe(clickBox.outcome)) \(clickOK ? "" : "MISMATCH")")
+        } else {
+            // Bare desktop under the anchor. The click must then do *nothing* —
+            // committing a 1×1 area is exactly what the old code did with a
+            // press that carried one point of hand-shake.
+            clickOK = clickBox.outcome == nil
+            print("click:         nothing offered -> \(describe(clickBox.outcome)) "
+                + "\(clickOK ? "" : "MISMATCH — a click with no suggestion must not commit")")
+        }
+
+        // MARK: drag
+        let dragBox = OutcomeBox()
+        let dragFlag = CompletionFlag()
+        Task {
+            dragBox.outcome = await coordinator.overlay.present(windows: windows)
+            dragFlag.markDone()
+        }
+        try await Task.sleep(for: .milliseconds(400))
+        coordinator.overlay.forceHover(atAppKitGlobal: anchor)
+        let size = CGSize(width: 120, height: 80)
+        coordinator.overlay.dragForTest(
+            from: anchor, to: CGPoint(x: anchor.x + size.width, y: anchor.y + size.height))
+        _ = await dragFlag.wait(upTo: .milliseconds(600))
+        coordinator.overlay.tearDown()
+        try await Task.sleep(for: .milliseconds(200))
+
+        var dragOK = false
+        if case .area(_, let rect) = dragBox.outcome {
+            // The rect has to start at the *press*, not at the point where the
+            // gesture crossed the threshold: `beginDrag` is deliberately fed the
+            // stored origin rather than the current location, and getting that
+            // wrong would silently shave the first few points off every drag.
+            dragOK = abs(rect.width - size.width) < 1 && abs(rect.height - size.height) < 1
+                && abs(rect.minX - anchor.x) < 1 && abs(rect.minY - anchor.y) < 1
+        }
+        print("drag:          120×80 from \(rectString(CGRect(origin: anchor, size: .zero))) -> "
+            + "\(describe(dragBox.outcome)) \(dragOK ? "" : "MISMATCH")")
+
+        return (clickOK, dragOK)
+    }
+
+    /// Photographs the overlay while it is offering a window, so the suggestion
+    /// can be looked at rather than inferred.
+    ///
+    /// Everything else about the merge is asserted through the model, and the
+    /// model cannot tell you whether `drawSuggestion` puts a single pixel on
+    /// screen. It is a treatment that was deliberately made subtle — an outline
+    /// and a partial un-dim, where window mode used to punch the window clean
+    /// out of the dim — and "too subtle to see" is a failure that only a picture
+    /// catches. It is also the treatment whose *first* version was legible in
+    /// exactly this photograph and still wrong: a wash of white read as fog.
+    ///
+    /// Needs the panels visible to ScreenCaptureKit, which they are not by
+    /// default; `usesSharingTypeNone` is flipped for this one capture and put
+    /// back, because every other test in this file depends on the default.
+    private static func photographSuggestion(
+        _ coordinator: CaptureCoordinator, _ windows: [WindowInfo], into directory: URL
+    ) async throws {
+        guard let screen = NSScreen.main, let displayID = ScreenIndex.displayID(of: screen) else {
+            return
+        }
+        let wasHidden = OverlayPanel.usesSharingTypeNone
+        OverlayPanel.usesSharingTypeNone = false
+        defer { OverlayPanel.usesSharingTypeNone = wasHidden }
+
+        let presentation = Task { await coordinator.overlay.present(windows: windows) }
+        try await Task.sleep(for: .milliseconds(500))
+        let anchor = CGPoint(x: screen.frame.midX, y: screen.frame.midY)
+        coordinator.overlay.forceHover(atAppKitGlobal: anchor)
+        try await Task.sleep(for: .milliseconds(250))
+        let offering = coordinator.overlay.suggestedWindowForTest
+
+        var options = CaptureOptions.default
+        options.showsCursor = false
+        let shot = try? await coordinator.engine.capture(.display(displayID), options: options)
+        coordinator.overlay.tearDown()
+        presentation.cancel()
+        try await Task.sleep(for: .milliseconds(200))
+
+        guard let shot else {
+            print("suggestion png: capture failed")
+            return
+        }
+        let url = directory.appendingPathComponent("suggestion-overlay.png")
+        try? ImageEncoder.write(shot.image, to: url, as: .png, scale: shot.scale)
+        print("suggestion png: \(offering?.displayName ?? "nothing offered") -> \(url.path)")
+    }
+
+    /// The ⇧⌘S path, which shows no overlay and so has no way to tell the user
+    /// what it is about to take.
+    ///
+    /// Two halves, and the second is the one worth the code. Over a window it
+    /// must capture *that* window. Over bare desktop it must capture nothing —
+    /// falling through to whatever is stacked behind the pointer would be a
+    /// wrong answer with no UI anywhere on screen to catch it, which is the
+    /// failure this shortcut is written around.
+    ///
+    /// The pointer is warped, because a shortcut whose entire input is the
+    /// pointer cannot be driven any other way. It is put back afterwards.
+    private static func instantWindowCapture(
+        _ coordinator: CaptureCoordinator
+    ) async throws -> Bool {
+        let restore = NSEvent.mouseLocation
+        defer { CGWarpMouseCursorPosition(DisplayGeometry.flipped(restore)) }
+
+        /// The picker's own verdict at a point, which is what `captureWindow()`
+        /// consults. Rebuilt per query rather than shared, so the test cannot
+        /// pass off a stale hover as an answer.
+        func verdict(at pointInAppKitGlobal: CGPoint) -> WindowInfo? {
+            let picker = WindowPickerModel()
+            picker.load(coordinator.engine.shareableContent.windows)
+            picker.reRank()
+            picker.updateHover(atAppKitGlobal: pointInAppKitGlobal)
+            return picker.hovered
+        }
+
+        func warp(to pointInAppKitGlobal: CGPoint) async throws {
+            CGWarpMouseCursorPosition(DisplayGeometry.flipped(pointInAppKitGlobal))
+            try await Task.sleep(for: .milliseconds(150))
+        }
+
+        guard let screen = NSScreen.main else {
+            print("instant ⇧⌘S:   no main screen — not exercised")
+            return true
+        }
+        try await coordinator.engine.refreshContent()
+
+        // A point with a window under it, and a point with none. Both are found
+        // by asking rather than assuming: which is which depends entirely on
+        // what this machine happens to have open.
+        var overWindow: (point: CGPoint, window: WindowInfo)?
+        var overNothing: CGPoint?
+        for column in stride(from: 0.08, through: 0.92, by: 0.12) {
+            for row in stride(from: 0.08, through: 0.92, by: 0.12) {
+                let point = CGPoint(
+                    x: screen.frame.minX + screen.frame.width * column,
+                    y: screen.frame.minY + screen.frame.height * row)
+                if let hit = verdict(at: point) {
+                    if overWindow == nil { overWindow = (point, hit) }
+                } else if overNothing == nil {
+                    overNothing = point
+                }
+            }
+        }
+
+        var ok = true
+
+        if let (point, expected) = overWindow {
+            try await warp(to: point)
+            // Re-asked after the warp: the act of moving the pointer can raise
+            // nothing by itself, but the enumeration inside `captureWindow` is
+            // fresh, and comparing against a verdict taken before it would be
+            // comparing two different window lists.
+            let expectedNow = verdict(at: NSEvent.mouseLocation) ?? expected
+            let result = await coordinator.captureWindow()
+            let matched = result?.sourceDescription == expectedNow.displayName
+            let got = result.map {
+                "\($0.sourceDescription) \(Int($0.pixelSize.width))x\(Int($0.pixelSize.height)) px"
+            } ?? "nothing"
+            print("instant ⇧⌘S:   over \(expectedNow.displayName) -> \(got) "
+                + "\(matched ? "" : "MISMATCH")")
+            ok = ok && matched
+        } else {
+            print("instant ⇧⌘S:   no point on this screen has a pickable window — not exercised")
+        }
+
+        guard let empty = overNothing else {
+            // Not a failure: a maximised window can legitimately cover every
+            // sampled point. Said out loud, because a silently unexercised half
+            // is indistinguishable from a passing one.
+            print("instant ⇧⌘S:   every sampled point has a window over it — "
+                + "the bare-desktop half was not exercised")
+            return ok
+        }
+        try await warp(to: empty)
+        let stillEmpty = verdict(at: NSEvent.mouseLocation) == nil
+        let result = await coordinator.captureWindow()
+        // Only meaningful while the point really is empty; a window arriving
+        // under the pointer mid-test would make a capture the correct answer.
+        let refusedOK = !stillEmpty || result == nil
+        print("instant ⇧⌘S:   over bare desktop -> "
+            + "\(result.map { "captured \($0.sourceDescription)" } ?? "refused") "
+            + "\(refusedOK ? "" : "MISMATCH — it fell through to the window behind")")
+        return ok && refusedOK
+    }
+
+    private static func describe(_ outcome: OverlayController.Outcome?) -> String {
+        switch outcome {
+        case .none: "nothing (still presenting or cancelled without resuming)"
+        case .cancelled: "cancelled"
+        case .window(let id): "window \(id)"
+        case .area(_, let rect): "area \(rectString(rect))"
+        }
+    }
+
     private static func systemFurnitureIsPickable(
         _ coordinator: CaptureCoordinator, _ all: [WindowInfo]
     ) async throws -> Bool {
@@ -1507,7 +1936,7 @@ enum SelfTest {
         let dock = all.first { $0.layer == WindowInfo.dockLayer && $0.isOnScreen }
 
         let presentation = Task {
-            await coordinator.overlay.present(mode: .window, windows: all)
+            await coordinator.overlay.present(windows: all)
         }
         try await Task.sleep(for: .milliseconds(400))
         let pickable = coordinator.overlay.pickableWindowIDs
@@ -1740,6 +2169,385 @@ enum SelfTest {
     }
 
     // MARK: - Preview stack
+
+    // MARK: - Viewer
+
+    /// The in-app viewer window: geometry, the one-window-per-file rule, and a
+    /// photograph of the thing so it can be looked at.
+    ///
+    /// Geometry is the whole risk here. A viewer is trivial when the picture is
+    /// small and the interesting cases are the ones where it is not: a
+    /// full-screen capture is by definition exactly as large as the display it
+    /// came from, so a window sized to it has its title bar off the top of the
+    /// screen and no way to reach its bottom edge. Two of the three cases below
+    /// exist for that.
+    private static func viewerWindow(into directory: URL) async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+
+        let coordinator = CaptureCoordinator()
+        let viewer = ViewerWindowController.shared
+        // Same reasoning as the Settings window's: `NSApp.activate` yanks the
+        // keyboard out of whatever the person running the test is typing in.
+        viewer.activatesOnShow = false
+        defer { viewer.closeAll() }
+
+        try await coordinator.engine.refreshContent()
+        let displayID = ScreenIndex.screenUnderMouse().flatMap(ScreenIndex.displayID(of:))
+            ?? CGMainDisplayID()
+        guard let screen = ScreenIndex.screen(for: displayID) ?? NSScreen.main else {
+            print("result:        FAIL — no screen")
+            return 1
+        }
+        let visible = screen.visibleFrame
+        var failures: [String] = []
+
+        /// Every window has to end up inside the screen it opened on. Checked for
+        /// each case rather than once, because the three take different paths to a
+        /// size and only one of them is capped.
+        func checkFits(_ window: NSWindow, _ label: String) {
+            let fits = visible.insetBy(dx: -1, dy: -1).contains(window.frame)
+            print("  \(label) window \(rectString(window.frame)) "
+                + "in \(rectString(visible)) -> \(fits ? "fits" : "OFF SCREEN")")
+            if !fits { failures.append("\(label) window does not fit its screen") }
+        }
+
+        // MARK: a still, smaller than the screen
+
+        let small = CGRect(x: 200, y: 200, width: 640, height: 360)
+        let stillResult = try await coordinator.engine.capture(
+            .area(displayID: displayID, rectInAppKitGlobal: small))
+        guard let stillOutput = await OutputPipeline.shared.process(
+            stillResult, saveDirectoryOverride: directory)
+        else {
+            print("result:        FAIL — the still did not reach the output pipeline")
+            return 1
+        }
+        let still = await PreviewEntry(stillOutput)
+
+        // MARK: the card's centre button
+
+        // The wiring between the two halves. The disc in the middle of a preview
+        // card is what opens this window, and it is deliberately not an
+        // `NSButton`: the card decides on mouse-*up* whether a press was a click
+        // on the disc or the start of a drag-out, so the only honest test drives
+        // the real handlers.
+        let previews = PreviewStackController()
+        previews.timeout = .seconds(60)
+        await previews.present(stillOutput)
+        try await Task.sleep(for: .milliseconds(400))
+        previews.setHoverForTest(true)
+        try await Task.sleep(for: .milliseconds(200))
+
+        if let centre = previews.newestCardCentreForTest {
+            previews.clickNewestCardForTest(at: centre)
+            try await Task.sleep(for: .milliseconds(400))
+            let opened = viewer.openWindowCount == 1
+            print("card centre:   click at \(Int(centre.x)),\(Int(centre.y)) -> "
+                + "\(viewer.openWindowCount) viewer(s) \(opened ? "" : "MISMATCH")")
+            if !opened { failures.append("the card's centre button did not open the viewer") }
+            viewer.closeAll()
+            try await Task.sleep(for: .milliseconds(200))
+
+            // And a click that is NOT on the disc must not open anything.
+            // Dragging a card out begins with a press somewhere on it, and
+            // without this every one of those presses is a viewer waiting to
+            // happen.
+            previews.clickNewestCardForTest(at: CGPoint(x: 12, y: 12))
+            try await Task.sleep(for: .milliseconds(300))
+            let quiet = viewer.openWindowCount == 0
+            print("card corner:   click at 12,12 -> \(viewer.openWindowCount) viewer(s) "
+                + "\(quiet ? "" : "MISMATCH — a click off the disc opened one")")
+            if !quiet { failures.append("a click away from the centre opened the viewer") }
+            viewer.closeAll()
+        } else {
+            failures.append("no preview card to click")
+        }
+
+        viewer.show(still)
+        try await Task.sleep(for: .milliseconds(400))
+
+        guard let stillWindow = viewer.windowForTest(still.url) else {
+            print("result:        FAIL — no window for the still")
+            return 1
+        }
+        print("still:         \(rectString(small)) -> content "
+            + "\(rectString(stillWindow.contentLayoutRect))")
+        checkFits(stillWindow, "still")
+
+        // Aspect, not size: the window is allowed to be capped, but a capped
+        // window that does not keep the shape of the picture is letterboxing the
+        // user's screenshot inside their own viewer.
+        let content = stillWindow.contentLayoutRect.size
+        let wanted = small.width / small.height
+        let got = content.width / max(content.height, 1)
+        let aspectOK = abs(wanted - got) < 0.02
+        print(String(format: "  aspect %.3f vs %.3f -> %@", got, wanted,
+                     (aspectOK ? "matches" : "MISMATCH") as NSString))
+        if !aspectOK { failures.append("still window aspect \(got) != image aspect \(wanted)") }
+
+        // The whole picture has to be visible when it opens. A viewer that lands
+        // zoomed in on the top-left corner is technically showing the file and is
+        // useless.
+        if let magnification = viewer.magnificationForTest(still.url) {
+            // Room for the scrollers and the odd rounding; what would fail here is
+            // an opening magnification of 1 on an image larger than the window.
+            let fits = magnification <= 1.02
+            print(String(format: "  opens at %.3fx -> %@", magnification,
+                         (fits ? "whole image visible" : "OPENS ZOOMED IN") as NSString))
+            if !fits { failures.append("still opens at \(magnification)x") }
+        } else {
+            failures.append("still viewer is not a zooming scroll view")
+        }
+
+        // MARK: the same file again
+
+        // One window per file. A second click on a card whose viewer is already
+        // up must raise that window, not build a second one — two windows of the
+        // same screenshot is never what the second click meant.
+        viewer.show(still)
+        try await Task.sleep(for: .milliseconds(200))
+        let reopenedOK = viewer.openWindowCount == 1
+            && viewer.windowForTest(still.url) === stillWindow
+        print("reopen:        \(viewer.openWindowCount) window(s) "
+            + "\(reopenedOK ? "— raised the existing one" : "MISMATCH — built a second")")
+        if !reopenedOK { failures.append("re-opening the same file made a second window") }
+
+        // MARK: a full-screen still
+
+        // The case the cap exists for: as large as the display, so the natural
+        // size is unusable by construction.
+        let fullResult = try await coordinator.engine.capture(.display(displayID))
+        guard let fullOutput = await OutputPipeline.shared.process(
+            fullResult, saveDirectoryOverride: directory)
+        else {
+            print("result:        FAIL — the full-screen still did not reach the pipeline")
+            return 1
+        }
+        let full = await PreviewEntry(fullOutput)
+        viewer.show(full)
+        try await Task.sleep(for: .milliseconds(400))
+        if let fullWindow = viewer.windowForTest(full.url) {
+            print("fullscreen:    image \(Int(fullResult.pointSize.width))x"
+                + "\(Int(fullResult.pointSize.height)) pt")
+            checkFits(fullWindow, "fullscreen")
+        } else {
+            failures.append("no window for the full-screen still")
+        }
+
+        // MARK: a recording
+
+        // The other content path entirely — AVPlayerView, sized from the
+        // RecordingResult rather than from a decoded image.
+        let clip = directory.appendingPathComponent("viewer-clip.mp4")
+        try? FileManager.default.removeItem(at: clip)
+        let recorder = RecordingEngine()
+        var options = RecordingOptions.default
+        options.capturesSystemAudio = false
+        let region = CGRect(x: 200, y: 200, width: 640, height: 360)
+        _ = try await recorder.start(
+            .area(displayID: displayID, rectInAppKitGlobal: region), options: options, to: clip)
+        try await Task.sleep(for: .milliseconds(1200))
+        let recording = try await recorder.stop()
+        let poster = await VideoPoster.frame(for: recording.url) ?? VideoPoster.placeholder()
+        let video = PreviewEntry(
+            OutputPipeline.RecordingOutput(result: recording, url: recording.url, wasSaved: false),
+            poster: poster)
+        viewer.show(video)
+        try await Task.sleep(for: .milliseconds(500))
+
+        if let videoWindow = viewer.windowForTest(video.url) {
+            print("recording:     \(Int(recording.pointSize.width))x"
+                + "\(Int(recording.pointSize.height)) pt -> content "
+                + "\(rectString(videoWindow.contentLayoutRect))")
+            checkFits(videoWindow, "recording")
+            // Exactly the video's aspect. The first version of this padded the
+            // window for the transport controls and asserted the padding was
+            // there — which passed, while the window showed the clip with a black
+            // band above and below it. `.inline` controls are an auto-hiding
+            // overlay, so any allowance for them is pure letterboxing.
+            let box = videoWindow.contentLayoutRect.size
+            let wantedVideo = recording.pointSize.width / max(recording.pointSize.height, 1)
+            let gotVideo = box.width / max(box.height, 1)
+            let videoAspectOK = abs(wantedVideo - gotVideo) < 0.02
+            print(String(format: "  aspect %.3f vs %.3f -> %@", gotVideo, wantedVideo,
+                         (videoAspectOK ? "matches, no letterboxing" : "MISMATCH") as NSString))
+            if !videoAspectOK {
+                failures.append("recording window aspect \(gotVideo) != video aspect \(wantedVideo)")
+            }
+            if !(videoWindow.contentView is AVPlayerView) {
+                failures.append("recording window is not an AVPlayerView")
+            }
+        } else {
+            failures.append("no window for the recording")
+        }
+
+        // MARK: the two keys every window closes with
+
+        // DuoShot is LSUIElement and has no main menu, so there is nothing
+        // behind ⌘W: an equivalent that no window in the app claims is normally
+        // caught by the menu bar's Close item, and here it just does nothing.
+        // Escape had the same shape of bug in a different place — the still's
+        // scroll view answered `cancelOperation`, so Escape worked on a
+        // screenshot and silently did not on a recording.
+        //
+        // Both are therefore checked on the *video* window, which is the one
+        // whose content view answers neither.
+        if let videoWindow = viewer.windowForTest(video.url) {
+            let commandW = NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: .command,
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: videoWindow.windowNumber, context: nil,
+                characters: "w", charactersIgnoringModifiers: "w",
+                isARepeat: false, keyCode: UInt16(kVK_ANSI_W))
+            // `performKeyEquivalent` is the method NSApp itself calls, so this is
+            // the real entry point rather than a stand-in for it.
+            let claimed = commandW.map { videoWindow.performKeyEquivalent(with: $0) } ?? false
+            try await Task.sleep(for: .milliseconds(200))
+            let closed = viewer.windowForTest(video.url) == nil
+            print("⌘W:            claimed=\(claimed) closed=\(closed) "
+                + "\(claimed && closed ? "" : "MISMATCH")")
+            if !(claimed && closed) { failures.append("⌘W did not close the viewer") }
+
+            // Re-opened for the Escape half, since ⌘W just closed it.
+            viewer.show(video)
+            try await Task.sleep(for: .milliseconds(300))
+            viewer.windowForTest(video.url)?.cancelOperation(nil)
+            try await Task.sleep(for: .milliseconds(200))
+            let escClosed = viewer.windowForTest(video.url) == nil
+            print("Esc:           closed=\(escClosed) \(escClosed ? "" : "MISMATCH")")
+            if !escClosed { failures.append("Escape did not close the viewer") }
+            viewer.show(video)
+            try await Task.sleep(for: .milliseconds(300))
+        }
+
+        // MARK: look at it
+
+        // Everything above is arithmetic on frames, and none of it can tell you
+        // whether the window looks like a viewer. The three are left on screen
+        // together for this one shot.
+        try await Task.sleep(for: .milliseconds(300))
+        let shot = try await coordinator.engine.capture(.display(displayID))
+        let url = directory.appendingPathComponent("viewer.png")
+        try ImageEncoder.write(shot.image, to: url, as: .png, scale: shot.scale)
+        print("wrote:         \(url.path)")
+
+        print("windows:       \(viewer.openWindowCount) open")
+        viewer.closeAll()
+        try await Task.sleep(for: .milliseconds(200))
+        let closedOK = viewer.openWindowCount == 0
+        print("closeAll:      \(viewer.openWindowCount) left \(closedOK ? "" : "MISMATCH")")
+        if !closedOK { failures.append("closeAll left windows behind") }
+
+        for failure in failures { print("FAIL:          \(failure)") }
+        print("result:        \(failures.isEmpty ? "PASS" : "FAIL")")
+        return failures.isEmpty ? 0 : 1
+    }
+
+    /// The three share states, photographed.
+    ///
+    /// Written because the states cannot be reasoned about: "is the link button
+    /// there, and does the ring cover the open button" is a question about
+    /// pixels. It is also the only way to see them without a configured server
+    /// and a real upload, since two of the three last under a second.
+    ///
+    /// Forces `--sharing-default` on: the preview panel is normally invisible to
+    /// ScreenCaptureKit (`sharingType = .none`) so that it stays out of the next
+    /// capture, which also means a screenshot of it comes back empty. That is
+    /// not a bug and it is why this test has to say so explicitly.
+    private static func shareCardStates(into directory: URL) async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+        PreviewPanel.usesSharingTypeNone = false
+
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+
+        let coordinator = CaptureCoordinator()
+        let previews = PreviewStackController()
+        previews.timeout = .seconds(600)
+        try await coordinator.engine.refreshContent()
+        let displayID = ScreenIndex.screenUnderMouse().flatMap(ScreenIndex.displayID(of:))
+            ?? CGMainDisplayID()
+
+        let result = try await coordinator.engine.capture(
+            .area(displayID: displayID,
+                  rectInAppKitGlobal: CGRect(x: 300, y: 300, width: 520, height: 360)))
+        guard let output = await OutputPipeline.shared.process(
+            result, saveDirectoryOverride: directory)
+        else {
+            print("result:        FAIL — pipeline returned nothing")
+            return 1
+        }
+        await previews.present(output)
+        try await Task.sleep(for: .milliseconds(300))
+        // The action bar only exists while the pointer is over the stack, and
+        // there is no pointer here.
+        previews.setHoverForTest(true)
+        try await Task.sleep(for: .milliseconds(300))
+
+        // What the link button does once an upload has finished. Asserted here
+        // because "clicking it did nothing" was a real report, and the only part
+        // that can be checked without a pointer is whether the write happens.
+        let link = LinkdropLink(
+            key: "clipboardcheck",
+            pageURL: URL(string: "https://s.example.com/clipboardcheck")!,
+            fileURL: URL(string: "https://s.example.com/f/clipboardcheck.png")!)
+        NSPasteboard.general.clearContents()
+        Clipboard.write(link: link.pageURL)
+        let pasted = NSPasteboard.general.string(forType: .string)
+        print("clipboard:     \(pasted ?? "nil")")
+        if pasted != link.pageURL.absoluteString {
+            print("result:        FAIL — the link did not reach the clipboard")
+            return 1
+        }
+
+        // Hover matters as much as the state: the card is a different thing
+        // with the pointer on it, and the uploading case is shown in two
+        // different places depending on which it is.
+        // "idle" is captured further down as the card is *born*, never by
+        // pushing `nil`: a real card is never told it has no share state, and a
+        // test that says so tests a path nothing takes.
+        let states: [(String, ShareService.State?, Bool)] = [
+            ("uploading-resting", .uploading(0.62), false),
+            ("uploading", .uploading(0.62), true),
+            ("done", .done(LinkdropLink(
+                key: "a7Kd9xQ2mZ01",
+                pageURL: URL(string: "https://s.example.com/a7Kd9xQ2mZ01")!,
+                fileURL: URL(string: "https://s.example.com/f/a7Kd9xQ2mZ01.png")!)), true),
+            ("failed", .failed("No network connection.", retryable: true), true),
+        ]
+
+        guard let frame = previews.panelFrames.first else {
+            print("result:        FAIL — no card on screen")
+            return 1
+        }
+        print("configured:    \(ShareService.shared.isConfigured)")
+        print("card frame:    \(Int(frame.minX)),\(Int(frame.minY)) \(Int(frame.width))x\(Int(frame.height))")
+
+        // As constructed, before anything touches its share state.
+        previews.setHoverForTest(true)
+        try await Task.sleep(for: .milliseconds(300))
+        let born = try await coordinator.engine.capture(
+            .area(displayID: displayID, rectInAppKitGlobal: frame.insetBy(dx: -12, dy: -12)))
+        try ImageEncoder.write(
+            born.image, to: directory.appendingPathComponent("share-card-idle.png"),
+            as: .png, scale: born.scale)
+        print("wrote:         share-card-idle.png (as constructed)")
+
+        for (name, state, hovering) in states {
+            previews.setShareStateForTest(state)
+            previews.setHoverForTest(hovering)
+            try await Task.sleep(for: .milliseconds(350))
+
+            let shot = try await coordinator.engine.capture(
+                .area(displayID: displayID, rectInAppKitGlobal: frame.insetBy(dx: -12, dy: -12)))
+            let url = directory.appendingPathComponent("share-card-\(name).png")
+            try ImageEncoder.write(shot.image, to: url, as: .png, scale: shot.scale)
+            print("wrote:         \(url.lastPathComponent)")
+        }
+
+        print("result:        PASS")
+        return 0
+    }
 
     private static func previewStack(count: Int, into directory: URL) async throws -> Int32 {
         guard ScreenPermission.isGranted else { return permissionHint() }
@@ -2419,7 +3227,7 @@ enum SelfTest {
         // close without a second monitor plugged in.
         let flag = CompletionFlag()
         Task {
-            _ = await overlay.present(mode: .area, windows: [], allowsWindowMode: false)
+            _ = await overlay.present(windows: [], suggestsWindows: false)
             flag.markDone()
         }
         try await Task.sleep(for: .milliseconds(250))
@@ -2844,7 +3652,7 @@ enum SelfTest {
             overlay.isRecordingActive = { recording }
             let flag = CompletionFlag()
             Task {
-                _ = await overlay.present(mode: .area, windows: [])
+                _ = await overlay.present(windows: [])
                 flag.markDone()
             }
             try? await Task.sleep(for: .milliseconds(160))
@@ -2903,7 +3711,7 @@ enum SelfTest {
         let flag = CompletionFlag()
         Task {
             box.outcome = await overlay.present(
-                mode: .area, windows: [], allowsWindowMode: false, requiresConfirmation: true)
+                windows: [], suggestsWindows: false, requiresConfirmation: true)
             flag.markDone()
         }
         try await Task.sleep(for: .milliseconds(140))
@@ -2960,7 +3768,7 @@ enum SelfTest {
         let moveFlag = CompletionFlag()
         Task {
             _ = await overlay.present(
-                mode: .area, windows: [], allowsWindowMode: false, requiresConfirmation: true)
+                windows: [], suggestsWindows: false, requiresConfirmation: true)
             moveFlag.markDone()
         }
         try await Task.sleep(for: .milliseconds(140))
@@ -3104,7 +3912,7 @@ enum SelfTest {
         let secondFlag = CompletionFlag()
         Task {
             _ = await overlay.present(
-                mode: .area, windows: [], allowsWindowMode: false, requiresConfirmation: true)
+                windows: [], suggestsWindows: false, requiresConfirmation: true)
             secondFlag.markDone()
         }
         try await Task.sleep(for: .milliseconds(140))
@@ -3134,7 +3942,7 @@ enum SelfTest {
         let stillFlag = CompletionFlag()
         let stillBox = OutcomeBox()
         Task {
-            stillBox.outcome = await overlay.present(mode: .area, windows: [])
+            stillBox.outcome = await overlay.present(windows: [])
             stillFlag.markDone()
         }
         try await Task.sleep(for: .milliseconds(140))
@@ -3182,7 +3990,6 @@ enum SelfTest {
 
         for iteration in 0..<iterations {
             let path = ExitPath.allCases[iteration % ExitPath.allCases.count]
-            let mode: SelectionMode = path == .confirmWindow ? .window : .area
 
             let flag = CompletionFlag()
             let box = OutcomeBox()
@@ -3190,7 +3997,7 @@ enum SelfTest {
             // checked. The paths that are *supposed* to cancel leave it false.
             var expectsConfirmation = false
             Task {
-                box.outcome = await overlay.present(mode: mode, windows: windows)
+                box.outcome = await overlay.present(windows: windows)
                 flag.markDone()
             }
             try await Task.sleep(for: .milliseconds(120))
@@ -3228,7 +4035,7 @@ enum SelfTest {
                 // The second call must cancel the first, not strand it.
                 let secondFlag = CompletionFlag()
                 Task {
-                    _ = await overlay.present(mode: .area, windows: windows)
+                    _ = await overlay.present(windows: windows)
                     secondFlag.markDone()
                 }
                 try await Task.sleep(for: .milliseconds(120))
@@ -3299,7 +4106,7 @@ enum SelfTest {
         // it produced was vacuous.
         let strandedFlag = CompletionFlag()
         Task {
-            _ = await overlay.present(mode: .area, windows: windows)
+            _ = await overlay.present(windows: windows)
             strandedFlag.markDone()
         }
         try await Task.sleep(for: .milliseconds(120))
