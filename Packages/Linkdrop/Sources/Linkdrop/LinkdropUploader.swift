@@ -113,6 +113,7 @@ public actor LinkdropUploader {
             URLQueryItem(name: "name", value: d.name),
         ]
         if d.ephemeral { query.append(URLQueryItem(name: "ephemeral", value: "1")) }
+        if d.burnAfterReading { query.append(URLQueryItem(name: "burn", value: "1")) }
         if let width = d.width { query.append(URLQueryItem(name: "w", value: "\(width)")) }
         if let height = d.height { query.append(URLQueryItem(name: "h", value: "\(height)")) }
         if let duration = d.duration {
@@ -135,7 +136,7 @@ public actor LinkdropUploader {
     ) async throws -> LinkdropLink {
         struct Body: Encodable {
             let ext: String, name: String
-            let size: Int64, ephemeral: Bool
+            let size: Int64, ephemeral: Bool, burn: Bool
             let width: Int?, height: Int?, duration: Double?
         }
         struct Reply: Decodable {
@@ -149,6 +150,7 @@ public actor LinkdropUploader {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(Body(
             ext: d.ext, name: d.name, size: size, ephemeral: d.ephemeral,
+            burn: d.burnAfterReading,
             width: d.width, height: d.height, duration: d.duration))
 
         let reply: Reply = try decode(await send(endpoint.authorized(request)))

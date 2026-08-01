@@ -46,10 +46,15 @@ export function renderPage(record: ShareRecord, base: string): string {
   const { contentType } = servedTypeFor(record.ext);
   const title = escape(record.name || `${record.key}.${record.ext}`);
 
-  // og:image is what actually produces a thumbnail in chat apps. For a video
-  // that has to be the poster still -- no unfurler decodes a frame for you.
-  const previewImage =
-    kind === "image" && isRenderable(record.ext)
+  // A one-time link gets no preview of any kind, and that is the whole design
+  // rather than an omission: an og:image is fetched by the unfurler in whatever
+  // chat app the link was pasted into, which would spend the single read on a
+  // bot before the recipient had clicked anything.
+  const previewImage = record.burn
+    ? null
+    : // og:image is what actually produces a thumbnail in chat apps. For a video
+      // that has to be the poster still -- no unfurler decodes a frame for you.
+      kind === "image" && isRenderable(record.ext)
       ? fileURL
       : record.posterKey
         ? `${base}/f/${record.key}.poster.jpg`
@@ -75,14 +80,24 @@ export function renderPage(record: ShareRecord, base: string): string {
   }
   const width = positive(record.width);
   const height = positive(record.height);
-  if (width !== null && height !== null) {
+  if (width !== null && height !== null && !record.burn) {
     const dimensionPrefix = kind === "video" ? "og:video" : "og:image";
     meta.push(`<meta property="${dimensionPrefix}:width" content="${width}">`);
     meta.push(`<meta property="${dimensionPrefix}:height" content="${height}">`);
   }
 
   let body: string;
-  if (kind === "image" && isRenderable(record.ext)) {
+  if (record.burn) {
+    // No <img>: rendering the file here would spend the read on whoever loaded
+    // the page, including the recipient who only wanted to see what they had
+    // been sent. The read has to be something a person chooses.
+    body = `<div class="once">
+<h1>This link opens once</h1>
+<p>Opening the file deletes it. The link will not work a second time, for you or
+for anyone else it was forwarded to.</p>
+<a class="go" href="${fileURL}">Open ${title}</a>
+</div>`;
+  } else if (kind === "image" && isRenderable(record.ext)) {
     body = `<img src="${fileURL}" alt="${title}">`;
   } else if (kind === "video") {
     const poster = record.posterKey ? ` poster="${base}/f/${record.key}.poster.jpg"` : "";
@@ -114,6 +129,10 @@ body { margin:0; min-height:100vh; display:flex; flex-direction:column; align-it
 img, video { max-width:min(100%, 1400px); max-height:82vh; border-radius:10px;
   background:var(--card); box-shadow:0 1px 3px #0000001f, 0 8px 28px #00000014; }
 .plain { padding:48px 32px; background:var(--card); border-radius:10px; }
+.once { max-width:34em; padding:32px; background:var(--card); border-radius:10px; text-align:center; }
+.once h1 { font-size:19px; margin:0 0 10px; }
+.once p { color:var(--dim); margin:0 0 20px; }
+.once .go { display:inline-block; padding:9px 18px; font-weight:600; }
 footer { display:flex; align-items:center; gap:14px; color:var(--dim); flex-wrap:wrap; justify-content:center; }
 a { color:inherit; text-decoration:none; border:1px solid var(--line); padding:5px 12px; border-radius:7px; }
 a:hover { background:var(--card); }
@@ -123,33 +142,56 @@ a:hover { background:var(--card); }
 ${body}
 <footer>
 <span>${facts.join(" · ")}</span>
-<a href="${downloadURL}" download>Download</a>
+${record.burn ? "" : `<a href="${downloadURL}" download>Download</a>`}
 </footer>
 </body>
 </html>`;
 }
 
-export function renderGone(key: string, unfinished = false): string {
+/// Why there are no bytes behind a link that once had a record.
+///
+/// Three cases and not one page, because the recipient's next move differs: an
+/// unfinished upload is worth reloading, an expired one is worth asking for
+/// again, and a used one-time link is worth knowing was *used* -- telling them
+/// it expired would have them wait for a link that is never coming back, and
+/// would hide that somebody has already opened it.
+export type GoneReason = "expired" | "unfinished" | "burned";
+
+const GONE_TEXT: Record<GoneReason, { title: string; heading: string; detail: string }> = {
+  expired: { title: "Expired", heading: "This link has expired", detail: "" },
+  unfinished: {
+    title: "Not here",
+    heading: "Nothing here yet",
+    detail: "The upload is still running, or it did not finish.",
+  },
+  burned: {
+    title: "Viewed",
+    heading: "This one-time link has been viewed",
+    detail: "It was set to open once. The file was deleted when it was opened, "
+      + "and no copy of it is left here.",
+  },
+};
+
+export function renderGone(key: string, reason: GoneReason = "expired"): string {
+  const { title, heading, detail } = GONE_TEXT[reason];
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>${unfinished ? "Not here" : "Expired"}</title>
+<title>${title}</title>
 <style>
 :root { color-scheme: light dark; }
 body { margin:0; min-height:100vh; display:flex; flex-direction:column; align-items:center;
-  justify-content:center; gap:8px;
+  justify-content:center; gap:8px; padding:24px; text-align:center;
   font:14px/1.5 -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
-p { color:#6e6e73; margin:0; }
+p { color:#6e6e73; margin:0; max-width:32em; }
 </style>
 </head>
 <body>
-<h1>${unfinished ? "Nothing here yet" : "This link has expired"}</h1>
-<p>${unfinished
-  ? "The upload is still running, or it did not finish."
-  : escape(key)}</p>
+<h1>${heading}</h1>
+<p>${detail || escape(key)}</p>
 </body>
 </html>`;
 }

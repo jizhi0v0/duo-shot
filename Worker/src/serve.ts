@@ -141,6 +141,72 @@ export async function serveObject(
   return new Response(object.body, { status: 200, headers: base });
 }
 
+/// Serves a one-time object and then hands the caller the go-ahead to destroy it.
+///
+/// Everything here is a consequence of `consume` being irreversible:
+///
+///  - the body is buffered rather than streamed. Handing R2's stream to the
+///    runtime and deleting the object underneath it is a race whose loser is the
+///    recipient, who gets a truncated file and no second chance. The upload side
+///    caps a burn at `BURN_LIMIT` so this fits in a Worker's memory.
+///  - HEAD does not consume. An unfurler, a link checker or a proxy prefetch
+///    would otherwise spend the one read on nobody.
+///  - a Range request is refused rather than served. Serving one without burning
+///    would make `Range: bytes=0-` a way to read the whole file forever; burning
+///    on a partial read would destroy the rest of a file nobody has yet seen.
+///    Burns are images, which browsers fetch whole, so nothing legitimate asks.
+///  - `no-store`, without which a shared cache goes on serving bytes this Worker
+///    has already deleted, and the one guarantee the link makes is void.
+///
+/// Two readers arriving at once both get the bytes: the delete only starts after
+/// the first has been read out. That is a race between two people who already
+/// hold the same secret link, not a hole in it.
+export async function serveOnce(
+  bucket: R2Bucket,
+  objectKey: string,
+  request: Request,
+  options: ServeOptions,
+  consume: () => void,
+): Promise<Response | null> {
+  const { contentType, forceDownload } = servedTypeFor(options.ext);
+  const headers = new Headers({
+    "Content-Type": contentType,
+    "Accept-Ranges": "none",
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "X-Robots-Tag": "noindex, nofollow",
+  });
+  if (forceDownload || options.download) {
+    headers.set(
+      "Content-Disposition",
+      `attachment; filename="${sanitizeFilename(options.filename)}"`,
+    );
+  }
+
+  if (request.method === "HEAD") {
+    const head = await bucket.head(objectKey);
+    if (!head) return null;
+    headers.set("Content-Length", String(head.size));
+    return new Response(null, { status: 200, headers });
+  }
+
+  if (request.headers.get("Range") !== null) {
+    return new Response("one-time links are served whole, not in ranges", {
+      status: 416,
+      headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },
+    });
+  }
+
+  const object = await bucket.get(objectKey);
+  if (object === null) return null;
+
+  const body = await object.arrayBuffer();
+  consume();
+
+  headers.set("Content-Length", String(body.byteLength));
+  return new Response(body, { status: 200, headers });
+}
+
 /// A filename reaches this header from whatever the client sent at upload time.
 /// A quote or a newline in it would let the uploader inject header fields.
 function sanitizeFilename(name: string): string {

@@ -44,6 +44,11 @@ final class PreviewCardView: NSView {
     /// The file never reached the save folder. Adds its own badge, because
     /// nothing else on the card distinguishes this from an ordinary capture.
     private let saveFailed: Bool
+    /// Whether the share button's tooltip advertises the Option-click one-time
+    /// link. The modifier is read by the stack when the button fires — this is
+    /// only how anyone finds out it is there, and a hint for a thing the
+    /// service would refuse is worse than no hint.
+    private let allowsOneTimeShare: Bool
     private var callbacks: Callbacks
     private var isDraggingOut = false
     private var mouseDownGlobal: CGPoint?
@@ -64,11 +69,12 @@ final class PreviewCardView: NSView {
     private var isHovering = false
 
     init(image: NSImage, badge: String? = nil, isIncomplete: Bool = false,
-         saveFailed: Bool = false, callbacks: Callbacks) {
+         saveFailed: Bool = false, allowsOneTimeShare: Bool = false, callbacks: Callbacks) {
         self.image = image
         self.badge = badge
         self.isIncomplete = isIncomplete
         self.saveFailed = saveFailed
+        self.allowsOneTimeShare = allowsOneTimeShare
         self.callbacks = callbacks
         super.init(frame: CGRect(origin: .zero, size: Self.cardSize))
         wantsLayer = true
@@ -444,7 +450,9 @@ final class PreviewCardView: NSView {
             shareButton?.isHidden = !ShareService.shared.isConfigured
             shareButton?.isEnabled = true
             shareButton?.contentTintColor = .white
-            shareButton?.toolTip = "Upload and copy link"
+            shareButton?.toolTip = allowsOneTimeShare
+                ? "Upload and copy link\nOption-click: one-time link, deleted after it is opened"
+                : "Upload and copy link"
             // The platform's own glyph for this action. `arrow.up.circle` says
             // "upload" to a developer; this says "share" to everyone, and that
             // is what the button does.

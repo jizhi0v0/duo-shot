@@ -72,6 +72,13 @@ public struct LinkdropDescriptor: Sendable {
     public var duration: Double?
     /// Lands under the service's expiring prefix.
     public var ephemeral: Bool
+    /// The service deletes the bytes after the first complete read.
+    ///
+    /// Images only, and the service refuses it for anything else: a video is
+    /// fetched in ranges, so there is no first complete read to trigger on. The
+    /// service also caps how large one may be, because it has to hold the whole
+    /// file in memory to answer and delete in the same breath.
+    public var burnAfterReading: Bool
 
     public enum Kind: String, Sendable {
         case image
@@ -81,7 +88,7 @@ public struct LinkdropDescriptor: Sendable {
 
     public init(
         ext: String, name: String, kind: Kind, width: Int? = nil, height: Int? = nil,
-        duration: Double? = nil, ephemeral: Bool = false
+        duration: Double? = nil, ephemeral: Bool = false, burnAfterReading: Bool = false
     ) {
         self.ext = ext
         self.name = name
@@ -90,6 +97,7 @@ public struct LinkdropDescriptor: Sendable {
         self.height = height
         self.duration = duration
         self.ephemeral = ephemeral
+        self.burnAfterReading = burnAfterReading
     }
 }
 

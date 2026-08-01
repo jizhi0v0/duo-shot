@@ -48,4 +48,13 @@ export interface ShareRecord {
   posterKey?: string;
   createdAt: string;
   ephemeral: boolean;
+  /// One read and the bytes are deleted. Images only: a video is fetched with
+  /// Range requests, so "the first complete read" is not a moment that exists
+  /// for one, and a link that burned halfway through a seek would be a lie.
+  burn?: boolean;
+  /// Set when the read happened. Its presence is what turns this record into a
+  /// tombstone -- the object and everything describing it are gone by then, and
+  /// all that is left is enough to answer "you already opened this" instead of
+  /// the 404 a deleted sidecar would give.
+  burnedAt?: string;
 }

@@ -85,6 +85,7 @@ final class PreviewStackController {
         let card = PreviewCardView(
             image: entry.thumbnail, badge: entry.badge,
             isIncomplete: entry.isIncomplete, saveFailed: entry.saveFailed,
+            allowsOneTimeShare: !entry.isVideo,
             callbacks: callbacks)
         let item = Item(entry: entry, card: card)
 
@@ -146,7 +147,17 @@ final class PreviewStackController {
             case .failed:
                 ShareService.shared.retry(entry)
             default:
-                ShareService.shared.share(entry)
+                // Option-click shares a still as a one-time link: the recipient
+                // gets the file on the first open and the service deletes it.
+                // Read here rather than plumbed down from the button, because
+                // the modifier is a property of the click and the card has no
+                // business knowing what a burn link is.
+                //
+                // Offered for stills only. A video is fetched in ranges, so
+                // "the first complete read" is not a moment that happens, and
+                // the service refuses one.
+                let once = !entry.isVideo && NSEvent.modifierFlags.contains(.option)
+                ShareService.shared.share(entry, burnAfterReading: once)
             }
             // Pressing it restarts the clock rather than consuming the card:
             // unlike copy and reveal, the interesting part happens afterwards

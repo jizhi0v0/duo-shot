@@ -30,6 +30,14 @@ final class ShareService {
     private var tasks: [URL: Task<Void, Never>] = [:]
     private var observers: [URL: [(State) -> Void]] = [:]
 
+    /// Captures that were asked to go up as one-time links.
+    ///
+    /// Kept here rather than passed along because `retry` only has the entry: a
+    /// retry that quietly produced an ordinary permanent link would be the worst
+    /// possible outcome of a button whose whole point is that the file is not
+    /// meant to survive being looked at.
+    private var oneTime: Set<URL> = []
+
     /// The Keychain item. Service string rather than the app's bundle id so the
     /// token survives a bundle rename, and so two builds of the same app share it.
     static let credentials = LinkdropCredentials(service: "com.boli.duoshot.share")
@@ -81,7 +89,12 @@ final class ShareService {
     /// Idempotent: asking twice for the same capture does not upload it twice,
     /// which matters because the card's button and the auto-upload preference can
     /// both fire for one capture.
-    func share(_ entry: PreviewEntry) {
+    ///
+    /// - Parameter burnAfterReading: The service deletes the file after the
+    ///   first complete read. Only honoured for a still — a video is fetched in
+    ///   ranges, so there is no first complete read — and the service refuses it
+    ///   for anything else regardless of what is asked here.
+    func share(_ entry: PreviewEntry, burnAfterReading: Bool = false) {
         guard tasks[entry.url] == nil else { return }
         if case .done = states[entry.url] { return }
 
@@ -89,6 +102,12 @@ final class ShareService {
             publish(.failed("Set a share endpoint and token in Settings.", retryable: false),
                     for: entry.url)
             return
+        }
+
+        if burnAfterReading && !entry.isVideo {
+            oneTime.insert(entry.url)
+        } else {
+            oneTime.remove(entry.url)
         }
 
         publish(.uploading(0), for: entry.url)
@@ -101,7 +120,7 @@ final class ShareService {
 
     func retry(_ entry: PreviewEntry) {
         states[entry.url] = nil
-        share(entry)
+        share(entry, burnAfterReading: oneTime.contains(entry.url))
     }
 
     private func run(_ entry: PreviewEntry, endpoint: LinkdropEndpoint) async {
@@ -110,7 +129,8 @@ final class ShareService {
         case .image(let pointSize):
             outcome = LinkdropGate.plan(
                 image: entry.url, pointSize: pointSize,
-                ephemeral: ShareSettings.shared.ephemeralScreenshots)
+                ephemeral: ShareSettings.shared.ephemeralScreenshots,
+                burnAfterReading: oneTime.contains(entry.url))
         case .video(let result):
             outcome = await LinkdropGate.plan(
                 video: entry.url, pointSize: result.pointSize, duration: result.duration,

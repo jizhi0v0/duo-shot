@@ -38,8 +38,14 @@ public enum LinkdropGate {
 
     // MARK: - Stills
 
+    /// - Parameter burnAfterReading: Offered on this path and not on the video
+    ///   one, so that "one-time links are images only" is a thing the compiler
+    ///   knows rather than a rule every caller has to remember. The service
+    ///   refuses it for a video anyway; neither end is allowed to be the only
+    ///   check.
     public static func plan(
-        image url: URL, pointSize: CGSize? = nil, ephemeral: Bool = false
+        image url: URL, pointSize: CGSize? = nil, ephemeral: Bool = false,
+        burnAfterReading: Bool = false
     ) -> Outcome {
         let ext = url.pathExtension.lowercased()
 
@@ -47,7 +53,8 @@ public enum LinkdropGate {
             return .ok(Plan(
                 fileURL: url,
                 descriptor: descriptor(for: url, ext: ext, pointSize: pointSize,
-                                       ephemeral: ephemeral),
+                                       ephemeral: ephemeral,
+                                       burnAfterReading: burnAfterReading),
                 isTemporary: false))
         }
 
@@ -61,7 +68,8 @@ public enum LinkdropGate {
             return .ok(Plan(
                 fileURL: converted,
                 descriptor: descriptor(for: converted, ext: "png", pointSize: pointSize,
-                                       ephemeral: ephemeral),
+                                       ephemeral: ephemeral,
+                                       burnAfterReading: burnAfterReading),
                 isTemporary: true))
         }
 
@@ -97,7 +105,9 @@ public enum LinkdropGate {
                             + "for most people who open the link.")
         }
 
-        var descriptor = descriptor(for: url, ext: ext, pointSize: pointSize, ephemeral: ephemeral)
+        var descriptor = descriptor(
+            for: url, ext: ext, pointSize: pointSize, ephemeral: ephemeral,
+            burnAfterReading: false)
         descriptor.kind = .video
         descriptor.duration = duration
 
@@ -179,13 +189,14 @@ public enum LinkdropGate {
     // MARK: -
 
     private static func descriptor(
-        for url: URL, ext: String, pointSize: CGSize?, ephemeral: Bool
+        for url: URL, ext: String, pointSize: CGSize?, ephemeral: Bool,
+        burnAfterReading: Bool
     ) -> LinkdropDescriptor {
         LinkdropDescriptor(
             ext: ext, name: url.lastPathComponent, kind: .image,
             width: pointSize.map { Int($0.width.rounded()) },
             height: pointSize.map { Int($0.height.rounded()) },
-            ephemeral: ephemeral)
+            ephemeral: ephemeral, burnAfterReading: burnAfterReading)
     }
 }
 

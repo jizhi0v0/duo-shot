@@ -250,6 +250,127 @@ describe("api/new does not trust its JSON", () => {
   });
 });
 
+describe("one-time links", () => {
+  async function burnKey(query = "ext=png&name=secret.png&burn=1"): Promise<string> {
+    return uploadedKey(query);
+  }
+
+  it("serves the bytes once and then refuses", async () => {
+    const key = await burnKey();
+
+    const first = await SELF.fetch(`${BASE}/f/${key}.png`);
+    expect(first.status).toBe(200);
+    expect(new Uint8Array(await first.arrayBuffer())).toEqual(PNG);
+    // A cached copy is a copy that outlives the deletion, which is the one
+    // thing this link promises cannot happen.
+    expect(first.headers.get("Cache-Control")).toBe("no-store");
+
+    const second = await SELF.fetch(`${BASE}/f/${key}.png`);
+    expect([404, 410]).toContain(second.status);
+    expect(await (env as Env).BUCKET.head(`p/${key}`)).toBeNull();
+  });
+
+  it("says viewed rather than expired once it has been used", async () => {
+    const key = await burnKey();
+    await SELF.fetch(`${BASE}/f/${key}.png`);
+
+    const page = await SELF.fetch(`${BASE}/${key}`);
+    expect(page.status).toBe(410);
+    const html = await page.text();
+    expect(html).toContain("viewed");
+    expect(html).not.toContain("expired");
+  });
+
+  // An unfurl bot, a link checker or a proxy prefetch would otherwise spend the
+  // single read on nobody, and the recipient would get the 410.
+  it("does not burn on HEAD", async () => {
+    const key = await burnKey();
+
+    const head = await SELF.fetch(`${BASE}/f/${key}.png`, { method: "HEAD" });
+    expect(head.status).toBe(200);
+    expect(head.headers.get("Content-Length")).toBe(String(PNG.byteLength));
+
+    const get = await SELF.fetch(`${BASE}/f/${key}.png`);
+    expect(get.status).toBe(200);
+  });
+
+  // The whole reason the viewer page renders no <img> and no og:image.
+  it("does not burn on a page view, and the page names no bytes", async () => {
+    const key = await burnKey();
+
+    const page = await SELF.fetch(`${BASE}/${key}`);
+    expect(page.status).toBe(200);
+    const html = await page.text();
+    expect(html).not.toContain("og:image");
+    expect(html).not.toContain(`<img src=`);
+    expect(html).toContain("opens once");
+    // The link to the bytes is there to be *clicked*; nothing may fetch it.
+    expect(html).toContain(`href="${BASE}/f/${key}.png"`);
+
+    expect((await SELF.fetch(`${BASE}/f/${key}.png`)).status).toBe(200);
+  });
+
+  it("refuses a range rather than serving one", async () => {
+    const key = await burnKey();
+    const response = await SELF.fetch(`${BASE}/f/${key}.png`, {
+      headers: { Range: "bytes=0-9" },
+    });
+
+    expect(response.status).toBe(416);
+    expect((await SELF.fetch(`${BASE}/f/${key}.png`)).status).toBe(200);
+  });
+
+  // "First complete read" is not a moment that exists for a video.
+  it("refuses a burn upload of a video", async () => {
+    const put = await upload(PNG, "ext=mp4&burn=1");
+    expect(put.status).toBe(400);
+
+    const post = await SELF.fetch(`${BASE}/api/new`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify({ ext: "mp4", size: 1000, burn: true }),
+    });
+    expect(post.status).toBe(400);
+  });
+
+  // The read is buffered whole before it can be answered and deleted, so the
+  // size limit is what a Worker can hold, and upload time is the last moment
+  // where refusing is still useful.
+  it("refuses a burn upload too large to buffer", async () => {
+    const oversized = await SELF.fetch(`${BASE}/api/new`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify({ ext: "png", size: 64 * 1024 * 1024, burn: true }),
+    });
+    expect(oversized.status).toBe(400);
+
+    // And with no declared size at all, which would be the way around it.
+    const unsized = await SELF.fetch(`${BASE}/api/new`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify({ ext: "png", burn: true }),
+    });
+    expect(unsized.status).toBe(400);
+  });
+
+  it("refuses a burn flag that is not a boolean", async () => {
+    const response = await SELF.fetch(`${BASE}/api/new`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify({ ext: "png", size: 1000, burn: "yes" }),
+    });
+    expect(response.status).toBe(400);
+  });
+
+  // The download route reads the same bytes; letting it through unburnt would
+  // be the way round the feature.
+  it("burns on the download route too", async () => {
+    const key = await burnKey();
+    expect((await SELF.fetch(`${BASE}/${key}/dl`)).status).toBe(200);
+    expect([404, 410]).toContain((await SELF.fetch(`${BASE}/f/${key}.png`)).status);
+  });
+});
+
 describe("delete", () => {
   it("removes the object and then serves nothing", async () => {
     const key = await uploadedKey();
