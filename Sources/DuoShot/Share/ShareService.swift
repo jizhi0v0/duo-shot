@@ -1,3 +1,4 @@
+import AVFoundation
 import AppKit
 import Linkdrop
 
@@ -37,6 +38,16 @@ final class ShareService {
     /// possible outcome of a button whose whole point is that the file is not
     /// meant to survive being looked at.
     private var oneTime: Set<URL> = []
+
+    /// Where the reason a dropped file could not be shared is shown, and nil to
+    /// take the last one back down.
+    ///
+    /// A capture reports itself on its preview card. A file dragged onto the
+    /// menu bar has no card, so without this the only evidence of a refusal
+    /// would be a beep and a line in Console. The menu bar item is what took the
+    /// drop, so its menu is where the sentence belongs; `StatusItemController`
+    /// owns the wording of the row.
+    var onDropNotice: ((String?) -> Void)?
 
     /// The Keychain item. Service string rather than the app's bundle id so the
     /// token survives a bundle rename, and so two builds of the same app share it.
@@ -121,6 +132,124 @@ final class ShareService {
     func retry(_ entry: PreviewEntry) {
         states[entry.url] = nil
         share(entry, burnAfterReading: oneTime.contains(entry.url))
+    }
+
+    // MARK: - Files that were never captured
+
+    /// Whether a file is worth accepting from a drag at all.
+    ///
+    /// The gate's own answer, asked before the drop rather than after it, so a
+    /// file nothing could do anything with shows no drop cursor instead of
+    /// beeping once it has been let go of.
+    nonisolated static func canShare(fileAt url: URL) -> Bool {
+        LinkdropGate.medium(of: url) != nil
+    }
+
+    /// Shares a file that is not a capture: no `PreviewEntry`, no thumbnail and
+    /// no card.
+    ///
+    /// Everything after the plan is deliberately identical to `share(_:)` — the
+    /// ephemeral settings by kind, the history row, the clipboard format, the
+    /// sound — because a file should not be treated differently for having
+    /// arrived by hand. What differs is the reporting: the card is a capture's
+    /// failure surface and there is none here, so a refusal goes to
+    /// `onDropNotice` as well as to the beep.
+    ///
+    /// Idempotent through the same `tasks` and `states` maps as `share(_:)`, so
+    /// dropping the same file again while it is still going up is one upload,
+    /// and dropping one already shared this session is none.
+    func share(fileAt url: URL) {
+        guard tasks[url] == nil else { return }
+        if case .done = states[url] { return }
+
+        guard let endpoint = ShareSettings.shared.endpoint else {
+            failDrop("Set a share endpoint and token in Settings.", for: url, retryable: false)
+            return
+        }
+        guard let medium = LinkdropGate.medium(of: url) else {
+            failDrop("\(url.lastPathComponent) is not a kind of file that can be shared.",
+                     for: url, retryable: false)
+            return
+        }
+
+        publish(.uploading(0), for: url)
+        tasks[url] = Task { [weak self] in
+            await self?.runDrop(url, medium: medium, endpoint: endpoint)
+            self?.tasks[url] = nil
+        }
+    }
+
+    private func runDrop(
+        _ url: URL, medium: LinkdropGate.Medium, endpoint: LinkdropEndpoint
+    ) async {
+        let outcome: LinkdropGate.Outcome
+        switch medium {
+        case .image:
+            // No point size, because nothing here has opened the file. That is
+            // the honest answer: a made-up one would be what the page lays the
+            // image out at.
+            outcome = LinkdropGate.plan(
+                image: url, ephemeral: ShareSettings.shared.ephemeralScreenshots)
+        case .video:
+            let duration = await Self.duration(of: url)
+            outcome = await LinkdropGate.plan(
+                video: url, duration: duration,
+                ephemeral: ShareSettings.shared.ephemeralRecordings)
+        }
+
+        guard case .ok(let plan) = outcome else {
+            if case .refused(let reason) = outcome {
+                failDrop(reason, for: url, retryable: false)
+            }
+            return
+        }
+
+        do {
+            let link = try await uploader.upload(plan, to: endpoint) { fraction in
+                // Progress arrives on URLSession's queue.
+                Task { @MainActor [weak self] in
+                    self?.publishProgress(fraction, for: url)
+                }
+            }
+
+            // Same reason a recording gets one: without a still the link is bare
+            // text in every chat app. A card would already hold the frame; this
+            // path has no card, so it is decoded here and only on success.
+            if medium == .video, let poster = await VideoPoster.frame(for: url) {
+                await attachPoster(poster, to: link, endpoint: endpoint)
+            }
+
+            publish(.done(link), for: url)
+            onDropNotice?(nil)
+            ShareHistory.shared.record(link, name: url.lastPathComponent)
+            if ShareSettings.shared.linkToClipboard {
+                Self.copy(link, name: url.lastPathComponent, isImage: medium == .image)
+            }
+            if Preferences.shared.playsSound { NSSound(named: "Morse")?.play() }
+        } catch {
+            let failure = LinkdropError.from(error)
+            failDrop(failure.message, for: url, retryable: failure.isRetryable)
+        }
+    }
+
+    /// The duration a video's descriptor carries, or nil.
+    ///
+    /// Worth asking for because the page uses it, and cheap enough to ask on
+    /// this path because the gate is about to parse the same header anyway to
+    /// find out what the codecs are. Anything it cannot answer from that header
+    /// is nil rather than waited for.
+    private static func duration(of url: URL) async -> Double? {
+        guard let seconds = try? await AVURLAsset(url: url).load(.duration).seconds,
+              seconds.isFinite, seconds > 0
+        else { return nil }
+        return seconds
+    }
+
+    private func failDrop(_ message: String, for url: URL, retryable: Bool) {
+        Log.share.error("drop share failed: \(message, privacy: .public)")
+        publish(.failed(message, retryable: retryable), for: url)
+        onDropNotice?("Could not share \"\(url.lastPathComponent)\": \(message)")
+        NSSound.beep()
     }
 
     private func run(_ entry: PreviewEntry, endpoint: LinkdropEndpoint) async {

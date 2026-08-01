@@ -36,6 +36,31 @@ public enum LinkdropGate {
     private static let convertibleImages: Set<String> = ["heic", "heif", "tiff", "tif", "bmp"]
     private static let containers: Set<String> = ["mp4", "m4v", "mov"]
 
+    // MARK: - Which plan a file wants
+
+    public enum Medium: Sendable {
+        case image
+        case video
+    }
+
+    /// Which of the two `plan` overloads a bare file URL belongs to, or nil if
+    /// neither would take it.
+    ///
+    /// Exists so a caller holding nothing but a path -- a file dragged onto the
+    /// menu bar, say -- can choose without keeping a second copy of the
+    /// extension sets above, which would then be free to drift out of step with
+    /// them.
+    ///
+    /// It reads the extension and nothing else, so it answers "ask about this as
+    /// a still" and never "this will be accepted". Only `plan` can say that: it
+    /// is the one that looks inside the container.
+    public static func medium(of url: URL) -> Medium? {
+        let ext = url.pathExtension.lowercased()
+        if webImages.contains(ext) || convertibleImages.contains(ext) { return .image }
+        if containers.contains(ext) { return .video }
+        return nil
+    }
+
     // MARK: - Stills
 
     /// - Parameter burnAfterReading: Offered on this path and not on the video

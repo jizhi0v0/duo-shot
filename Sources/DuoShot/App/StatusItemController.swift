@@ -16,6 +16,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// What `setHiddenFromCapture` was last told, so an item installed part-way
     /// through a take is created in the state the take left the old one in.
     private var isHiddenFromCapture = false
+    /// Why the last file dropped on the item was not shared, until it is
+    /// dismissed or another drop succeeds.
+    private var dropNotice: String?
 
     var onOpenSettings: () -> Void = {}
 
@@ -35,6 +38,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         guard statusItem == nil else { return }
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         setHiddenFromCapture(isHiddenFromCapture)
+        installDropTarget()
         // Sets the image, the timer and the menu, for whichever state the
         // recorder is actually in.
         refreshRecordingState()
@@ -61,6 +65,53 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     func setHiddenFromCapture(_ hidden: Bool) {
         isHiddenFromCapture = hidden
         statusItem?.button?.window?.sharingType = hidden ? .none : .readOnly
+    }
+
+    // MARK: - Dropped files
+
+    /// Files dragged onto the item are shared as links, one upload each.
+    ///
+    /// Wired here rather than in `AppDelegate` because the target is the
+    /// button, which only exists between `install` and `remove` — with the menu
+    /// bar icon turned off there is nothing to drop on, and nothing to keep a
+    /// notice for either.
+    private func installDropTarget() {
+        guard let button = statusItem?.button else { return }
+        let drop = StatusItemDropView(frame: button.bounds)
+        drop.accepts = { ShareService.canShare(fileAt: $0) }
+        drop.onDrop = { urls in
+            for url in urls { ShareService.shared.share(fileAt: url) }
+        }
+        button.addSubview(drop)
+        ShareService.shared.onDropNotice = { [weak self] notice in
+            self?.showDropNotice(notice)
+        }
+    }
+
+    /// The one thing a dropped file's failure can say, since it has no card.
+    ///
+    /// Two places, because the menu is only seen if it is opened: the tool tip
+    /// puts the sentence where the pointer already is a second after the drop,
+    /// and the menu keeps it until it is read and dismissed.
+    private func showDropNotice(_ notice: String?) {
+        dropNotice = notice
+        statusItem?.button?.toolTip = notice
+        statusItem?.menu = buildMenu()
+    }
+
+    private func dropNoticeItem() -> NSMenuItem? {
+        guard let dropNotice else { return nil }
+        let item = NSMenuItem(
+            title: dropNotice, action: #selector(clearDropNotice), keyEquivalent: "")
+        item.target = self
+        item.image = NSImage(
+            systemSymbolName: "exclamationmark.triangle", accessibilityDescription: nil)
+        item.toolTip = "Click to dismiss."
+        return item
+    }
+
+    @objc private func clearDropNotice() {
+        showDropNotice(nil)
     }
 
     func noteOutput(_ output: OutputPipeline.Output) {
@@ -213,6 +264,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private func buildMenu() -> NSMenu {
         let menu = NSMenu()
         menu.delegate = self
+
+        // Above everything, including during a take: a drop that failed is the
+        // one thing in this menu the user has not already been told, and it is
+        // information rather than an action, so the short recording menu below
+        // has no reason to exclude it.
+        if let notice = dropNoticeItem() {
+            menu.addItem(notice)
+            menu.addItem(.separator())
+        }
 
         // While a take is running the only thing worth offering is ending it.
         // A menu full of capture actions that all silently refuse is worse than

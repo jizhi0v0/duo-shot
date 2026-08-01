@@ -82,6 +82,29 @@ struct GateTests {
         #expect(isRefused(await LinkdropGate.plan(video: URL(fileURLWithPath: "/tmp/x.avi"))))
     }
 
+    /// The point of `medium(of:)` is that a caller with only a path picks the
+    /// same way the two `plan` overloads would, so this asserts against them
+    /// rather than against a repeated list of extensions.
+    ///
+    /// Mostly stated as "the *other* plan refuses it", because these paths name
+    /// no file that exists: a convertible still is refused for want of bytes to
+    /// convert, which says nothing about how it was classified.
+    @Test("names the plan a bare path belongs to",
+          arguments: ["png", "webp", "heic", "tif", "mp4", "mov", "svg", "xcf", ""])
+    func medium(ext: String) async {
+        let url = URL(fileURLWithPath: ext.isEmpty ? "/tmp/x" : "/tmp/x.\(ext)")
+        switch LinkdropGate.medium(of: url) {
+        case .image:
+            #expect(isRefused(await LinkdropGate.plan(video: url)))
+        case .video:
+            #expect(isRefused(LinkdropGate.plan(image: url)))
+            #expect(!isRefused(await LinkdropGate.plan(video: url)))
+        case nil:
+            #expect(isRefused(LinkdropGate.plan(image: url)))
+            #expect(isRefused(await LinkdropGate.plan(video: url)))
+        }
+    }
+
     @Test("reads four-character codes back as text")
     func fourCC() {
         #expect(LinkdropGate.fourCharString(0x6176_6331) == "avc1")
