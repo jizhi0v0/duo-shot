@@ -27,6 +27,16 @@ final class ViewerWindowController {
     /// running the test is typing in.
     var activatesOnShow = true
 
+    /// Called with a capture's URL and a fresh thumbnail once a redaction has
+    /// been written over its file.
+    ///
+    /// Injected by whoever owns the preview stack, the way
+    /// `CaptureCoordinator.additionalExcludedWindowIDs` is. The viewer must not
+    /// reach for the stack itself: a card is a thing that may or may not still be
+    /// on screen six seconds after a capture, and a window that knew how to find
+    /// one would also have to know when there is nothing to find.
+    var onImageRedacted: ((URL, NSImage) -> Void)?
+
     func show(_ entry: PreviewEntry) {
         if let existing = windows[entry.url] {
             bringToFront(existing)
@@ -160,45 +170,26 @@ final class ViewerWindowController {
               image.size.height >= 1
         else { return nil }
 
+        // Recognition runs against `url`, not against `image`, so zoom cannot
+        // affect it. `RedactionEditor` puts the same menu on all three of its
+        // views for the reason its comment gives.
+        let menu = NSMenu()
+        menu.addItem(.action("Copy Text") { CopyText.run(fileAt: url) })
+
         // `NSImage.size` is in POINTS — the encoder stamps the DPI, so a 2× 5K
         // capture reports 2560×1440 here, not 5120×2880. That is the right unit
         // for a window: it makes "actual size" mean the size the thing was on
         // screen when it was taken.
-        let imageView = NSImageView(frame: CGRect(origin: .zero, size: image.size))
-        imageView.image = image
-        imageView.imageScaling = .scaleAxesIndependently
-        imageView.animates = false
+        let size = fitted(image.size)
+        guard let editor = RedactionEditor(
+            url: url, image: image, menu: menu,
+            frame: CGRect(origin: .zero, size: size))
+        else { return nil }
+        editor.onRedacted = { [weak self] thumbnail in
+            self?.onImageRedacted?(url, thumbnail)
+        }
 
-        // On both views, and on purpose. The image view is the hit view over the
-        // picture itself, the scroll view over the letterboxing around it, and a
-        // right-click that works on one but not the other reads as the menu
-        // being broken rather than as a boundary anyone can see. Recognition
-        // runs against `url`, not against `image`, so zoom cannot affect it.
-        let menu = NSMenu()
-        menu.addItem(.action("Copy Text") { CopyText.run(fileAt: url) })
-        imageView.menu = menu
-
-        let scrollView = ZoomingScrollView(frame: CGRect(origin: .zero, size: fitted(image.size)))
-        scrollView.menu = menu
-        scrollView.documentView = imageView
-        scrollView.naturalSize = image.size
-        scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = true
-        scrollView.autohidesScrollers = true
-        scrollView.allowsMagnification = true
-        // 0.05 rather than something tidier so a full-screen capture can still be
-        // zoomed *out* to fit inside a small window; the ceiling is where a
-        // screenshot's own pixels turn into visible squares, which is the point
-        // of zooming into one.
-        scrollView.minMagnification = 0.05
-        scrollView.maxMagnification = 16
-        scrollView.backgroundColor = NSColor(white: 0.11, alpha: 1)
-        scrollView.drawsBackground = true
-        scrollView.autoresizingMask = [.width, .height]
-
-        return Content(view: scrollView, size: fitted(image.size), onShown: {
-            scrollView.zoomToFit()
-        })
+        return Content(view: editor, size: size, onShown: { editor.zoomToFit() })
     }
 
     // MARK: - Geometry
@@ -255,7 +246,11 @@ final class ViewerWindowController {
 
     /// The magnification a still's viewer is currently at, or nil for a video.
     func magnificationForTest(_ url: URL) -> CGFloat? {
-        (windows[url]?.contentView as? ZoomingScrollView)?.magnification
+        editorForTest(url)?.magnification
+    }
+
+    func editorForTest(_ url: URL) -> RedactionEditor? {
+        windows[url]?.contentView as? RedactionEditor
     }
 }
 
@@ -296,7 +291,11 @@ private final class ViewerWindow: NSWindow {
 /// was given, so a window dragged wider leaves the image at its old scale with
 /// a growing margin around it, which reads as the window and the picture coming
 /// apart.
-private final class ZoomingScrollView: NSScrollView {
+///
+/// Internal rather than private because `RedactionEditor` is what holds one now:
+/// the still viewer's content view is the editor, and the scroll view is the
+/// layer of it that owns zoom.
+final class ZoomingScrollView: NSScrollView {
     /// The document's size in points, which is what "actual size" means.
     var naturalSize: CGSize = .zero
 

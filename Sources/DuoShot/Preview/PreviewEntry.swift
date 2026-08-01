@@ -107,12 +107,32 @@ enum PreviewThumbnail {
     /// already arrives after the encode, so this adds no visible latency.
     @concurrent
     private static func downsample(_ result: CaptureResult, cap: CGSize) async -> sending NSImage {
-        let source = result.image
+        scaled(result.image, cap: cap) ?? result.nsImage
+    }
+
+    /// The same scale-down for an image that is not a fresh capture: a still that
+    /// has just been redacted in place, whose card must stop showing the pixels
+    /// the file no longer contains.
+    ///
+    /// Synchronous and `nonisolated` because its one caller is already off the
+    /// main actor — `RedactionEditor.redact` does the rewrite and the thumbnail
+    /// in a single hop rather than sending a 5K bitmap back and forth.
+    nonisolated static func image(_ source: CGImage, cap: CGSize) -> NSImage {
+        scaled(source, cap: cap)
+            ?? NSImage(
+                cgImage: source,
+                size: CGSize(width: source.width, height: source.height))
+    }
+
+    /// nil when there is nothing to do or the context cannot be made, so each
+    /// caller can fall back to the image it already has: an oversized thumbnail
+    /// is a far better outcome than a blank card.
+    private nonisolated static func scaled(_ source: CGImage, cap: CGSize) -> NSImage? {
         let width = CGFloat(source.width)
         let height = CGFloat(source.height)
-        guard width > 0, height > 0 else { return result.nsImage }
+        guard width > 0, height > 0 else { return nil }
         let ratio = min(cap.width / width, cap.height / height)
-        guard ratio < 1 else { return result.nsImage }
+        guard ratio < 1 else { return nil }
 
         let size = CGSize(
             width: max(1, (width * ratio).rounded()),
@@ -126,11 +146,10 @@ enum PreviewThumbnail {
             bitsPerComponent: 8, bytesPerRow: 0,
             space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return result.nsImage }
+        ) else { return nil }
         context.interpolationQuality = .high
         context.draw(source, in: CGRect(origin: .zero, size: size))
-        guard let scaled = context.makeImage() else { return result.nsImage }
-        return NSImage(cgImage: scaled, size: size)
+        return context.makeImage().map { NSImage(cgImage: $0, size: size) }
     }
 }
 

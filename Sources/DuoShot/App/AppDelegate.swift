@@ -92,6 +92,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.previews.panelWindowIDs ?? []
         }
         previews.isRecordingActive = { [weak self] in self?.recorder.isRecording ?? false }
+        // The viewer rewrites the staged file when a redaction is applied, and a
+        // card that is still up is drawing the version that no longer exists.
+        ViewerWindowController.shared.onImageRedacted = { [weak self] url, thumbnail in
+            self?.previews.refreshThumbnail(thumbnail, for: url)
+        }
         recorder.onRecordingLost = { [weak self] error in
             self?.reportRecordingLost(error)
         }

@@ -339,6 +339,23 @@ final class ShareService {
         }
     }
 
+    /// The link this capture already has, if it has one.
+    ///
+    /// Two sources because they cover different halves of "already shared": the
+    /// state map is this session's uploads and is authoritative, and history is
+    /// what survives a relaunch. History is keyed by filename rather than by URL
+    /// — it is what a menu row shows and it has never held a path — which is
+    /// sound here because `StagingStore` guarantees the name is unique within
+    /// staging.
+    ///
+    /// Asked by the redaction editor, which needs to know that destroying the
+    /// pixels in the file does *not* reach a link already serving them.
+    func existingLink(for url: URL) -> LinkdropLink? {
+        if case .done(let link) = states[url] { return link }
+        let name = url.lastPathComponent
+        return ShareHistory.shared.entries.first { $0.name == name }?.link
+    }
+
     // MARK: - Listing
 
     /// Everything the server is still holding, newest first.

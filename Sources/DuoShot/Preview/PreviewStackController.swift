@@ -651,6 +651,16 @@ final class PreviewStackController {
         CATransaction.commit()
     }
 
+    /// Repoints the card for `url` at a new thumbnail, or does nothing if that
+    /// card has already timed out.
+    ///
+    /// Doing nothing is a legitimate outcome and not a failure worth reporting:
+    /// the file on disk is the copy of record, and a card is a six-second
+    /// affordance over it.
+    func refreshThumbnail(_ image: NSImage, for url: URL) {
+        items.first { $0.entry.url == url }?.card.setThumbnail(image)
+    }
+
     func dismissAll() {
         for item in items { remove(item, animated: false) }
     }

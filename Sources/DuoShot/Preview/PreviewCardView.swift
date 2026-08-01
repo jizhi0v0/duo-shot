@@ -36,7 +36,13 @@ final class PreviewCardView: NSView {
     private static let barInset: CGFloat = 8
     static let gestureSlop: CGFloat = 4
 
-    private let image: NSImage
+    /// `var`, and the tile's view is kept, because the file can change under a
+    /// card that is still on screen: a redaction rewrites the staged capture in
+    /// place, and a card showing the pixels that were just destroyed — or
+    /// carrying them as a drag image — is the one outcome that feature cannot
+    /// have.
+    private var image: NSImage
+    private var thumbnailView: NSImageView?
     /// Non-nil turns this into a video card: a play glyph and this string as a
     /// duration pill. A still needs neither — its thumbnail already says what it
     /// is, whereas one frame of a recording is indistinguishable from a
@@ -174,6 +180,7 @@ final class PreviewCardView: NSView {
         imageView.layer?.borderColor = NSColor(white: 1, alpha: 0.16).cgColor
         imageView.layer?.backgroundColor = NSColor(white: 0.09, alpha: 0.96).cgColor
         addSubview(imageView)
+        thumbnailView = imageView
 
         buildCenterButton()
         if let badge { buildDurationPill(badge) }
@@ -399,6 +406,11 @@ final class PreviewCardView: NSView {
     /// the state — every other glyph in the bar is an outline, so the filled one
     /// reads as "this exists now", and pressing it is confirmed by the flash
     /// rather than by the icon.
+    func setThumbnail(_ image: NSImage) {
+        self.image = image
+        thumbnailView?.image = image
+    }
+
     func setShareState(_ state: ShareService.State?) {
         shareState = state
 

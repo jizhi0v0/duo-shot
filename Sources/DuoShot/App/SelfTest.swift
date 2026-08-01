@@ -38,6 +38,9 @@ enum SelfTest {
         /// The in-app viewer: window geometry for a still, a full-screen still
         /// and a recording, plus the one-window-per-file rule.
         case viewer(directory: URL)
+        /// Redaction, image in and image out: the point-to-pixel mapping at 2×,
+        /// and whether the bytes under a rectangle are really gone.
+        case redact(directory: URL)
         /// Window-picker hit-testing, filtering and window capture geometry.
         case windowMode(directory: URL)
         /// Fullscreen capture with `includeMenuBar` both ways.
@@ -277,6 +280,8 @@ enum SelfTest {
                 self = .previewStack(
                     count: value(for: "--count").flatMap(Int.init) ?? 3,
                     directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
+            case "--selftest-redact":
+                self = .redact(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-viewer":
                 self = .viewer(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-preview":
@@ -318,6 +323,7 @@ enum SelfTest {
             case .previewStack(let count, let directory):
                 return try await previewStack(count: count, into: directory)
             case .viewer(let directory): return try await viewerWindow(into: directory)
+            case .redact(let directory): return try await redactCheck(into: directory)
             case .windowMode(let directory): return try await windowMode(into: directory)
             case .fullscreen(let directory): return try await fullscreenMode(into: directory)
             case .preferences: return preferencesCheck()
@@ -2555,6 +2561,195 @@ enum SelfTest {
         for failure in failures { print("FAIL:          \(failure)") }
         print("result:        \(failures.isEmpty ? "PASS" : "FAIL")")
         return failures.isEmpty ? 0 : 1
+    }
+
+    /// Redaction: image in, image out.
+    ///
+    /// Headless and synthetic on purpose. What has to be proved is that the
+    /// pixels under a rectangle are *gone* — not covered, not softened — and
+    /// that is a claim about bytes, so the input has to be an image whose bytes
+    /// are known rather than whatever happened to be on screen.
+    ///
+    /// The input is written at 2×, because that is where this feature is most
+    /// likely to be quietly wrong: a rectangle drawn over a picture is drawn in
+    /// points, the redaction happens in pixels, and on a Retina capture those
+    /// differ by a factor of two — applying the drawn numbers unchanged would
+    /// destroy a quarter of the intended area in the wrong corner and look
+    /// perfectly plausible doing it.
+    private static func redactCheck(into directory: URL) async throws -> Int32 {
+        var failures = 0
+        func check(_ label: String, _ passed: Bool, _ detail: String = "") {
+            print("  \(passed ? "PASS" : "FAIL") \(label)\(detail.isEmpty ? "" : " — \(detail)")")
+            if !passed { failures += 1 }
+        }
+        func sizeString(_ size: CGSize) -> String {
+            String(format: "%.0f×%.0f", size.width, size.height)
+        }
+
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+
+        // Fine stripes: every block average lands on the same mid-grey, so a
+        // block that is still striped afterwards is a redaction that did not
+        // happen, and one that is uniform cannot be inverted back into stripes.
+        let pixels = CGSize(width: 1200, height: 800)
+        let points = CGSize(width: 600, height: 400)
+        let file = directory.appendingPathComponent("redact-sample.png")
+        guard let original = stripedImage(
+            width: Int(pixels.width), height: Int(pixels.height)) else {
+            print("result:        FAIL — could not build the sample bitmap")
+            return 1
+        }
+        try ImageEncoder.write(original, to: file, as: .png, scale: 2)
+
+        // MARK: points to pixels
+
+        let drawn = CGRect(x: 100, y: 50, width: 200, height: 120)
+        let expected = CGRect(x: 200, y: 100, width: 400, height: 240)
+        let mapped = Redaction.regions([drawn], atPointSize: points, inPixels: pixels)
+        check("a 2× rect maps to twice its pixels", mapped == [expected],
+              "\(rectString(mapped.first ?? .zero))")
+
+        // Through the real view, which is where the point size and the pixel
+        // size are read off the file rather than passed in by a test.
+        guard let image = NSImage(contentsOf: file),
+              let editor = RedactionEditor(
+                url: file, image: image, menu: NSMenu(),
+                frame: CGRect(origin: .zero, size: points))
+        else {
+            print("result:        FAIL — the editor would not open the sample")
+            return 1
+        }
+        check("editor reads the image as \(Int(points.width))×\(Int(points.height)) pt",
+              image.size == points, "got \(sizeString(image.size))")
+        check("editor reads the bitmap as \(Int(pixels.width))×\(Int(pixels.height)) px",
+              editor.pixelSizeForTest == pixels, "got \(sizeString(editor.pixelSizeForTest))")
+        editor.addRegionForTest(drawn)
+        check("editor scales the drawn rect the same way",
+              editor.pixelRegionsForTest == [expected],
+              "\(rectString(editor.pixelRegionsForTest.first ?? .zero))")
+
+        // MARK: the write
+
+        let before = rgba(of: original)
+        _ = try await Redaction.apply(regions: [expected], toFileAt: file)
+
+        guard let source = CGImageSourceCreateWithURL(file as CFURL, nil),
+              let written = CGImageSourceCreateImageAtIndex(source, 0, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+                as? [CFString: Any]
+        else {
+            print("result:        FAIL — the redacted file cannot be read back")
+            return 1
+        }
+        let after = rgba(of: written)
+
+        check("still a PNG",
+              (CGImageSourceGetType(source) as String?) == UTType.png.identifier)
+        check("still \(Int(pixels.width))×\(Int(pixels.height)) px",
+              written.width == Int(pixels.width) && written.height == Int(pixels.height))
+        // The DPI tag is what stands between a 2× capture and being shown at
+        // double size everywhere afterwards.
+        let dpi = properties[kCGImagePropertyDPIWidth] as? Double
+        check("kept its 144 dpi tag", dpi == 144, "got \(dpi.map { "\($0)" } ?? "none")")
+        check("still opens at \(Int(points.width))×\(Int(points.height)) pt",
+              NSImage(contentsOf: file)?.size == points)
+
+        // MARK: the pixels
+
+        let width = written.width
+        let block = Redaction.blockSize(width: written.width, height: written.height)
+        /// Row indices from the top, which is how the bitmap is laid out; the
+        /// region is in CoreGraphics' bottom-left space.
+        let rows = (top: written.height - Int(expected.maxY),
+                    bottom: written.height - Int(expected.minY))
+        let columns = (left: Int(expected.minX), right: Int(expected.maxX))
+
+        func sample(_ bytes: [UInt8], _ row: Int, _ column: Int) -> [UInt8] {
+            let index = (row * width + column) * 4
+            return Array(bytes[index..<index + 4])
+        }
+
+        var changed = 0
+        var ragged = 0
+        for row in rows.top..<rows.bottom {
+            for column in columns.left..<columns.right {
+                if sample(before, row, column) != sample(after, row, column) { changed += 1 }
+                // Every pixel of a block must equal that block's top-left one.
+                let anchor = (
+                    row: rows.top + (row - rows.top) / block * block,
+                    column: columns.left + (column - columns.left) / block * block)
+                if sample(after, row, column) != sample(after, anchor.row, anchor.column) {
+                    ragged += 1
+                }
+            }
+        }
+        let area = (rows.bottom - rows.top) * (columns.right - columns.left)
+        // Not "most of them": a single surviving pixel of the original is a
+        // pixel of whatever was worth hiding.
+        check("every pixel under the rect changed", changed == area,
+              "\(changed)/\(area)")
+        check("the rect is \(block)px blocks of one colour", ragged == 0,
+              "\(ragged) stray pixels")
+
+        var outside = 0
+        for row in 0..<written.height where row < rows.top || row >= rows.bottom {
+            for column in stride(from: 0, to: width, by: 7)
+            where sample(before, row, column) != sample(after, row, column) {
+                outside += 1
+            }
+        }
+        check("nothing outside the rect moved", outside == 0, "\(outside) pixels differ")
+
+        // The whole point of averaging rather than blurring: a blur leaves the
+        // stripes' period in the data, an average does not.
+        let strip = (columns.left..<columns.right).map { sample(after, rows.top + 1, $0)[0] }
+        let distinct = Set(strip).count
+        check("no structure survives across the rect", distinct <= (columns.right - columns.left) / block + 1,
+              "\(distinct) distinct values across \(strip.count) px")
+
+        print("result:        \(failures == 0 ? "PASS" : "FAIL (\(failures))")")
+        return failures == 0 ? 0 : 1
+    }
+
+    /// Two-pixel black-and-white vertical stripes: maximum contrast at the
+    /// highest frequency the bitmap can hold, which is the hardest thing to
+    /// destroy and the easiest to notice surviving.
+    ///
+    /// Drawn into a `CGContext` at an exact pixel count rather than through
+    /// `NSImage.lockFocus`, which backs itself at the main display's scale — on
+    /// a Retina Mac that quietly returns twice the bitmap that was asked for,
+    /// and a 2× test whose input is already 2× proves nothing.
+    private static func stripedImage(width: Int, height: Int) -> CGImage? {
+        guard let context = CGContext(
+            data: nil, width: width, height: height,
+            bitsPerComponent: 8, bytesPerRow: width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        context.setFillColor(gray: 1, alpha: 1)
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        context.setFillColor(gray: 0, alpha: 1)
+        for x in stride(from: 0, to: width, by: 4) {
+            context.fill(CGRect(x: x, y: 0, width: 2, height: height))
+        }
+        return context.makeImage()
+    }
+
+    /// A CGImage's bytes in one known layout, so two of them can be compared.
+    private static func rgba(of image: CGImage) -> [UInt8] {
+        var bytes = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        bytes.withUnsafeMutableBytes { buffer in
+            guard let context = CGContext(
+                data: buffer.baseAddress, width: image.width, height: image.height,
+                bitsPerComponent: 8, bytesPerRow: image.width * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return }
+            context.draw(image, in: CGRect(
+                x: 0, y: 0, width: image.width, height: image.height))
+        }
+        return bytes
     }
 
     /// The three share states, photographed.
