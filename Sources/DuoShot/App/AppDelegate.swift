@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             path=\(Bundle.main.bundleURL.path, privacy: .public)
             """)
 
+        EditMenu.install()
         wireCoordinator()
         wireRecorder()
         wireSettings()
@@ -246,6 +247,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// ended through the coordinator's ordinary stop path, which finalises the
     /// file, moves it to the save folder and marks it incomplete if it is.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Uploads are abandoned, deliberately, and this is the only trace of it.
+        //
+        // A take is finalised before exit because a truncated file is worse than
+        // a slow quit. An upload is not: the capture is already on disk, the
+        // only loss is a transfer that can be started again, and holding a quit
+        // open for a minute-long upload is the worse trade. The plan writes this
+        // down so nobody drifts into building a resumable queue -- see
+        // plans/quiet-ferrying-parcel.md.
+        //
+        // The server end of it is handled too: a record whose bytes never
+        // arrived says "the upload did not finish" rather than claiming the link
+        // expired.
+        let abandoned = ShareService.shared.inFlightCount
+        if abandoned > 0 {
+            Log.share.notice(
+                "quitting with \(abandoned, privacy: .public) upload(s) in flight; abandoning them")
+        }
+
         guard recorder.hasTakeInFlight else { return .terminateNow }
 
         Log.app.notice("quit requested during a take; finalising before exit")

@@ -35,6 +35,8 @@ if let mode = SelfTest.Mode(arguments: arguments) {
           --selftest-permission
           --selftest-windows
           --selftest-preferences
+          --selftest-edit-menu
+          --selftest-share-card <dir>
           --selftest-capture <out.png> [--display N]
           --selftest-rect <x,y,w,h> [--display N] [--out <file.png>]
           --selftest-overlay <x,y,w,h> [--out <file.png>] [--no-exclude] [--sharing-default]
@@ -49,6 +51,10 @@ if let mode = SelfTest.Mode(arguments: arguments) {
           --selftest-record-flow <dir> [--seconds N]
           --selftest-record-hud <dir> [--seconds N] [--sharing-none]
                                   [--hud-first] [--plain-window] [--status-item]
+          --selftest-share (--configured | --endpoint <url> --token <t>)
+                           [--file <f>] [--big <MB>]
+          --selftest-share-compat <recording.mp4>
+          --selftest-share-flow          (uploads to your real bucket, then deletes)
 
         Rects are in AppKit global points (origin bottom-left of the main screen).
 

@@ -38,9 +38,11 @@ help:
 	@echo "make launch    - verify, then 'open' the .app via LaunchServices"
 	@echo "make selftest  - headless capture checks"
 	@echo "make logs      - stream os_log for $(BUNDLE_ID)"
-	@echo "make install   - copy to /Applications"
+	@echo "make install   - copy to /Applications, restarting a running instance"
 	@echo "make dist      - notarization-ready build (real timestamp) + zip"
 	@echo "make check-26  - compile against an older macOS SDK on $(CHECK_HOST)"
+	@echo "make share-check - typecheck + test the share Worker (needs node)"
+	@echo "make share-selftest - run the app's share pipeline against a local wrangler dev"
 
 build:
 	swift build -c $(CONFIG)
@@ -168,6 +170,7 @@ check-26:
 	@echo "syncing to $(CHECK_HOST):$(CHECK_DIR)"
 	@rsync -az --delete \
 		--exclude '.build' --exclude 'build' --exclude '.git' --exclude 'dist' \
+		--exclude 'Worker/node_modules' --exclude 'Worker/.wrangler' \
 		./ "$(CHECK_HOST):$(CHECK_DIR)/"
 	@echo "remote SDK:"
 	@ssh -o BatchMode=yes "$(CHECK_HOST)" \
@@ -200,11 +203,12 @@ TEST_OUT := build/selftest-output
 test: verify
 	@mkdir -p $(TEST_OUT)
 	@set -e; \
-	fail=0; \
+	fail=0; incon=0; \
 	run() { name="$$1"; shift; printf '  %-26s ' "$$name"; \
 		if out="$$("$(EXEC)" "$$@" 2>&1)"; then status=""; else status=" [exit $$?]"; fail=1; fi; \
-		line="$$(printf '%s\n' "$$out" | grep -E '^result' | head -1 | sed 's/result: *//')"; \
+		line="$$(printf '%s\n' "$$out" | grep -E '^(result|verdict)' | head -1 | sed 's/^[a-z]*: *//')"; \
 		if [ -z "$$line" ]; then line="$$(printf '%s\n' "$$out" | tail -1)"; fi; \
+		case "$$out" in *INCONCLUSIVE*) incon=$$((incon+1));; esac; \
 		printf '%s%s\n' "$$line" "$$status"; }; \
 	run "sourceRect semantics"   --selftest-sourcerect-space; \
 	run "rect pipeline"          --selftest-rect 400,300,640,400; \
@@ -214,6 +218,7 @@ test: verify
 	run "window mode"            --selftest-window $(TEST_OUT); \
 	run "fullscreen menu bar"    --selftest-fullscreen $(TEST_OUT); \
 	run "preferences"            --selftest-preferences; \
+	run "edit menu (paste)"      --selftest-edit-menu; \
 	run "selection zones"        --selftest-selection-zones; \
 	run "pixel mapping"          --selftest-pixel-mapping; \
 	run "latch cancellation"     --selftest-latch-cancel; \
@@ -226,6 +231,7 @@ test: verify
 	run "recording border"       --selftest-region-outline $(TEST_OUT); \
 	run "selection loupe"        --selftest-loupe $(TEST_OUT); \
 	run "preview stack + scroll" --selftest-preview-stack $(TEST_OUT) --count 14; \
+	run "viewer window"          --selftest-viewer $(TEST_OUT); \
 	run "recording area"         --selftest-record $(TEST_OUT) --seconds 2 --rect 400,300,640,400; \
 	run "recording fullscreen"   --selftest-record $(TEST_OUT) --seconds 2; \
 	run "hud recorded (readOnly)" --selftest-record-hud $(TEST_OUT) --seconds 2; \
@@ -241,19 +247,74 @@ test: verify
 		then echo "BROKEN — the control passed, so the exclusion test cannot fail"; fail=1; \
 		else echo "fails as required"; fi; \
 	echo; \
+	if [ $$incon -gt 0 ]; then \
+		echo "  $$incon inconclusive — those asserted nothing; re-run with a still screen"; fi; \
 	if [ $$fail -eq 0 ]; then echo "  all green"; else echo "  FAILURES"; exit 1; fi
 
 .PHONY: soak
 soak: verify
 	@"$(EXEC)" --selftest-soak $${N:-500}
 
+# --- share backend ------------------------------------------------------------
+# The Worker in Worker/. Deliberately NOT part of `make test`: that target is
+# offline, has no toolchain but Swift, and must stay runnable on a machine with
+# no node installed. This one needs `npm install --prefix Worker` first.
+#
+# The suite itself is still offline -- it runs the real Worker in workerd
+# against miniflare's local R2, so it costs nothing and touches no bucket.
+.PHONY: share-check
+share-check:
+	@npm --prefix Worker run typecheck
+	@npm --prefix Worker test
+
+# The Swift side of sharing, against the real Worker.
+#
+# Starts `wrangler dev` (workerd + miniflare's local R2), points the app's
+# self-test at it, tears it down. Offline, costs nothing, touches no bucket --
+# and it is the same Worker code that gets deployed, not a mock.
+#
+# Worker/.dev.vars must override PUBLIC_BASE to the loopback address. Without
+# that the Worker correctly returns links built from the *production* domain --
+# it must, since it also serves on workers.dev -- and every download assertion
+# fails against a host that is not this one. Cost half an hour on 2026-08-01.
+.PHONY: share-selftest
+share-selftest: build
+	@set -eu; \
+	if [ ! -f Worker/.dev.vars ]; then \
+		printf 'UPLOAD_TOKEN="local-dev-token"\nPUBLIC_BASE="http://127.0.0.1:8787"\n' > Worker/.dev.vars; \
+		echo "  wrote Worker/.dev.vars"; \
+	fi; \
+	pkill -f "wrangler dev" 2>/dev/null || true; \
+	(cd Worker && WRANGLER_SEND_METRICS=false npx wrangler dev --port 8787 >/tmp/duoshot-wrangler-dev.log 2>&1 &) ; \
+	trap 'pkill -f "wrangler dev" 2>/dev/null || true' EXIT; \
+	curl -s --retry-connrefused --retry 40 --retry-delay 1 -o /dev/null http://127.0.0.1:8787/ || \
+		{ echo "wrangler dev did not come up:"; tail -20 /tmp/duoshot-wrangler-dev.log; exit 1; }; \
+	"$$(swift build -c $(CONFIG) --show-bin-path)/$(APP_NAME)" \
+		--selftest-share --endpoint http://127.0.0.1:8787 --token local-dev-token
+
 logs:
 	log stream --predicate 'subsystem == "$(BUNDLE_ID)"' --level debug --style compact
 
+# Replaces the bundle AND whatever is running from it.
+#
+# Copying over the bundle does not touch the live process, which goes on serving
+# the hotkeys out of the code that was just replaced. There is nothing on screen
+# to say so — the next screenshot simply behaves like the old build, which reads
+# as the change not working rather than as the app not having been restarted.
+# Cost a debugging round trip on 2026-08-01.
+#
+# `osascript` first so a take in progress is finalised rather than truncated;
+# `killall` is the backstop for a hung or unresponsive instance. `killall`
+# matches on the process name, so unlike `pkill -f` it cannot match the shell
+# running this recipe. Both are best-effort: not running is the normal case.
 install: verify
+	@osascript -e 'quit app "$(APP_NAME)"' 2>/dev/null || true
+	@sleep 1
+	@killall $(APP_NAME) 2>/dev/null && echo "stopped a running instance" || true
 	rm -rf "/Applications/$(APP_NAME).app"
 	cp -R "$(APP)" /Applications/
-	@echo "installed /Applications/$(APP_NAME).app"
+	@open -a "/Applications/$(APP_NAME).app"
+	@echo "installed and relaunched /Applications/$(APP_NAME).app"
 
 dist: bundle
 	@codesign --force \
