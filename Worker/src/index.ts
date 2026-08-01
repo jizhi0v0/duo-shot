@@ -89,14 +89,16 @@ async function api(request: Request, env: Env, segments: string[], url: URL): Pr
   return json(404, { error: "no such endpoint" });
 }
 
+/// Every field is `unknown` on purpose: this is parsed JSON from the network,
+/// and the declared shape is a wish until each one has been checked.
 interface NewBody {
-  ext?: string;
-  name?: string;
-  size?: number;
-  ephemeral?: boolean;
-  width?: number;
-  height?: number;
-  duration?: number;
+  ext?: unknown;
+  name?: unknown;
+  size?: unknown;
+  ephemeral?: unknown;
+  width?: unknown;
+  height?: unknown;
+  duration?: unknown;
 }
 
 /// Mints a key, writes the sidecar, and returns a URL the client can PUT the
@@ -113,14 +115,26 @@ async function apiNew(request: Request, env: Env): Promise<Response> {
   const ext = normalizeExtension(body.ext);
   if (!ext) return json(400, { error: "unsupported or missing extension" });
 
+  if (body.name !== undefined && typeof body.name !== "string") {
+    return json(400, { error: "name must be a string" });
+  }
+
+  // These reach the viewer page's meta tags, where a string is markup.
+  const width = finite(body.width);
+  const height = finite(body.height);
+  const duration = finite(body.duration);
+  if (width === null || height === null || duration === null) {
+    return json(400, { error: "width, height and duration must be finite numbers" });
+  }
+
   const record = await createRecord(env, {
     ext,
     name: body.name ?? "",
     size: typeof body.size === "number" ? body.size : null,
     ephemeral: body.ephemeral === true,
-    width: body.width,
-    height: body.height,
-    duration: body.duration,
+    width,
+    height,
+    duration,
   });
 
   let uploadURL: string;
@@ -203,16 +217,37 @@ async function apiDelete(env: Env, key: string): Promise<Response> {
 }
 
 /// Backs the app's "recent links" menu. Reads only the sidecars' custom
-/// metadata, so listing 50 uploads is one operation rather than 50.
+/// metadata, so a page of them is one operation rather than one read per item.
+///
+/// The whole prefix has to be walked before "recent" means anything: R2 lists
+/// lexicographically and the keys are random, so a single page of N is the
+/// alphabetically-first N, not the newest N. LIST_CAP bounds that walk -- past
+/// it the answer is the newest of what was seen, flagged `truncated`.
+const LIST_CAP = 5000;
+
 async function apiList(env: Env, url: URL): Promise<Response> {
   const limit = Math.min(Math.max(numberParam(url, "limit") ?? 25, 1), 200);
-  const listed = await env.BUCKET.list({
-    prefix: "m/",
-    limit,
-    include: ["customMetadata"],
-  });
 
-  const items = listed.objects
+  const sidecars: R2Object[] = [];
+  let cursor: string | undefined;
+  let truncated = false;
+  for (;;) {
+    const listed = await env.BUCKET.list({
+      prefix: "m/",
+      limit: 1000,
+      cursor,
+      include: ["customMetadata"],
+    });
+    sidecars.push(...listed.objects);
+    if (!listed.truncated) break;
+    if (sidecars.length >= LIST_CAP) {
+      truncated = true;
+      break;
+    }
+    cursor = listed.cursor;
+  }
+
+  const items = sidecars
     .map((object) => {
       const key = object.key.slice(2);
       const custom = object.customMetadata ?? {};
@@ -226,9 +261,10 @@ async function apiList(env: Env, url: URL): Promise<Response> {
         fileURL: custom.ext ? `${base(env)}/f/${key}.${custom.ext}` : null,
       };
     })
-    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
+    .slice(0, limit);
 
-  return json(200, { items, truncated: listed.truncated });
+  return json(200, { items, truncated });
 }
 
 // MARK: - Public serving
@@ -281,12 +317,17 @@ async function servePage(env: Env, key: string): Promise<Response> {
   if (!head) {
     const age = Date.now() - Date.parse(record.createdAt);
     const unfinished = Number.isFinite(age) && age < INCOMPLETE_WINDOW_MS;
+    const headers = new Headers(htmlHeaders());
+    // A recipient who opens the link mid-upload would otherwise cache this 404
+    // for five minutes past the moment the bytes land. The 410 is final and may
+    // keep the shared cache lifetime.
+    if (unfinished) headers.set("Cache-Control", "no-store");
     return new Response(renderGone(key, unfinished), {
       // 404 rather than 410 while it could still be arriving: 410 means "was
       // here, is deliberately gone", which is a claim about the past that a
       // never-completed upload does not support.
       status: unfinished ? 404 : 410,
-      headers: htmlHeaders(),
+      headers,
     });
   }
 
@@ -354,8 +395,15 @@ async function loadRecord(env: Env, key: string): Promise<ShareRecord | null> {
 
 // MARK: - Small helpers
 
-function normalizeExtension(raw: string | null | undefined): string | null {
-  if (!raw) return null;
+/// undefined for absent, null for present-but-not-a-number. The caller has to
+/// tell those apart: one is a shorter record, the other is a 400.
+function finite(value: unknown): number | undefined | null {
+  if (value === undefined || value === null) return undefined;
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function normalizeExtension(raw: unknown): string | null {
+  if (typeof raw !== "string" || !raw) return null;
   const ext = raw.replace(/^\./, "").toLowerCase();
   if (!/^[a-z0-9]{1,8}$/.test(ext)) return null;
   return isUploadableExtension(ext) ? ext : null;
@@ -387,6 +435,10 @@ function htmlHeaders(): HeadersInit {
     "X-Content-Type-Options": "nosniff",
     "X-Robots-Tag": "noindex, nofollow",
     "Referrer-Policy": "no-referrer",
+    // The viewer page is one inline <style>, an <img> or <video> from this
+    // origin, and nothing else. Anything beyond that is an injection.
+    "Content-Security-Policy":
+      "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'",
   };
 }
 

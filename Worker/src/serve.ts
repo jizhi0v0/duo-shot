@@ -87,6 +87,10 @@ export async function serveObject(
     // "delete this link, eventually, in most places". These links carry
     // screenshots. Revocation that actually revokes is worth more than the
     // Class B operations, of which the free tier has ten million a month.
+    //
+    // If those ever do become a problem, the move is to cache the SIDECAR alone
+    // on a short TTL and never the bytes: the existence check goes stale by at
+    // most the TTL, while deleting the object still revokes the bytes at once.
     "Cache-Control": "public, max-age=31536000, immutable",
     "X-Content-Type-Options": "nosniff",
     "X-Robots-Tag": "noindex, nofollow",

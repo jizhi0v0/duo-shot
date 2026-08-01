@@ -28,9 +28,11 @@
   //   R2_ACCESS_KEY_ID        > only needed for POST /api/new (presigned PUT)
   //   R2_SECRET_ACCESS_KEY   /
   //
-  // Uncomment once the domain is on Cloudflare. Without a route the Worker is
-  // reachable only at *.workers.dev, where responses do not go through the
-  // zone cache -- which is exactly what keeps a video's range requests off R2.
+  // The custom domain buys a stable URL on a zone you own -- links that outlive
+  // any *.workers.dev subdomain and can be pointed elsewhere later. It buys no
+  // caching: measured against the deployed Worker, responses carry no
+  // `cf-cache-status` at all, so every range request still reaches R2. See the
+  // note in src/serve.ts for why that is the wanted behaviour.
   //
   "routes": [{ "pattern": "s.example.com", "custom_domain": true }]
 }

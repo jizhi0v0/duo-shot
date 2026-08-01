@@ -160,6 +160,7 @@ describe("viewer page", () => {
     expect(html).toContain(`<meta property="og:image" content="${BASE}/f/${key}.png">`);
     expect(html).toContain(`<img src="${BASE}/f/${key}.png"`);
     expect(html).toContain("800×600");
+    expect(response.headers.get("Content-Security-Policy")).toContain("default-src 'none'");
   });
 
   it("escapes a filename chosen to break out of the markup", async () => {
@@ -198,6 +199,8 @@ describe("viewer page", () => {
     const html = await response.text();
     expect(html).toContain("did not finish");
     expect(html).not.toContain("expired");
+    // Cached, this 404 would outlive the upload that fixes it.
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
   });
 
   it("leaves the record alone so an upload in flight can still land", async () => {
@@ -208,6 +211,42 @@ describe("viewer page", () => {
     // Reading the page must not clean up: a large presigned upload looks
     // identical to an abandoned one while it is still running.
     expect(await (env as Env).BUCKET.head(`m/${key}`)).not.toBeNull();
+  });
+});
+
+describe("api/new does not trust its JSON", () => {
+  async function create(body: unknown): Promise<Response> {
+    return SELF.fetch(`${BASE}/api/new`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify(body),
+    });
+  }
+
+  // The dimensions are interpolated into meta tags without escaping, so a
+  // string here is markup on the share origin for anyone holding the token.
+  it("refuses a width that is not a number", async () => {
+    const response = await create({
+      ext: "png",
+      width: '"><script>alert(1)</script>',
+      height: 600,
+    });
+    expect(response.status).toBe(400);
+  });
+
+  it("refuses a non-finite height and a string duration", async () => {
+    expect((await create({ ext: "png", width: 800, height: "600" })).status).toBe(400);
+    expect((await create({ ext: "png", duration: "12" })).status).toBe(400);
+  });
+
+  // `input.name.slice` on a number is a 500.
+  it("refuses a name that is not a string", async () => {
+    expect((await create({ ext: "png", name: 12 })).status).toBe(400);
+  });
+
+  it("still accepts a well-formed body", async () => {
+    const response = await create({ ext: "png", name: "shot.png", width: 800, height: 600 });
+    expect(response.status).toBe(201);
   });
 });
 

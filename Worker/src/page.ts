@@ -26,9 +26,16 @@ function formatBytes(size: number | null): string {
   return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`;
 }
 
-function formatDuration(seconds: number | undefined): string {
-  if (seconds === undefined) return "";
-  const total = Math.round(seconds);
+/// A record written before these fields were validated can hold anything, and
+/// the two callers below interpolate the result without escaping it.
+function positive(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function formatDuration(seconds: unknown): string {
+  const value = positive(seconds);
+  if (value === null) return "";
+  const total = Math.round(value);
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
 }
 
@@ -66,10 +73,12 @@ export function renderPage(record: ShareRecord, base: string): string {
   } else {
     meta.push(`<meta property="og:type" content="website">`);
   }
-  if (record.width && record.height) {
+  const width = positive(record.width);
+  const height = positive(record.height);
+  if (width !== null && height !== null) {
     const dimensionPrefix = kind === "video" ? "og:video" : "og:image";
-    meta.push(`<meta property="${dimensionPrefix}:width" content="${record.width}">`);
-    meta.push(`<meta property="${dimensionPrefix}:height" content="${record.height}">`);
+    meta.push(`<meta property="${dimensionPrefix}:width" content="${width}">`);
+    meta.push(`<meta property="${dimensionPrefix}:height" content="${height}">`);
   }
 
   let body: string;
@@ -83,7 +92,7 @@ export function renderPage(record: ShareRecord, base: string): string {
   }
 
   const facts = [
-    record.width && record.height ? `${record.width}×${record.height}` : "",
+    width !== null && height !== null ? `${width}×${height}` : "",
     formatDuration(record.duration),
     formatBytes(record.size),
   ].filter(Boolean);
