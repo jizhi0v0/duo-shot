@@ -210,24 +210,50 @@ final class ShareService {
         }
     }
 
+    // MARK: - Listing
+
+    /// Everything the server is still holding, newest first.
+    ///
+    /// Deliberately not merged with `ShareHistory`: that list is what *this Mac*
+    /// uploaded lately and survives the server going away, while this one is the
+    /// server's own answer and includes links made from another machine or by a
+    /// build that predates the history file.
+    func allLinks(limit: Int) async throws -> LinkdropListing {
+        guard let endpoint = ShareSettings.shared.endpoint else {
+            throw LinkdropError.unsupported("Set a share endpoint and token in Settings.")
+        }
+        do {
+            return try await uploader.list(limit: limit, from: endpoint)
+        } catch {
+            throw LinkdropError.from(error)
+        }
+    }
+
     // MARK: - Deleting
 
     /// Makes the link stop working for everyone, then forgets it locally.
-    func revoke(_ key: String) {
-        guard let endpoint = ShareSettings.shared.endpoint else { return }
-        Task {
-            do {
-                try await uploader.delete(key: key, from: endpoint)
-                ShareHistory.shared.forget(key)
-                states = states.filter {
-                    if case .done(let link) = $0.value { link.key != key } else { true }
-                }
-            } catch {
-                Log.share.error("""
-                    delete failed: \(LinkdropError.from(error).message, privacy: .public)
-                    """)
-                NSSound.beep()
+    ///
+    /// Answers whether it happened, because a list showing server state cannot
+    /// drop a row on optimism: the row is the only evidence the link still
+    /// exists, so it goes away when the server says the object did and stays put
+    /// when it does not. The failure is audible either way — the menu's
+    /// ⌥-delete has nothing to show and so has only the beep.
+    @discardableResult
+    func revoke(_ key: String) async -> Bool {
+        guard let endpoint = ShareSettings.shared.endpoint else { return false }
+        do {
+            try await uploader.delete(key: key, from: endpoint)
+            ShareHistory.shared.forget(key)
+            states = states.filter {
+                if case .done(let link) = $0.value { link.key != key } else { true }
             }
+            return true
+        } catch {
+            Log.share.error("""
+                delete failed: \(LinkdropError.from(error).message, privacy: .public)
+                """)
+            NSSound.beep()
+            return false
         }
     }
 

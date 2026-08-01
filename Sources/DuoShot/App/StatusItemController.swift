@@ -126,7 +126,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// which is why it is behind a modifier and says so.
     private func recentLinksItem() -> NSMenuItem? {
         let entries = ShareHistory.shared.entries
-        guard !entries.isEmpty else { return nil }
+        // Configured-but-empty still gets the submenu, because "All Links…" at
+        // the bottom of it is the only way into the server's own list — and on a
+        // Mac that has just been set up, or one whose history was cleared, there
+        // are no recent rows to hang it under.
+        let isConfigured = ShareSettings.shared.isConfigured
+        guard !entries.isEmpty || isConfigured else { return nil }
 
         let submenu = NSMenu()
         for entry in entries {
@@ -155,12 +160,27 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             submenu.addItem(item)
             submenu.addItem(delete)
         }
+        if !entries.isEmpty {
+            submenu.addItem(.separator())
+            let clear = NSMenuItem(
+                title: "Clear This List", action: #selector(clearRecentLinks), keyEquivalent: "")
+            clear.target = self
+            clear.toolTip = "Only forgets them here. The links keep working."
+            submenu.addItem(clear)
+        }
+
         submenu.addItem(.separator())
-        let clear = NSMenuItem(
-            title: "Clear This List", action: #selector(clearRecentLinks), keyEquivalent: "")
-        clear.target = self
-        clear.toolTip = "Only forgets them here. The links keep working."
-        submenu.addItem(clear)
+        // The ten rows above are what this Mac uploaded lately; this is the
+        // server's own answer, which is a different question and so a different
+        // place. Without an endpoint there is nothing to ask, and an item with
+        // no action is disabled by AppKit's own menu validation — which is the
+        // enabling this menu already relies on everywhere else.
+        let all = NSMenuItem(
+            title: "All Links…",
+            action: isConfigured ? #selector(openAllLinks) : nil, keyEquivalent: "")
+        all.target = self
+        if !isConfigured { all.toolTip = "Set a share endpoint and token in Settings." }
+        submenu.addItem(all)
 
         let item = NSMenuItem(title: "Recent Links", action: nil, keyEquivalent: "")
         item.submenu = submenu
@@ -174,7 +194,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     @objc private func deleteRecentLink(_ sender: NSMenuItem) {
         guard let key = sender.representedObject as? String else { return }
-        ShareService.shared.revoke(key)
+        // Nothing to do with the answer: the row this was clicked in is gone
+        // with the menu, and a failed revoke has already beeped.
+        Task { await ShareService.shared.revoke(key) }
+    }
+
+    @objc private func openAllLinks() {
+        AllLinksWindowController.shared.show()
     }
 
     @objc private func clearRecentLinks() {

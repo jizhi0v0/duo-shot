@@ -189,6 +189,34 @@ public actor LinkdropUploader {
         _ = try await send(endpoint.authorized(request))
     }
 
+    /// One page of what the service is holding, newest first.
+    ///
+    /// - Parameter limit: Rows wanted. The service clamps this to its own
+    ///   ceiling, so asking for more than it will give is not an error.
+    public func list(
+        limit: Int = 25, from endpoint: LinkdropEndpoint
+    ) async throws -> LinkdropListing {
+        var request = URLRequest(url: endpoint.url(
+            path: "/api/list", query: [URLQueryItem(name: "limit", value: "\(limit)")]))
+        request.httpMethod = "GET"
+        let reply: LinkdropListing.Wire = try decode(await send(endpoint.authorized(request)))
+
+        // A row whose key is not a plain word is dropped rather than shown: the
+        // key is what a Copy or a Delete would interpolate into a path, so a row
+        // that cannot be acted on safely has nothing to offer. This is the same
+        // distrust `validate(key:)` applies to an upload's reply, and it is the
+        // one field where a bad value is worse than a missing row.
+        let items = reply.items.compactMap { row -> LinkdropItem? in
+            guard (try? Self.validate(key: row.key)) != nil else { return nil }
+            return LinkdropItem(
+                key: row.key, name: row.name, ext: row.ext,
+                kind: LinkdropDescriptor.Kind(rawValue: row.kind) ?? .file,
+                createdAt: LinkdropListing.date(from: row.createdAt),
+                pageURL: row.pageURL, fileURL: row.fileURL)
+        }
+        return LinkdropListing(items: items, truncated: reply.truncated)
+    }
+
     /// Makes the link stop working, everywhere, for everyone.
     public func delete(key: String, from endpoint: LinkdropEndpoint) async throws {
         try Self.validate(key: key)

@@ -156,3 +156,27 @@ struct ErrorTests {
         #expect(error.message == "larger than 90 MB")
     }
 }
+
+@Suite("Listing")
+struct ListingTests {
+    // What the Worker stamps: `Date.toISOString()`, milliseconds and all.
+    @Test("reads the timestamp the service actually writes")
+    func fractionalSeconds() {
+        let date = LinkdropListing.date(from: "2026-08-01T09:30:00.000Z")
+        #expect(date.timeIntervalSince1970 == 1_785_576_600)
+    }
+
+    @Test("reads a timestamp written without milliseconds")
+    func wholeSeconds() {
+        let date = LinkdropListing.date(from: "2026-08-01T09:30:00Z")
+        #expect(date.timeIntervalSince1970 == 1_785_576_600)
+    }
+
+    // A row with an unreadable date is still a link that can be copied and
+    // revoked, so it keeps its place rather than being dropped from the list.
+    @Test("falls back rather than dropping the row")
+    func unparseable() {
+        #expect(LinkdropListing.date(from: "yesterday") == .distantPast)
+        #expect(LinkdropListing.date(from: "") == .distantPast)
+    }
+}
