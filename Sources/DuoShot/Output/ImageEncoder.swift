@@ -13,9 +13,11 @@ import UniformTypeIdentifiers
 ///    logical size in every viewer.
 /// 2. **JPEG quality control**, which the SCK writer does not expose.
 ///
-/// All functions are `nonisolated` and synchronous: no isolation boundary, so
-/// non-Sendable `CGImage` is a non-issue. Encoding moves off-main (`@concurrent`)
-/// only once it is on a latency-sensitive path.
+/// All functions are `nonisolated` and synchronous, so there is no isolation
+/// boundary here and non-Sendable `CGImage` is a non-issue. Getting off the main
+/// thread is the caller's job: the screenshot path does it in
+/// `StagingStore.encode`, which is `@concurrent` and hands over the Sendable
+/// `CaptureResult` rather than the bare image.
 enum ImageEncoder {
     nonisolated static func write(
         _ image: CGImage,

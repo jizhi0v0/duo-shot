@@ -39,7 +39,13 @@ final class ImageDragSource: NSObject, NSDraggingSource, NSPasteboardItemDataPro
         super.init()
     }
 
-    func beginDrag(from view: NSView, event: NSEvent, thumbnail: NSImage) {
+    /// `frame` is the dragged card's rect in `view`'s coordinates.
+    ///
+    /// Not `view.bounds`: the session is begun from the panel's content view, so
+    /// that it outlives the card, and that view is the whole scrolling column.
+    /// Using its bounds made the drag image stretch over every card on screen as
+    /// soon as there was more than one.
+    func beginDrag(from view: NSView, event: NSEvent, thumbnail: NSImage, frame: CGRect) {
         let item = NSPasteboardItem()
         // The file URL is what makes Finder, Mail, Slack, Figma and browser file
         // inputs all do the right thing.
@@ -52,7 +58,6 @@ final class ImageDragSource: NSObject, NSDraggingSource, NSPasteboardItemDataPro
         }
 
         let draggingItem = NSDraggingItem(pasteboardWriter: item)
-        let frame = CGRect(origin: .zero, size: view.bounds.size)
         draggingItem.setDraggingFrame(frame, contents: thumbnail)
 
         let session = view.beginDraggingSession(with: [draggingItem], event: event, source: self)

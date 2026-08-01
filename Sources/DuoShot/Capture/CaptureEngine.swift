@@ -222,7 +222,7 @@ final class CaptureEngine {
         if let wallpaperFilter = content.wallpaperFilter(for: displayID) {
             backdrop = await wallpaper.image(for: displayID, filter: wallpaperFilter)
         }
-        guard let result = ImagePadding.pad(
+        guard let result = await ImagePadding.padded(
             image, by: padding, scale: scale, backdrop: backdrop,
             fallbackFill: NSColor.windowBackgroundColor.cgColor)
         else {

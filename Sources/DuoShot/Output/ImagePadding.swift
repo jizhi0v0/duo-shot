@@ -3,8 +3,11 @@ import Foundation
 
 /// Centres a capture on a backdrop with a margin around it.
 ///
-/// `nonisolated` and synchronous, like `ImageEncoder`: no isolation boundary, so
-/// the non-Sendable `CGImage` never has to cross one.
+/// `nonisolated`, like `ImageEncoder`. The composite itself is a full-display
+/// wallpaper aspect-fill plus a Gaussian shadow the width of the margin, which is
+/// tens of milliseconds at 5K — far too much to run on the main thread while the
+/// capture is still in flight. `padded` is the entry point that leaves main;
+/// `pad` stays synchronous for callers already off it.
 nonisolated enum ImagePadding {
     // Both are fractions of the margin, so the shadow scales with the padding
     // instead of being clipped by it. At the extremes the shadow reaches
@@ -21,6 +24,23 @@ nonisolated enum ImagePadding {
     /// no backdrop to draw, so a failed wallpaper grab degrades to a flat colour
     /// instead of losing the padding altogether.
     ///
+    /// `pad`, off the main thread.
+    ///
+    /// `@concurrent` rather than plain `nonisolated`: under
+    /// NonisolatedNonsendingByDefault a nonisolated async function runs on the
+    /// *caller's* executor, which for the capture path is main — exactly what
+    /// this is here to avoid.
+    @concurrent
+    static func padded(
+        _ image: CGImage,
+        by padding: CGFloat,
+        scale: CGFloat,
+        backdrop: CGImage?,
+        fallbackFill: CGColor
+    ) async -> CGImage? {
+        pad(image, by: padding, scale: scale, backdrop: backdrop, fallbackFill: fallbackFill)
+    }
+
     /// Returns nil only if the bitmap context cannot be created, which the caller
     /// treats as "keep the unpadded image".
     static func pad(

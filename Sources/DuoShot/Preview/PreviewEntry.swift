@@ -10,21 +10,29 @@ import AppKit
 /// that was never in memory — so the card needs a description both can satisfy.
 struct PreviewEntry {
     enum Kind {
-        case image(CaptureResult)
+        /// A still. Carries only its *point* size, not the capture: the file on
+        /// disk is the copy of record, and holding the CGImage as well meant up
+        /// to `PreviewStackController.maxRetained` full-resolution bitmaps — ~59 MB
+        /// each at 5K — alive for the length of a card's timeout, for one button.
+        case image(pointSize: CGSize)
         case video(RecordingResult)
     }
 
     let kind: Kind
-    /// What the card draws: the capture itself, or a recording's poster frame.
+    /// What the card draws: a downsampled still, or a recording's poster frame.
     let thumbnail: NSImage
-    /// Where the file lives now. The card's reveal, open and drag all use this,
-    /// so it must be the post-move URL, never the staged one.
+    /// Where the file lives now. The card's reveal, open, copy and drag all use
+    /// this, so it must be the post-move URL, never the staged one.
     let url: URL
     let sourceDisplayID: CGDirectDisplayID
     /// A recording whose take ended badly. The card says so, because the file
     /// looks ordinary and the user would otherwise discover the truncation only
     /// on playback.
     var isIncomplete = false
+    /// The save into the user's save folder threw. The card says so, because
+    /// everything else about the capture looks like it worked and the file is
+    /// sitting in staging waiting to be pruned.
+    var saveFailed = false
 
     var isVideo: Bool {
         if case .video = kind { true } else { false }
@@ -40,19 +48,20 @@ struct PreviewEntry {
     /// which of the two `Clipboard.write` overloads a card needs.
     func copyToClipboard() {
         switch kind {
-        case .image(let result): Clipboard.write(result, fileURL: url)
+        case .image(let pointSize): Clipboard.write(fileAt: url, pointSize: pointSize)
         case .video(let result): Clipboard.write(result)
         }
     }
 }
 
 extension PreviewEntry {
-    init(_ output: OutputPipeline.Output) {
+    init(_ output: OutputPipeline.Output) async {
         self.init(
-            kind: .image(output.result),
-            thumbnail: output.result.nsImage,
+            kind: .image(pointSize: output.result.pointSize),
+            thumbnail: await PreviewThumbnail.of(output.result),
             url: output.url,
-            sourceDisplayID: output.result.sourceDisplayID)
+            sourceDisplayID: output.result.sourceDisplayID,
+            saveFailed: output.saveFailed)
     }
 
     /// `poster` is passed in rather than derived here because extracting it
@@ -64,7 +73,64 @@ extension PreviewEntry {
             thumbnail: poster,
             url: output.url,
             sourceDisplayID: output.result.sourceDisplayID,
-            isIncomplete: output.isIncomplete)
+            isIncomplete: output.isIncomplete,
+            saveFailed: output.saveFailed)
+    }
+}
+
+/// The still a screenshot card shows.
+enum PreviewThumbnail {
+    /// Twice the card and no larger, for the reason `VideoPoster.maximumSize`
+    /// gives: this image is only ever drawn into a 208×132 tile.
+    ///
+    /// A capture's own `nsImage` wraps the full-resolution CGImage, so handing it
+    /// to the card meant every redraw of the tile resampled a 5K bitmap, and the
+    /// stack kept up to `PreviewStackController.maxRetained` of them.
+    static let maximumSize = CGSize(
+        width: PreviewCardView.cardSize.width * 2,
+        height: PreviewCardView.cardSize.height * 2)
+
+    /// Returns the capture scaled to fit `maximumSize`, falling back to its own
+    /// `nsImage` when it is already smaller or the scale-down fails: an
+    /// oversized thumbnail is a far better outcome than a blank card.
+    ///
+    /// The cap is read here, on the main actor where it lives, and handed to
+    /// the off-main half as a plain value.
+    static func of(_ result: CaptureResult) async -> NSImage {
+        await downsample(result, cap: maximumSize)
+    }
+
+    /// `@concurrent` for the same reason `StagingStore.encode` is: the
+    /// scale-down decodes the full capture once, which is tens of milliseconds
+    /// at 5K, and under NonisolatedNonsendingByDefault a plain nonisolated
+    /// async function would run it on the caller's executor — main. The card
+    /// already arrives after the encode, so this adds no visible latency.
+    @concurrent
+    private static func downsample(_ result: CaptureResult, cap: CGSize) async -> sending NSImage {
+        let source = result.image
+        let width = CGFloat(source.width)
+        let height = CGFloat(source.height)
+        guard width > 0, height > 0 else { return result.nsImage }
+        let ratio = min(cap.width / width, cap.height / height)
+        guard ratio < 1 else { return result.nsImage }
+
+        let size = CGSize(
+            width: max(1, (width * ratio).rounded()),
+            height: max(1, (height * ratio).rounded()))
+        // Fixed sRGB + premultipliedLast rather than the source's layout, for the
+        // reason `ImagePadding.pad` gives: a capture can arrive in display P3 or
+        // without an alpha channel, and one known-good destination keeps this
+        // predictable.
+        guard let context = CGContext(
+            data: nil, width: Int(size.width), height: Int(size.height),
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return result.nsImage }
+        context.interpolationQuality = .high
+        context.draw(source, in: CGRect(origin: .zero, size: size))
+        guard let scaled = context.makeImage() else { return result.nsImage }
+        return NSImage(cgImage: scaled, size: size)
     }
 }
 

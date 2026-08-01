@@ -357,10 +357,63 @@ final class OverlayView: NSView {
 
     // MARK: - Drawing
 
+    /// Everything this view's appearance is a function of.
+    ///
+    /// The pointer is stored *local and only while it is over this screen*, which
+    /// is what makes the early-out below work: a pointer moving on another
+    /// display leaves this view's entry nil before and after.
+    private struct DrawInputs: Equatable {
+        var highlight: CGRect?
+        var pointer: CGPoint?
+        var phase: SelectionModel.Phase
+        var mode: SelectionMode
+        var isArmed: Bool
+        var allowsWindowMode: Bool
+        var badge: String?
+        var hasBackdrop: Bool
+        var backingScale: CGFloat
+    }
+
+    private var lastDrawn: DrawInputs?
+
+    private var drawInputs: DrawInputs {
+        let highlight = highlightRect
+        let local = model.pointerInAppKitGlobal
+            .map { toLocal(CGRect(origin: $0, size: .zero)).origin }
+        let badge: String? = switch mode {
+        case .area: highlight.map { "\(Int($0.width)) × \(Int($0.height))" }
+        case .window: picker.hovered?.displayName
+        }
+        return DrawInputs(
+            highlight: highlight,
+            // The same inset `placeLoupe` uses, so the two agree about which
+            // screen the pointer is on.
+            pointer: local.flatMap { bounds.insetBy(dx: -1, dy: -1).contains($0) ? $0 : nil },
+            phase: model.phase,
+            mode: mode,
+            isArmed: isArmed,
+            allowsWindowMode: allowsWindowMode,
+            badge: badge,
+            hasBackdrop: backdrop != nil,
+            backingScale: window?.backingScaleFactor ?? 2)
+    }
+
+    /// Invalidates this screen's selection UI — but only when something it draws
+    /// has actually changed.
+    ///
+    /// The controller's refresh closure is shared by every screen's view, so a
+    /// single pointer move used to mark a screen-sized view dirty and rebuild its
+    /// cursor rects on *every* display. Only the view under the pointer has
+    /// anything new to show; on a three-display machine the other two were
+    /// repainting a full screen of dim for nothing.
     func refresh() {
+        let current = drawInputs
+        guard current != lastDrawn else { return }
+        lastDrawn = current
+
         needsDisplay = true
         ants.frame = bounds
-        ants.update(rect: highlightRect, contentsScale: window?.backingScaleFactor ?? 2)
+        ants.update(rect: current.highlight, contentsScale: current.backingScale)
         placeLoupe()
         window?.invalidateCursorRects(for: self)
     }

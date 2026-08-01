@@ -9,7 +9,9 @@ final class CaptureCoordinator {
     let engine = CaptureEngine()
     let overlay = OverlayController()
 
-    var onResult: ((CaptureResult) -> Void)?
+    /// `async` because the output pipeline is: the encode leg leaves the main
+    /// thread and the caller has to be able to wait for it.
+    var onResult: ((CaptureResult) async -> Void)?
     /// Extra windows to keep out of the shot — the floating previews, which are
     /// on screen from a previous capture and would otherwise be photographed.
     var additionalExcludedWindowIDs: () -> Set<CGWindowID> = { [] }
@@ -81,9 +83,12 @@ final class CaptureCoordinator {
             var options = Preferences.shared.captureOptions
             options.excludedWindowIDs = overlay.panelWindowIDs
                 .union(additionalExcludedWindowIDs())
+            // The defer is the safety net for the failure paths; the success path
+            // takes the overlay down through `afterCapture`, before the encode.
             defer { overlay.tearDown() }
             return await perform(
-                .area(displayID: displayID, rectInAppKitGlobal: rect), options: options)
+                .area(displayID: displayID, rectInAppKitGlobal: rect), options: options,
+                afterCapture: { [overlay] in overlay.tearDown() })
 
         case .window(let windowID):
             // The panels are still on screen, as in the area case above. A window
@@ -94,13 +99,23 @@ final class CaptureCoordinator {
             options.excludedWindowIDs = overlay.panelWindowIDs
                 .union(additionalExcludedWindowIDs())
             defer { overlay.tearDown() }
-            return await perform(.window(windowID), options: options)
+            return await perform(
+                .window(windowID), options: options,
+                afterCapture: { [overlay] in overlay.tearDown() })
         }
     }
 
     /// Repeats the last region with no overlay at all.
     @discardableResult
     func captureLastArea() async -> CaptureResult? {
+        // Same gate as `captureInteractive`: this is on a hotkey, and a
+        // double-tap would stack two full encodes on the same main-thread turn.
+        guard !isCapturing else {
+            Log.capture.notice("capture already in progress; ignoring trigger")
+            return nil
+        }
+        isCapturing = true
+        defer { isCapturing = false }
         guard let lastArea else {
             Log.capture.notice("no previous area to repeat")
             NSSound.beep()
@@ -131,12 +146,23 @@ final class CaptureCoordinator {
         await captureInteractive(startingIn: .window)
     }
 
+    /// `afterCapture` runs the moment the image is in hand and before anything is
+    /// done with it.
+    ///
+    /// It exists so the overlay can come down *before* the output pipeline
+    /// encodes. The panels have to stay up across the capture itself — their
+    /// window IDs are the exclusion list — but the encode is tens of milliseconds
+    /// of full-resolution compression, and leaving the dim on screen for it made
+    /// every capture look like a freeze. Not called on the failure path, where
+    /// the retry still needs the panels.
     private func perform(
-        _ request: CaptureRequest, options: CaptureOptions, isRetry: Bool = false
+        _ request: CaptureRequest, options: CaptureOptions, isRetry: Bool = false,
+        afterCapture: () -> Void = {}
     ) async -> CaptureResult? {
         do {
             let result = try await engine.capture(request, options: options)
-            onResult?(result)
+            afterCapture()
+            await onResult?(result)
             return result
         } catch {
             let failure = CaptureFailure(error)
@@ -155,7 +181,8 @@ final class CaptureCoordinator {
                 // A display or window disappeared between enumeration and
                 // capture. One refresh-and-retry covers the common race.
                 try? await engine.refreshContent()
-                return await perform(request, options: options, isRetry: true)
+                return await perform(
+                    request, options: options, isRetry: true, afterCapture: afterCapture)
             default:
                 NSSound.beep()
             }
@@ -165,6 +192,13 @@ final class CaptureCoordinator {
 
     @discardableResult
     func captureDisplay(_ displayID: CGDirectDisplayID? = nil) async -> CaptureResult? {
+        // Same gate as `captureInteractive`, for the same hotkey reason.
+        guard !isCapturing else {
+            Log.capture.notice("capture already in progress; ignoring trigger")
+            return nil
+        }
+        isCapturing = true
+        defer { isCapturing = false }
         do {
             try await engine.refreshContent()
             let target = displayID
@@ -173,7 +207,7 @@ final class CaptureCoordinator {
             var options = Preferences.shared.captureOptions
             options.excludedWindowIDs = additionalExcludedWindowIDs()
             let result = try await engine.capture(.display(target), options: options)
-            onResult?(result)
+            await onResult?(result)
             return result
         } catch {
             Log.capture.error("display capture failed: \(error.localizedDescription, privacy: .public)")

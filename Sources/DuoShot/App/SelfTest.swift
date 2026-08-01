@@ -845,7 +845,7 @@ enum SelfTest {
         defer { preferences.filenameTemplate = originalTemplate }
 
         NSPasteboard.general.clearContents()
-        guard let output = OutputPipeline.shared.process(
+        guard let output = await OutputPipeline.shared.process(
             result, saveDirectoryOverride: directory)
         else {
             print("result:        FAIL — pipeline returned nothing")
@@ -901,13 +901,46 @@ enum SelfTest {
         let baseline = try await coordinator.engine.capture(.display(displayID))
 
         let result = try await coordinator.engine.capture(.display(displayID))
-        guard let output = OutputPipeline.shared.process(result, saveDirectoryOverride: directory)
+        guard let output = await OutputPipeline.shared.process(result, saveDirectoryOverride: directory)
         else { return 1 }
-        previews.present(output)
+        await previews.present(output)
         try await Task.sleep(for: .milliseconds(500))
 
         print("panels:        \(previews.count)")
         print("panel state:   \(previews.debugState)")
+
+        // The card only ever draws into a 208x132 tile, and up to `maxRetained`
+        // of them are alive at once. A full-resolution still as the thumbnail is
+        // ~59 MB of pixels per card that nothing ever looks at.
+        //
+        // Measured off the CGImage, not off `representations`: an NSImage built
+        // with `NSImage(cgImage:size:)` carries an NSCGImageSnapshotRep whose
+        // `pixelsWide` is the *device* backing multiple of the logical size, not
+        // the bitmap's real width — measured, it answers 816 for a 408 px image.
+        let entry = await PreviewEntry(output)
+        let thumbnail = entry.thumbnail
+            .cgImage(forProposedRect: nil, context: nil, hints: nil)
+            .map { CGSize(width: $0.width, height: $0.height) } ?? entry.thumbnail.size
+        let cap = PreviewThumbnail.maximumSize
+        let thumbnailOK = thumbnail.width <= cap.width + 1 && thumbnail.height <= cap.height + 1
+        print(String(format: "thumbnail:     %.0fx%.0f px, cap %.0fx%.0f -> %@",
+                     thumbnail.width, thumbnail.height, cap.width, cap.height,
+                     (thumbnailOK ? "bounded" : "FULL-RESOLUTION STILL RETAINED") as NSString))
+
+        // The card's Copy re-reads the staged file instead of holding the
+        // capture, so the point-size guarantee has to be proved again on that
+        // path — it is the one thing between a 2x capture and pasting at double
+        // size, and no other check covers the card's own button.
+        NSPasteboard.general.clearContents()
+        entry.copyToClipboard()
+        let copied = (NSPasteboard.general.readObjects(
+            forClasses: [NSImage.self], options: nil)?.first as? NSImage)?.size ?? .zero
+        let copyOK = abs(copied.width - result.pointSize.width) < 1
+            && abs(copied.height - result.pointSize.height) < 1
+        print(String(format: "card copy:     %.0fx%.0f pt, expected %.0fx%.0f -> %@",
+                     copied.width, copied.height,
+                     result.pointSize.width, result.pointSize.height,
+                     (copyOK ? "OK" : "WRONG LOGICAL SIZE") as NSString))
 
         // A preview that steals focus would make every capture-then-keep-typing
         // flow miserable, and would also alter what the next capture shows.
@@ -986,18 +1019,18 @@ enum SelfTest {
         var hoverOK = true
         previews.timeout = .milliseconds(300)
         if let fresh = try? await coordinator.engine.capture(.display(displayID)),
-           let freshOutput = OutputPipeline.shared.process(
+           let freshOutput = await OutputPipeline.shared.process(
                fresh, saveDirectoryOverride: directory)
         {
-            previews.present(freshOutput)
+            await previews.present(freshOutput)
             try await Task.sleep(for: .milliseconds(200))
 
             // A second card, so the test can prove the hold is *per card* and
             // not "freeze the whole stack whenever the pointer is anywhere".
             if let second = try? await coordinator.engine.capture(.display(displayID)),
-               let secondOutput = OutputPipeline.shared.process(
+               let secondOutput = await OutputPipeline.shared.process(
                    second, saveDirectoryOverride: directory) {
-                previews.present(secondOutput)
+                await previews.present(secondOutput)
                 try await Task.sleep(for: .milliseconds(200))
             }
 
@@ -1053,7 +1086,7 @@ enum SelfTest {
             print("               (another app took focus during the test; not ours to prevent)")
         }
         let pass = !keyWindowIsPreview && !weStoleFocus
-            && exclusionOK && dismissed && hoverOK
+            && exclusionOK && dismissed && hoverOK && thumbnailOK && copyOK
         print("result:        \(pass ? "PASS" : "FAIL")")
         return pass ? 0 : 1
     }
@@ -1731,9 +1764,9 @@ enum SelfTest {
             let result = try await coordinator.engine.capture(
                 .area(displayID: displayID,
                       rectInAppKitGlobal: rects[index % rects.count]))
-            guard let output = OutputPipeline.shared.process(
+            guard let output = await OutputPipeline.shared.process(
                 result, saveDirectoryOverride: directory) else { continue }
-            previews.present(output)
+            await previews.present(output)
             try await Task.sleep(for: .milliseconds(250))
             frames = previews.panelFrames
         }
@@ -1823,9 +1856,9 @@ enum SelfTest {
         for index in 0..<2 {
             let result = try await coordinator.engine.capture(
                 .area(displayID: displayID, rectInAppKitGlobal: rects[index]))
-            if let output = OutputPipeline.shared.process(
+            if let output = await OutputPipeline.shared.process(
                 result, saveDirectoryOverride: directory) {
-                previews.present(output)
+                await previews.present(output)
             }
             try await Task.sleep(for: .milliseconds(200))
         }
@@ -1834,9 +1867,9 @@ enum SelfTest {
         try await Task.sleep(for: .milliseconds(400))
         let afterResult = try await coordinator.engine.capture(
             .area(displayID: displayID, rectInAppKitGlobal: rects[2]))
-        if let output = OutputPipeline.shared.process(
+        if let output = await OutputPipeline.shared.process(
             afterResult, saveDirectoryOverride: directory) {
-            previews.present(output)
+            await previews.present(output)
         }
         try await Task.sleep(for: .milliseconds(400))
         let after = previews.panelFrames
@@ -2700,12 +2733,12 @@ enum SelfTest {
         try await Task.sleep(for: .milliseconds(500))
         let shot = try await coordinator.engine.capture(
             .area(displayID: displayID, rectInAppKitGlobal: marker.frame))
-        guard let output = OutputPipeline.shared.process(
+        guard let output = await OutputPipeline.shared.process(
             shot, saveDirectoryOverride: directory) else {
             print("result:        FAIL — could not stage the marker capture")
             return 1
         }
-        previews.present(output)
+        await previews.present(output)
         // Closed before recording, so the card is the only magenta on screen.
         marker.orderOut(nil)
         try await Task.sleep(for: .milliseconds(600))
@@ -3354,8 +3387,8 @@ enum SelfTest {
         for iteration in 1...iterations {
             let result = try await coordinator.engine.capture(
                 .area(displayID: displayID, rectInAppKitGlobal: rect))
-            if let output = OutputPipeline.shared.process(result) {
-                previews.present(output)
+            if let output = await OutputPipeline.shared.process(result) {
+                await previews.present(output)
             }
             if iteration % max(iterations / 5, 1) == 0 {
                 let now = MemoryFootprint.current()

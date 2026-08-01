@@ -65,8 +65,12 @@ final class PreviewStackController {
     // MARK: - Presenting
 
     /// Screenshots. The recording path goes through `present(_:poster:)`.
-    func present(_ output: OutputPipeline.Output) {
-        present(PreviewEntry(output))
+    ///
+    /// `async` because building the entry downsamples the capture off-main.
+    /// The card arriving a turn later is invisible next to the encode the
+    /// caller has already awaited.
+    func present(_ output: OutputPipeline.Output) async {
+        present(await PreviewEntry(output))
     }
 
     /// Recordings. The poster frame is the caller's job because extracting one
@@ -80,7 +84,8 @@ final class PreviewStackController {
         var callbacks = PreviewCardView.Callbacks()
         let card = PreviewCardView(
             image: entry.thumbnail, badge: entry.badge,
-            isIncomplete: entry.isIncomplete, callbacks: callbacks)
+            isIncomplete: entry.isIncomplete, saveFailed: entry.saveFailed,
+            callbacks: callbacks)
         let item = Item(entry: entry, card: card)
 
         // Every capture of `item` is weak. `item` owns the card, the card owns
@@ -119,8 +124,15 @@ final class PreviewStackController {
                 if accepted { self.dismiss(item) } else { self.scheduleDismiss(item) }
             }
             item.dragSource = source
-            source.beginDrag(from: panel.contentView ?? item.card,
-                             event: event, thumbnail: thumbnail)
+            // The session is begun from the panel's content view so the drag
+            // survives the card being removed, but the dragging *frame* has to be
+            // the card's own rect in that view's coordinates. Passing the content
+            // view's bounds stretched the drag image over the whole column the
+            // moment there was more than one card in it.
+            let dragView = panel.contentView ?? item.card
+            source.beginDrag(
+                from: dragView, event: event, thumbnail: thumbnail,
+                frame: item.card.convert(item.card.bounds, to: dragView))
         }
         card.apply(callbacks)
 

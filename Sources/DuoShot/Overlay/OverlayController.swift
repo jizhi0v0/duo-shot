@@ -100,13 +100,19 @@ final class OverlayController {
         // No pointer means no loupe either, so any point that no patch can
         // contain will do: the base frame is the right answer.
         let pointer = model.pointerInAppKitGlobal ?? CGPoint(x: -1e9, y: -1e9)
-        for (panel, view) in zip(panels, views) {
-            guard let screen = panel.screen,
-                  let displayID = ScreenIndex.displayID(of: screen)
-            else { continue }
+        for (displayID, view) in zip(panelDisplayIDs, views) {
+            guard let displayID else { continue }
             view.backdrop = backdrop.frame(for: displayID, showing: pointer)
         }
     }
+
+    /// Each panel's display, in the same order as `panels` and `views`.
+    ///
+    /// Resolved once, when the panels are built. `ScreenIndex.displayID(of:)` is
+    /// a `deviceDescription` dictionary lookup, and this used to run once per
+    /// panel per pointer move. The pairing cannot change under a presentation: a
+    /// topology change tears the whole thing down (see the screen observer).
+    private var panelDisplayIDs: [CGDirectDisplayID?] = []
 
     /// How long the pointer has to be still before the patch is re-taken.
     ///
@@ -115,13 +121,30 @@ final class OverlayController {
     private static let patchDelay: TimeInterval = 0.3
     private var patchTimer: Timer?
 
-    /// Restarted on every pointer move, so it only fires once the pointer stops.
+    /// Pushed back on every pointer move, so it only fires once the pointer stops.
+    ///
+    /// The fire date is moved rather than the timer rebuilt. `fireDate` is the
+    /// one property a live `Timer` lets you change, and setting it reschedules
+    /// the timer on its run loop — so a pointer sweep costs one assignment per
+    /// move instead of an invalidate, an allocation and a run-loop insertion.
     private func scheduleFreshPatch() {
-        patchTimer?.invalidate()
-        patchTimer = nil
-        guard mode == .area, !isArmed, captureBackdrop != nil else { return }
+        guard mode == .area, !isArmed, captureBackdrop != nil else {
+            patchTimer?.invalidate()
+            patchTimer = nil
+            return
+        }
+        if let patchTimer {
+            patchTimer.fireDate = Date(timeIntervalSinceNow: Self.patchDelay)
+            return
+        }
         let timer = Timer(timeInterval: Self.patchDelay, repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated { self?.takeFreshPatch() }
+            MainActor.assumeIsolated {
+                // A non-repeating timer invalidates itself as it fires, and an
+                // invalidated timer ignores `fireDate` — leaving it in the
+                // property would mean the patch is never re-taken again.
+                self?.patchTimer = nil
+                self?.takeFreshPatch()
+            }
         }
         // `.common`: a menu tracking or a window drag must not be able to freeze
         // the loupe on an old photograph.
@@ -173,7 +196,7 @@ final class OverlayController {
         mode initialMode: SelectionMode, windows: [WindowInfo], allowsWindowMode: Bool = true,
         requiresConfirmation: Bool = false
     ) async -> Outcome {
-        if isPresenting { dismiss(resumingWith: .cancelled) }
+        if isPresenting { tearDown() }
         // A bar handed over by a previous presentation and never claimed would be
         // furniture nobody can dismiss. It cannot happen on the shipping path —
         // the recorder adopts it in the same turn — but an unowned window at
@@ -209,7 +232,7 @@ final class OverlayController {
         let callbacks = OverlayView.Callbacks(
             confirmArea: { [weak self] in self?.confirmArea() },
             confirmWindow: { [weak self] id in self?.confirmWindow(id) },
-            cancel: { [weak self] in self?.dismiss(resumingWith: .cancelled) },
+            cancel: { [weak self] in self?.tearDown() },
             toggleMode: { [weak self] in self?.toggleMode() },
             selectionRestarted: { [weak self] in self?.disarm() }
         )
@@ -230,7 +253,15 @@ final class OverlayController {
             // never be torn down and its view would be freed under AppKit's feet.
             panels.append(panel)
             views.append(view)
+            panelDisplayIDs.append(ScreenIndex.displayID(of: screen))
         }
+
+        // An empty `NSScreen.screens` — display sleep, a clamshell moment —
+        // builds no panels. Awaiting the continuation then would strand this
+        // caller with nothing on screen to cancel it, and a second `present`
+        // would overwrite the stranded continuation (`isPresenting` is false
+        // with no panels), leaving the first `await` parked forever.
+        guard !panels.isEmpty else { return .cancelled }
 
         // Loaded after the panels exist, so their window IDs can be kept out of
         // the picker. The enumeration predates them, so nothing is lost by
@@ -248,13 +279,13 @@ final class OverlayController {
 
         for panel in panels {
             guard ordering({ panel.orderFrontRegardless() }) else {
-                dismiss(resumingWith: .cancelled)
+                tearDown()
                 return .cancelled
             }
         }
 
         guard takeKeyboard() else {
-            dismiss(resumingWith: .cancelled)
+            tearDown()
             return .cancelled
         }
 
@@ -268,7 +299,7 @@ final class OverlayController {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 Log.overlay.notice("screen parameters changed during selection; cancelling")
-                self?.dismiss(resumingWith: .cancelled)
+                self?.tearDown()
             }
         }
 
@@ -367,13 +398,12 @@ final class OverlayController {
     @discardableResult
     private func takeKeyboard() -> Bool {
         let pointerDisplayID = ScreenIndex.screenUnderMouse().flatMap(ScreenIndex.displayID(of:))
-        let keyPanel = panels.first {
-            $0.screen.flatMap(ScreenIndex.displayID(of:)) == pointerDisplayID
-        } ?? panels.first
-        guard ordering({ keyPanel?.makeKeyAndOrderFront(nil) }) else { return false }
-        if let index = panels.firstIndex(where: { $0 === keyPanel }) {
-            keyPanel?.makeFirstResponder(views[index])
-        }
+        let index = panelDisplayIDs.firstIndex { $0 == pointerDisplayID }
+            ?? (panels.isEmpty ? nil : 0)
+        guard let index else { return true }
+        let keyPanel = panels[index]
+        guard ordering({ keyPanel.makeKeyAndOrderFront(nil) }) else { return false }
+        keyPanel.makeFirstResponder(views[index])
         return true
     }
 
@@ -392,6 +422,20 @@ final class OverlayController {
     /// application stays the one the user just moved to.
     private func restoreKeyboardIfLost() {
         guard !panels.contains(where: \.isKeyWindow) else { return }
+        // The panels are not the only window this selection owns. The armed
+        // toolbar is a `FloatingBarPanel` of its own, one level above the shield,
+        // and it is *entitled* to the keyboard — it holds the Record button and a
+        // device menu. Yanking key away from it every 120 ms would fight whatever
+        // the user is doing in it.
+        //
+        // `NSApp.keyWindow` is by definition one of ours, so the second test is
+        // only about level: anything standing at or above the panels' shielding
+        // level is part of this selection's UI, not something the poll has to
+        // recover from.
+        if let key = NSApp.keyWindow {
+            if toolbar.windowIDs.contains(CGWindowID(key.windowNumber)) { return }
+            if let level = panels.first?.level, key.level >= level { return }
+        }
         Log.overlay.debug("overlay lost key status; taking the keyboard back")
         takeKeyboard()
     }
@@ -448,7 +492,7 @@ final class OverlayController {
             let displayID = model.originDisplayID,
             model.isUsable
         else {
-            dismiss(resumingWith: .cancelled)
+            tearDown()
             return
         }
 
@@ -521,16 +565,17 @@ final class OverlayController {
         resume(with: .window(id))
     }
 
-    private func dismiss(resumingWith outcome: Outcome) {
-        tearDown()
-        resume(with: outcome)
-    }
-
-    /// Removes the panels. Safe to call more than once.
+    /// Removes the panels and cancels the selection. Safe to call more than once.
     ///
-    /// Also resumes any still-pending continuation with `.cancelled`, so no exit
-    /// path can leave `present()` awaiting forever. Harmless after a confirm,
-    /// which has already taken the continuation.
+    /// **Resuming with `.cancelled` is unconditional, and that is the invariant:**
+    /// no exit path may leave `present()` awaiting forever. Harmless after a
+    /// confirm, which has already taken the continuation.
+    ///
+    /// There is deliberately no `dismiss(resumingWith:)` wrapper any more. It
+    /// took an outcome, called this, and then tried to resume with it — a
+    /// continuation this method had already taken, so the argument had never
+    /// meant anything. Every cancelling path calls `tearDown()` directly, which
+    /// is the only outcome it could ever have produced.
     func tearDown() {
         // Unconditional, not `if isArmed`. This is the one exit every path goes
         // through, and a toolbar left on screen at shielding level with no
@@ -568,6 +613,7 @@ final class OverlayController {
         }
         panels.removeAll()
         views.removeAll()
+        panelDisplayIDs.removeAll()
         model.onChange = nil
         picker.onChange = nil
         resume(with: .cancelled)

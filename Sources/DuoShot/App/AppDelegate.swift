@@ -34,11 +34,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func wireCoordinator() {
         coordinator.onResult = { [weak self] result in
-            guard let self, let output = OutputPipeline.shared.process(result) else { return }
+            guard let self, let output = await OutputPipeline.shared.process(result)
+            else { return }
             self.statusItem.noteOutput(output)
             if Preferences.shared.showsPreviewOverlay {
                 self.previews.timeout = .seconds(Preferences.shared.previewTimeout)
-                self.previews.present(output)
+                await self.previews.present(output)
             }
         }
         // A preview left over from the previous capture is on screen; keep it out

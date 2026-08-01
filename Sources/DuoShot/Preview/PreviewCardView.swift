@@ -37,6 +37,9 @@ final class PreviewCardView: NSView {
     private let badge: String?
     /// Colours the duration pill and adds a warning glyph.
     private let isIncomplete: Bool
+    /// The file never reached the save folder. Adds its own badge, because
+    /// nothing else on the card distinguishes this from an ordinary capture.
+    private let saveFailed: Bool
     private var callbacks: Callbacks
     private var isDraggingOut = false
     private var mouseDownGlobal: CGPoint?
@@ -48,10 +51,11 @@ final class PreviewCardView: NSView {
     private var isHovering = false
 
     init(image: NSImage, badge: String? = nil, isIncomplete: Bool = false,
-         callbacks: Callbacks) {
+         saveFailed: Bool = false, callbacks: Callbacks) {
         self.image = image
         self.badge = badge
         self.isIncomplete = isIncomplete
+        self.saveFailed = saveFailed
         self.callbacks = callbacks
         super.init(frame: CGRect(origin: .zero, size: Self.cardSize))
         wantsLayer = true
@@ -105,6 +109,7 @@ final class PreviewCardView: NSView {
         addSubview(imageView)
 
         if let badge { buildVideoDecoration(duration: badge) }
+        if saveFailed { buildSaveWarning() }
 
         let specs: [(symbol: String, tip: String, action: Selector)] = [
             ("doc.on.doc", "Copy", #selector(copyTapped)),
@@ -222,6 +227,44 @@ final class PreviewCardView: NSView {
         pill.toolTip = isIncomplete
             ? "This take ended unexpectedly. The file holds what was written before it stopped."
             : nil
+        label.setFrameOrigin(CGPoint(x: padding.width, y: padding.height))
+        pill.addSubview(label)
+        addSubview(pill)
+        topRightUsedWidth = pill.frame.width + Self.badgeGap
+    }
+
+    /// How much of the top-right corner the duration pill has already taken.
+    private var topRightUsedWidth: CGFloat = 0
+    private static let badgeInset: CGFloat = 6
+    private static let badgeGap: CGFloat = 5
+
+    /// Says the file is not where the user thinks it is.
+    ///
+    /// Top-right, the same corner the duration pill uses and for the same
+    /// reason: the bottom edge belongs to the action bar and the top-left to the
+    /// close button. On a recording card that already has a pill this sits to its
+    /// left rather than under it — two rows of badges over a thumbnail reads as a
+    /// dialog, and there is only ever one line to say.
+    private func buildSaveWarning() {
+        let label = NSTextField(labelWithString: "⚠ Not saved")
+        label.font = .systemFont(ofSize: 10, weight: .semibold)
+        label.textColor = .white
+        label.sizeToFit()
+
+        let padding = CGSize(width: 7, height: 3)
+        let pill = PassthroughView(frame: CGRect(
+            x: bounds.width - label.frame.width - padding.width * 2
+                - Self.badgeInset - topRightUsedWidth,
+            y: bounds.height - label.frame.height - padding.height * 2 - Self.badgeInset,
+            width: label.frame.width + padding.width * 2,
+            height: label.frame.height + padding.height * 2))
+        pill.autoresizingMask = [.minXMargin, .minYMargin]
+        pill.wantsLayer = true
+        pill.layer?.cornerRadius = pill.frame.height / 2
+        pill.layer?.cornerCurve = .continuous
+        pill.layer?.backgroundColor = NSColor.systemOrange.withAlphaComponent(0.9).cgColor
+        pill.toolTip = "Saving to your folder failed. The file is still in DuoShot's "
+            + "staging folder — copy or drag it somewhere before it is pruned."
         label.setFrameOrigin(CGPoint(x: padding.width, y: padding.height))
         pill.addSubview(label)
         addSubview(pill)
