@@ -2720,6 +2720,12 @@ enum SelfTest {
         let displayID = ScreenIndex.screenUnderMouse().flatMap(ScreenIndex.displayID(of:))
             ?? CGMainDisplayID()
 
+        // Before the marker window exists — see `waitUntilStageClear`.
+        let stage = await waitUntilStageClear(on: displayID, upTo: .seconds(3))
+        print("stage:         "
+            + (stage.leftover == 0 ? "clear" : "STILL \(stage.leftover) px magenta")
+            + " after \(stage.waited.milliseconds) ms")
+
         let coordinator = CaptureCoordinator()
         try await coordinator.engine.refreshContent()
         let previews = PreviewStackController()
@@ -4286,6 +4292,12 @@ enum SelfTest {
             ?? CGMainDisplayID()
         let screen = ScreenIndex.screen(for: displayID)
 
+        // Before this test's own magenta exists — see `waitUntilStageClear`.
+        let stage = await waitUntilStageClear(on: displayID, upTo: .seconds(3))
+        print("stage:         "
+            + (stage.leftover == 0 ? "clear" : "STILL \(stage.leftover) px magenta")
+            + " after \(stage.waited.milliseconds) ms")
+
         var options = RecordingOptions.default
         options.capturesSystemAudio = false
         options.capturesMicrophone = false
@@ -4527,6 +4539,44 @@ enum SelfTest {
                     + "Either M9 has become true again or this test can no longer detect a leak — "
                     + "check the .none case, which now has no working positive control"))
         return leaked ? 0 : 1
+    }
+
+    /// Blocks until the display shows no debug magenta at all, and reports what
+    /// it found on arrival.
+    ///
+    /// The pre-flight for every magenta-counting recording test. The suite runs
+    /// them back to back as separate processes, and one run (2026-08-01) had
+    /// `hud absent (.none)` and `plain window recorded` fail *together* —
+    /// magenta in a video whose own surface was `.none`-hidden, the same shape
+    /// as the M9 transient the plan never explained. Both tests passed 3×
+    /// standalone and on every suite rerun, which is what leftovers from the
+    /// previous test look like and a product bug does not. Until the stage is
+    /// proven empty, a magenta count cannot be attributed to this test's
+    /// surface at all.
+    ///
+    /// Returns whatever count it last saw, so the caller's log line finally
+    /// says what was on stage before the test began — if the transient strikes
+    /// again, the run itself names the contamination instead of leaving it a
+    /// mystery to re-derive.
+    private static func waitUntilStageClear(
+        on displayID: CGDirectDisplayID, upTo timeout: Duration
+    ) async -> (leftover: Int, waited: Duration) {
+        let engine = CaptureEngine()
+        var options = CaptureOptions.default
+        options.excludedWindowIDs = []
+        let started = ContinuousClock.now
+        let deadline = started.advanced(by: timeout)
+        var count = -1
+        while true {
+            guard
+                let still = try? await engine.capture(.display(displayID), options: options)
+            else { break }
+            count = PixelCompare.count(still.image, matching: PixelCompare.isDebugMagenta)
+            if count == 0 { break }
+            guard ContinuousClock.now < deadline else { break }
+            try? await Task.sleep(for: .milliseconds(120))
+        }
+        return (count, started.duration(to: .now))
     }
 
     /// Blocks until the magenta surface has finished compositing, and returns
