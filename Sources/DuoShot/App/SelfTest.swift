@@ -718,7 +718,17 @@ enum SelfTest {
              CGRect(origin: contentRect.origin, size: half)),
         ]
 
-        var winner: String?
+        // `isSamePicture`, not `identical`, for the reason `rectCheck` gives and
+        // this one used to ignore: a window worth testing with is a large one,
+        // and a large one has translucent chrome that recomposites its backdrop
+        // from a different area in the two capture paths. Measured here against
+        // Mail on 2026-08-02, the correct reading came back 0.08% different with
+        // a worst channel of 3 — invisible, and rejected by a bit-exact rule, so
+        // the check reported INCONCLUSIVE every run and blamed a moving screen
+        // for it. The wrong reading in the same run differed on 65% of pixels
+        // with a worst channel of 255. Aggregate mean separates them by three
+        // orders of magnitude; the single worst pixel separates nothing.
+        var matched: [(name: String, exact: Bool)] = []
         for reading in readings {
             let output = try await captureRegion(
                 filter: filter, sourceRect: reading.rect, scale: scale, writeTo: nil)
@@ -726,25 +736,37 @@ enum SelfTest {
             let comparison = PixelCompare.compare(image, expected)
             print("  \(reading.name.padding(toLength: 28, withPad: " ", startingAt: 0))"
                 + "\(rectString(reading.rect)) -> \(image.width)x\(image.height) px, \(comparison.summary)")
-            if comparison.identical { winner = reading.name }
+            if comparison.isSamePicture {
+                matched.append((reading.name, comparison.identical))
+            }
         }
 
-        switch winner {
-        case .some(let name) where name.hasPrefix("local"):
+        switch matched.count {
+        case 1 where matched[0].name.hasPrefix("local"):
             print("""
                 verdict:       sourceRect is FILTER-LOCAL — measured from the contentRect
                                origin, which is (0,0) regardless of where contentRect sits in
                                global space. DisplayGeometry.displayLocal() is correct.
-                result:        PASS (FILTER-LOCAL)
+                result:        PASS (FILTER-LOCAL\(matched[0].exact ? "" : ", within tolerance"))
                 """)
             return 0
-        case .some(let name):
+        case 1:
             print("""
-                verdict:       sourceRect matched the \(name) reading. DisplayGeometry
+                verdict:       sourceRect matched the \(matched[0].name) reading. DisplayGeometry
                                .displayLocal() must NOT subtract the display origin.
                 """)
             return 1
-        case .none:
+        case 2:
+            // Both readings qualifying means the window was too uniform to tell
+            // them apart — a blank page, a solid backdrop — not that both are
+            // right. Nothing was discriminated, so nothing may be concluded.
+            print("""
+                verdict:       INCONCLUSIVE — both readings reproduced the crop, so this window
+                               cannot discriminate between them. Re-run over a window with
+                               detail in its top-left quarter.
+                """)
+            return 0
+        default:
             // Exit 0, like every other INCONCLUSIVE in this file.
             //
             // The rule: a non-zero exit means "the thing under test is broken".
