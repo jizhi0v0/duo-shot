@@ -24,9 +24,22 @@ make install       # replace /Applications/DuoShot.app AND restart it
 - Never change the signing flags in a way that alters the Designated
   Requirement. The screen-recording grant is keyed on it; `make verify` is the
   assertion and it must stay green.
-- Building here uses the newest SDK. `#available` does *not* protect against
-  using a symbol that only exists in a newer SDK — that is a compile-time
-  problem. `make check-26` compiles on a Mac running the minimum.
+- **Two machines, and which one you are on changes what a green build means.**
+  One runs Xcode beta with the newest SDK; the other (`Mac-mini`) runs
+  the deployment minimum. Check before concluding anything:
+  `sw_vers -productVersion`, `xcrun --show-sdk-version --sdk macosx`. On the
+  minimum machine an ordinary `make verify` already *is* the cross-SDK check,
+  and `make check-26` is a no-op that rsyncs to itself. On the newest-SDK
+  machine it is the only thing standing between you and a build everybody else
+  cannot compile.
+- A symbol newer than the deployment target needs **both** guards.
+  `#available(macOS 27.0, *)` is a runtime check — the symbol still has to
+  exist at compile time, and one that is absent from the 26 SDK fails the build
+  outright. Swift has no `#if sdk(...)`, so the compiler version stands in for
+  it: `#if compiler(>=6.4)` around the `#available`. Both 27-only calls in the
+  tree (`NSGlassEffectView.effectIsInteractive`,
+  `SCRecordingOutputConfiguration.mixesAudioWithMicrophone`) are written that
+  way, and each says in a comment what is lost when the block is compiled out.
 
 ## Concurrency
 
