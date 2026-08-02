@@ -1,7 +1,6 @@
 import { SELF, env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { presignPut } from "../src/presign";
-import type { Env } from "../src/types";
 
 const TOKEN = "test-token";
 const BASE = "https://s.test";
@@ -66,6 +65,15 @@ describe("round trip", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Length")).toBe(String(PNG.byteLength));
     expect(await response.text()).toBe("");
+  });
+
+  it("preserves a Unicode download name with RFC 5987", async () => {
+    const key = await uploadedKey(`ext=png&name=${encodeURIComponent("截图 你好.png")}`);
+    const response = await SELF.fetch(`${BASE}/${key}/dl`);
+    const disposition = response.headers.get("Content-Disposition") ?? "";
+
+    expect(disposition).toContain('filename="_ _.png"');
+    expect(disposition).toContain("filename*=UTF-8''%E6%88%AA%E5%9B%BE%20%E4%BD%A0%E5%A5%BD.png");
   });
 
   it("404s an unknown key", async () => {
@@ -419,6 +427,18 @@ describe("list", () => {
     const body = (await response.json()) as { items: { key: string; name: string }[] };
     const found = body.items.find((item) => item.key === key);
     expect(found?.name).toBe("listed.png");
+  });
+
+  it("uses the newest-first ordered index", async () => {
+    const older = await uploadedKey("ext=png&name=older.png");
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    const newer = await uploadedKey("ext=png&name=newer.png");
+    const response = await SELF.fetch(`${BASE}/api/list?limit=2`, {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    const body = (await response.json()) as { items: { key: string }[] };
+
+    expect(body.items.map((item) => item.key)).toEqual([newer, older]);
   });
 });
 

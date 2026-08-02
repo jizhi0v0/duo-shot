@@ -1,4 +1,9 @@
-import type { Env } from "./types";
+interface PresignBindings {
+  R2_ACCOUNT_ID?: string;
+  R2_ACCESS_KEY_ID?: string;
+  R2_SECRET_ACCESS_KEY?: string;
+  R2_BUCKET_NAME?: string;
+}
 
 /// AWS Signature Version 4, query-string form, for R2's S3-compatible endpoint.
 ///
@@ -55,7 +60,7 @@ export interface PresignOptions {
 }
 
 export async function presignPut(
-  env: Env,
+  env: Env & PresignBindings,
   objectKey: string,
   options: PresignOptions = {},
 ): Promise<string> {

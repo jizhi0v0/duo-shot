@@ -1,27 +1,3 @@
-export interface Env {
-  BUCKET: R2Bucket;
-
-  /// The one credential the DuoShot client holds. A leaked copy can upload and
-  /// delete, but cannot read the bucket outside this Worker's routes and cannot
-  /// touch any other bucket -- which is the entire reason the client does not
-  /// get R2 S3 credentials instead.
-  UPLOAD_TOKEN: string;
-
-  /// Origin the returned links are built from, no trailing slash.
-  /// e.g. "https://s.example.com"
-  PUBLIC_BASE: string;
-
-  /// Only needed for POST /api/new, which hands the client a presigned PUT so
-  /// large recordings never pass through this Worker (and so never meet the
-  /// Workers request-body limit). Leave unset to run upload-through-Worker only.
-  R2_ACCOUNT_ID?: string;
-  R2_ACCESS_KEY_ID?: string;
-  R2_SECRET_ACCESS_KEY?: string;
-  /// The bucket's real name, needed to build the S3 path. The binding above
-  /// does not expose it.
-  R2_BUCKET_NAME?: string;
-}
-
 /// The sidecar record, stored at `m/<key>` as JSON.
 ///
 /// Separate from the uploaded object on purpose: with a presigned PUT the bytes
@@ -47,6 +23,8 @@ export interface ShareRecord {
   /// what makes a video link unfurl with a thumbnail in chat apps.
   posterKey?: string;
   createdAt: string;
+  /// Time-ordered listing entry. Older records gain one through `/api/reindex`.
+  indexKey?: string;
   ephemeral: boolean;
   /// One read and the bytes are deleted. Images only: a video is fetched with
   /// Range requests, so "the first complete read" is not a moment that exists

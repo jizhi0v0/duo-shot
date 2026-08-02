@@ -111,7 +111,8 @@ Content-Type 白名单、`noindex`、"过期显示 410" 全都在 Worker 里。�
 | `PUT` | `/api/put?ext=png&name=…` | 小文件路径，一次请求搞定。**必须带 `Content-Length`**，上限 90 MB |
 | `PUT` | `/api/poster/<key>` | 给视频传一张封面图，上限 4 MB。传了之后链接才会有缩略图预览 |
 | `DELETE` | `/api/o/<key>` | 删除对象、封面和边车 |
-| `GET` | `/api/list?limit=25` | 最近的上传，一次操作读完（信息存在边车的 customMetadata 里） |
+| `GET` | `/api/list?limit=25` | 最近的上传；直接读取按时间排序的 `i/` 索引，耗时只随 limit 增长 |
+| `POST` | `/api/reindex?limit=100&cursor=…` | 部署升级时分批为旧边车补索引；按返回的 cursor 继续，直到 `truncated=false` |
 | `GET` | `/<key>` | 预览页 |
 | `GET` | `/<key>/dl` | 同样的字节，强制下载 |
 | `GET`/`HEAD` | `/f/<key>.<ext>` | 裸文件。Range → 206，`If-None-Match` → 304 |
@@ -135,6 +136,7 @@ Content-Type 白名单、`noindex`、"过期显示 410" 全都在 Worker 里。�
 | 前缀 | 内容 |
 |---|---|
 | `m/<key>` | 边车：JSON 元数据。**永不过期**，对象没了它还在，用来回 410 |
+| `i/<反向时间>/<key>` | 最近链接索引：R2 字典序即新到旧，列表无需扫描全部边车 |
 | `p/<key>` | 长期保存的字节 |
 | `e/<key>` | 会过期的字节（生命周期规则挂这个前缀） |
 | `s/<key>` | 视频封面 |
@@ -145,6 +147,7 @@ Content-Type 白名单、`noindex`、"过期显示 410" 全都在 Worker 里。�
 npm --prefix Worker run dev        # wrangler dev，本地 R2
 npm --prefix Worker test           # 离线，不花钱
 npm --prefix Worker run typecheck
+npm --prefix Worker run cf-typegen # wrangler.jsonc 改动后刷新绑定类型
 ```
 
 `wrangler dev` 读不到线上的 secret，所以本地要建一个 `Worker/.dev.vars`（已在 `.gitignore` 里）：

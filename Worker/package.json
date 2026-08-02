@@ -6,11 +6,11 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "cf-typegen": "wrangler types",
+    "typecheck": "wrangler types && tsc --noEmit"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.20.1",
-    "@cloudflare/workers-types": "^5.20260801.1",
     "typescript": "^5.9.0",
     "vitest": "^4.1.10",
     "wrangler": "^4.118.0"

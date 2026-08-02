@@ -1,5 +1,3 @@
-import type { Env } from "./types";
-
 /// Constant-time comparison.
 ///
 /// Not written this way out of superstition: the token is compared on every

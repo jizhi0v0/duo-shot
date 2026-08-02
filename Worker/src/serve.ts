@@ -96,7 +96,7 @@ export async function serveObject(
     "X-Robots-Tag": "noindex, nofollow",
   });
   if (attachment) {
-    base.set("Content-Disposition", `attachment; filename="${sanitizeFilename(options.filename)}"`);
+    base.set("Content-Disposition", contentDisposition(options.filename));
   }
 
   if (request.method === "HEAD") {
@@ -179,7 +179,7 @@ export async function serveOnce(
   if (forceDownload || options.download) {
     headers.set(
       "Content-Disposition",
-      `attachment; filename="${sanitizeFilename(options.filename)}"`,
+      contentDisposition(options.filename),
     );
   }
 
@@ -210,5 +210,15 @@ export async function serveOnce(
 /// A filename reaches this header from whatever the client sent at upload time.
 /// A quote or a newline in it would let the uploader inject header fields.
 function sanitizeFilename(name: string): string {
-  return name.replace(/[^\w.\- ]+/g, "_").slice(0, 120) || "download";
+  return name.replace(/[^\x20-\x7E]+/g, "_").replace(/["\\]/g, "_").slice(0, 120)
+    || "download";
+}
+
+/// RFC 5987 preserves the actual UTF-8 name while the conservative ASCII
+/// fallback keeps older user agents safe and usable.
+function contentDisposition(name: string): string {
+  const normalized = name.normalize("NFC").slice(0, 200) || "download";
+  const encoded = encodeURIComponent(normalized)
+    .replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `attachment; filename="${sanitizeFilename(normalized)}"; filename*=UTF-8''${encoded}`;
 }

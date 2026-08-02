@@ -4,7 +4,7 @@ import { isUploadableExtension, kindFor } from "./mime";
 import { renderGone, renderPage } from "./page";
 import { PresignUnavailable, presignPut } from "./presign";
 import { serveObject, serveOnce } from "./serve";
-import type { Env, ShareRecord } from "./types";
+import type { ShareRecord } from "./types";
 
 /// Above this, `PUT /api/put` refuses and tells the client to use the presigned
 /// path instead. The platform's own request-body limit sits somewhere above
@@ -96,6 +96,7 @@ async function api(request: Request, env: Env, segments: string[], url: URL): Pr
     return apiDelete(env, argument);
   }
   if (action === "list" && request.method === "GET") return apiList(env, url);
+  if (action === "reindex" && request.method === "POST") return apiReindex(env, url);
 
   return json(404, { error: "no such endpoint" });
 }
@@ -170,7 +171,7 @@ async function apiNew(request: Request, env: Env): Promise<Response> {
     if (error instanceof PresignUnavailable) {
       // The sidecar would otherwise be a permanent orphan pointing at bytes
       // that can never arrive.
-      await env.BUCKET.delete(metaKey(record.key));
+      await env.BUCKET.delete([metaKey(record.key), indexKeyFor(record)]);
       return json(501, { error: error.message });
     }
     throw error;
@@ -245,44 +246,28 @@ async function apiDelete(env: Env, key: string): Promise<Response> {
   // unreachable bytes paying rent forever.
   await env.BUCKET.delete(record.objectKey);
   if (record.posterKey) await env.BUCKET.delete(record.posterKey);
+  await env.BUCKET.delete(indexKeyFor(record));
   await env.BUCKET.delete(metaKey(key));
   return json(200, { deleted: key });
 }
 
-/// Backs the app's "recent links" menu. Reads only the sidecars' custom
-/// metadata, so a page of them is one operation rather than one read per item.
-///
-/// The whole prefix has to be walked before "recent" means anything: R2 lists
-/// lexicographically and the keys are random, so a single page of N is the
-/// alphabetically-first N, not the newest N. LIST_CAP bounds that walk -- past
-/// it the answer is the newest of what was seen, flagged `truncated`.
-const LIST_CAP = 5000;
+/// Backs the app's "recent links" menu. Every record has a stable-keyed `i/`
+/// entry whose first component is an inverted millisecond timestamp, so R2's
+/// native lexicographic order is newest-first. Listing 25 links therefore reads
+/// 25 objects, no matter how large the bucket becomes.
 
 async function apiList(env: Env, url: URL): Promise<Response> {
   const limit = Math.min(Math.max(numberParam(url, "limit") ?? 25, 1), 200);
 
-  const sidecars: R2Object[] = [];
-  let cursor: string | undefined;
-  let truncated = false;
-  for (;;) {
-    const listed = await env.BUCKET.list({
-      prefix: "m/",
-      limit: 1000,
-      cursor,
-      include: ["customMetadata"],
-    });
-    sidecars.push(...listed.objects);
-    if (!listed.truncated) break;
-    if (sidecars.length >= LIST_CAP) {
-      truncated = true;
-      break;
-    }
-    cursor = listed.cursor;
-  }
+  const listed = await env.BUCKET.list({
+    prefix: "i/",
+    limit,
+    include: ["customMetadata"],
+  });
 
-  const items = sidecars
+  const items = listed.objects
     .map((object) => {
-      const key = object.key.slice(2);
+      const key = object.key.split("/").at(-1) ?? "";
       const custom = object.customMetadata ?? {};
       return {
         key,
@@ -293,11 +278,39 @@ async function apiList(env: Env, url: URL): Promise<Response> {
         pageURL: `${base(env)}/${key}`,
         fileURL: custom.ext ? `${base(env)}/f/${key}.${custom.ext}` : null,
       };
-    })
-    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
-    .slice(0, limit);
+    });
 
-  return json(200, { items, truncated });
+  return json(200, { items, truncated: listed.truncated });
+}
+
+/// One-time migration for deployments that predate the ordered index. It is
+/// deliberately paged so no Worker request ever walks the whole bucket.
+async function apiReindex(env: Env, url: URL): Promise<Response> {
+  const limit = Math.min(Math.max(numberParam(url, "limit") ?? 100, 1), 100);
+  const cursor = url.searchParams.get("cursor") || undefined;
+  const listed = await env.BUCKET.list({
+    prefix: "m/",
+    limit,
+    cursor,
+    include: ["customMetadata"],
+  });
+  await Promise.all(listed.objects.map(async (object) => {
+    const custom = object.customMetadata ?? {};
+    const key = object.key.slice(2);
+    if (!isValidKey(key)) return;
+    const createdAt = custom.createdAt ?? object.uploaded.toISOString();
+    await putIndex(env, indexKey(createdAt, key), {
+      name: custom.name ?? "",
+      ext: custom.ext ?? "",
+      kind: custom.kind ?? "file",
+      createdAt,
+    });
+  }));
+  return json(200, {
+    indexed: listed.objects.length,
+    truncated: listed.truncated,
+    cursor: listed.truncated ? listed.cursor : null,
+  });
 }
 
 /// The two things a one-time link cannot be, in one place so both upload routes
@@ -498,22 +511,48 @@ async function createRecord(env: Env, input: RecordInput): Promise<ShareRecord> 
     ephemeral: input.ephemeral,
     burn: input.burn || undefined,
   };
+  record.indexKey = indexKey(record.createdAt, record.key);
   await saveRecord(env, record);
   return record;
 }
 
 async function saveRecord(env: Env, record: ShareRecord): Promise<void> {
-  await env.BUCKET.put(metaKey(record.key), JSON.stringify(record), {
-    httpMetadata: { contentType: "application/json" },
-    // Duplicated out of the body so `list` can render the recent-links menu
-    // without a read per item.
-    customMetadata: {
-      name: record.name,
-      ext: record.ext,
-      kind: record.kind,
-      createdAt: record.createdAt,
-    },
-  });
+  const customMetadata = {
+    name: record.name,
+    ext: record.ext,
+    kind: record.kind,
+    createdAt: record.createdAt,
+  };
+  const orderedKey = indexKeyFor(record);
+  record.indexKey = orderedKey;
+  await Promise.all([
+    env.BUCKET.put(metaKey(record.key), JSON.stringify(record), {
+      httpMetadata: { contentType: "application/json" },
+      customMetadata,
+    }),
+    putIndex(env, orderedKey, customMetadata),
+  ]);
+}
+
+const INVERTED_TIME_CEILING = 9_999_999_999_999;
+
+function indexKey(createdAt: string, key: string): string {
+  const parsed = Date.parse(createdAt);
+  const time = Number.isFinite(parsed) ? parsed : 0;
+  const inverted = Math.max(0, INVERTED_TIME_CEILING - time);
+  return `i/${String(inverted).padStart(13, "0")}/${key}`;
+}
+
+function indexKeyFor(record: ShareRecord): string {
+  return record.indexKey ?? indexKey(record.createdAt, record.key);
+}
+
+async function putIndex(
+  env: Env,
+  key: string,
+  customMetadata: Record<string, string>,
+): Promise<void> {
+  await env.BUCKET.put(key, "", { customMetadata });
 }
 
 async function loadRecord(env: Env, key: string): Promise<ShareRecord | null> {
@@ -589,4 +628,3 @@ function text(status: number, message: string): Response {
     headers: { "Content-Type": "text/plain; charset=utf-8", "X-Robots-Tag": "noindex, nofollow" },
   });
 }
-
