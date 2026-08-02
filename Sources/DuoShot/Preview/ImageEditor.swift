@@ -45,6 +45,9 @@ final class ImageEditor: NSView {
         case redact
         case marker
         case text
+        case line
+        case arrow
+        case rectangle
         case crop
 
         var draws: Bool { self != .pointer }
@@ -99,15 +102,9 @@ final class ImageEditor: NSView {
     /// like every other thing this view needs from outside itself.
     var onPictureResized: ((CGSize) -> Void)?
 
-    init?(url: URL, image: NSImage, menu: NSMenu, frame: CGRect) {
-        guard image.size.width >= 1, image.size.height >= 1,
-              // Read once, here, rather than per write: this is the capture as it
-              // was before anything in this window touched it, and after the first
-              // write the file is no longer a copy of it.
-              let data = try? Data(contentsOf: url)
-        else { return nil }
+    init(url: URL, image: NSImage, originalData: Data, menu: NSMenu, frame: CGRect) {
         self.url = url
-        self.originalData = data
+        self.originalData = originalData
         self.originalPointSize = image.size
         self.pointSize = image.size
         // `representations` rather than a second decode: the image was just read
@@ -198,6 +195,14 @@ final class ImageEditor: NSView {
         notice.isHidden = true
         refreshBar()
         needsLayout = true
+    }
+
+    /// Kept for focused editor tests and callers that already own only an
+    /// `NSImage`. The production viewer uses the data-taking initializer after
+    /// loading and decoding off the main actor.
+    convenience init?(url: URL, image: NSImage, menu: NSMenu, frame: CGRect) {
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
+        self.init(url: url, image: image, originalData: data, menu: menu, frame: frame)
     }
 
     @available(*, unavailable)
@@ -625,6 +630,9 @@ final class ImageEditor: NSView {
         case "r": choose(.redact)
         case "n": choose(.marker)
         case "t": choose(.text)
+        case "l": choose(.line)
+        case "a": choose(.arrow)
+        case "b": choose(.rectangle)
         case "c": choose(.crop)
         default: super.keyDown(with: event)
         }
@@ -903,6 +911,7 @@ private final class EditCanvas: NSView, NSTextViewDelegate, NSLayoutManagerDeleg
     /// does not blink out of existence for the length of a decode.
     func clearPending(revealTyping: Bool = false) {
         marks.pending = nil
+        marks.pendingStroke = nil
         marks.pendingMarker = nil
         draft = nil
         showCropFrame()
@@ -934,6 +943,11 @@ private final class EditCanvas: NSView, NSTextViewDelegate, NSLayoutManagerDeleg
         case .redact:
             anchor = point
             marks.pending = nil
+            marks.pendingStroke = nil
+        case .line, .arrow, .rectangle:
+            anchor = point
+            marks.pending = nil
+            marks.pendingStroke = nil
         case .crop:
             beginCrop(at: point)
         case .marker:
@@ -997,7 +1011,14 @@ private final class EditCanvas: NSView, NSTextViewDelegate, NSLayoutManagerDeleg
             super.mouseDragged(with: event)
             return
         }
-        marks.pending = rect(from: anchor, to: point)
+        switch tool {
+        case .redact:
+            marks.pending = rect(from: anchor, to: point)
+        case .line, .arrow, .rectangle:
+            marks.pendingStroke = (tool, anchor, clamped(point))
+        default:
+            break
+        }
         marks.needsDisplay = true
     }
 
@@ -1027,17 +1048,37 @@ private final class EditCanvas: NSView, NSTextViewDelegate, NSLayoutManagerDeleg
             return
         }
         self.anchor = nil
-        let drawn = rect(from: anchor, to: convert(event.locationInWindow, from: nil))
-        guard drawn.width >= Self.minimumSide, drawn.height >= Self.minimumSide else {
+        let endpoint = clamped(convert(event.locationInWindow, from: nil))
+        let drawn = rect(from: anchor, to: endpoint)
+        let longEnough = hypot(endpoint.x - anchor.x, endpoint.y - anchor.y) >= Self.minimumSide
+        let boxLargeEnough = drawn.width >= Self.minimumSide && drawn.height >= Self.minimumSide
+        guard tool == .line || tool == .arrow ? longEnough : boxLargeEnough else {
             marks.pending = nil
+            marks.pendingStroke = nil
             marks.needsDisplay = true
             return
         }
-        // Left on screen until the render lands, because a redaction that
-        // disappears for a decode and comes back as a mosaic reads as a bug.
-        marks.pending = drawn
+        let edit: ImageEdit
+        switch tool {
+        case .redact:
+            marks.pending = drawn
+            edit = .redact(drawn)
+        case .line:
+            marks.pendingStroke = (tool, anchor, endpoint)
+            edit = .line(anchor, endpoint)
+        case .arrow:
+            marks.pendingStroke = (tool, anchor, endpoint)
+            edit = .arrow(anchor, endpoint)
+        case .rectangle:
+            marks.pendingStroke = (tool, anchor, endpoint)
+            edit = .rectangle(drawn)
+        default:
+            marks.pending = nil
+            marks.pendingStroke = nil
+            return
+        }
         marks.needsDisplay = true
-        onEdit(.redact(drawn))
+        onEdit(edit)
     }
 
     /// Clamped to the image, because a drag that leaves the window is the normal
@@ -1047,6 +1088,11 @@ private final class EditCanvas: NSView, NSTextViewDelegate, NSLayoutManagerDeleg
         CGRect(x: min(from.x, to.x), y: min(from.y, to.y),
                width: abs(to.x - from.x), height: abs(to.y - from.y))
             .intersection(bounds)
+    }
+
+    private func clamped(_ point: CGPoint) -> CGPoint {
+        CGPoint(x: min(max(point.x, bounds.minX), bounds.maxX),
+                y: min(max(point.y, bounds.minY), bounds.maxY))
     }
 
     // MARK: - The crop frame
@@ -1533,6 +1579,7 @@ private final class EditMarks: NSView {
     /// The rectangle being dragged, or the one just committed and not yet
     /// rendered.
     var pending: CGRect?
+    var pendingStroke: (tool: ImageEditor.Tool, start: CGPoint, end: CGPoint)?
     var pendingMarker: (centre: CGPoint, number: Int)?
     /// The crop frame, when the crop tool is holding one.
     var crop: CGRect?
@@ -1570,6 +1617,7 @@ private final class EditMarks: NSView {
             path.lineWidth = 1
             path.stroke()
         }
+        if let pendingStroke { drawStroke(pendingStroke) }
         if let pendingMarker { drawMarker(pendingMarker) }
         if let hover, typing == nil {
             NSColor.controlAccentColor.withAlphaComponent(0.22).setFill()
@@ -1652,6 +1700,49 @@ private final class EditMarks: NSView {
         corners.stroke()
     }
 
+    private func drawStroke(
+        _ stroke: (tool: ImageEditor.Tool, start: CGPoint, end: CGPoint)
+    ) {
+        let color = NSColor(cgColor: ImageEdit.inkColor) ?? .systemRed
+        NSGraphicsContext.current?.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor(white: 0, alpha: 0.55)
+        shadow.shadowOffset = CGSize(width: 0, height: -1)
+        shadow.shadowBlurRadius = 3
+        shadow.set()
+        color.setStroke()
+
+        let path: NSBezierPath
+        if stroke.tool == .rectangle {
+            let rect = CGRect(
+                x: min(stroke.start.x, stroke.end.x),
+                y: min(stroke.start.y, stroke.end.y),
+                width: abs(stroke.end.x - stroke.start.x),
+                height: abs(stroke.end.y - stroke.start.y))
+            path = NSBezierPath(rect: rect.insetBy(
+                dx: ImageEdit.strokeWidth / 2, dy: ImageEdit.strokeWidth / 2))
+        } else {
+            path = NSBezierPath()
+            path.move(to: stroke.start)
+            path.line(to: stroke.end)
+            if stroke.tool == .arrow {
+                let angle = atan2(
+                    stroke.end.y - stroke.start.y, stroke.end.x - stroke.start.x)
+                for turn in [CGFloat.pi * 0.82, -CGFloat.pi * 0.82] {
+                    path.move(to: stroke.end)
+                    path.line(to: CGPoint(
+                        x: stroke.end.x + cos(angle + turn) * ImageEdit.arrowHeadLength,
+                        y: stroke.end.y + sin(angle + turn) * ImageEdit.arrowHeadLength))
+                }
+            }
+        }
+        path.lineWidth = ImageEdit.strokeWidth
+        path.lineCapStyle = .round
+        path.lineJoinStyle = .round
+        path.stroke()
+        NSGraphicsContext.current?.restoreGraphicsState()
+    }
+
     /// The same red circle the renderer draws, for the moment between the click
     /// and the render that makes it real.
     private func drawMarker(_ marker: (centre: CGPoint, number: Int)) {
@@ -1693,10 +1784,10 @@ private final class EditMarks: NSView {
 /// the window, where it sits over the picture rather than under it, the jump
 /// would be the first thing anyone saw.
 ///
-/// Icon-only tools with tooltips rather than words. Five titled pills plus Undo,
+/// Icon-only tools with tooltips rather than words. Titled pills plus Undo,
 /// Cancel and Apply is a bar wider than the window a small capture opens in, and
-/// the five are a set the eye should read as one control rather than as five
-/// sentences.
+/// the tools are a set the eye should read as one control rather than as a row
+/// of sentences.
 private final class EditToolbar: NSView {
     var onTool: (ImageEditor.Tool) -> Void = { _ in }
     var onUndo: () -> Void = {}
@@ -1730,6 +1821,9 @@ private final class EditToolbar: NSView {
         (.redact, "square.grid.3x3.fill", "Redact — destroy the pixels under a rectangle (R)"),
         (.marker, "1.circle", "Number — drop a numbered marker (N)"),
         (.text, "textformat", "Text — type a note onto the picture (T)"),
+        (.line, "line.diagonal", "Line — draw a straight line (L)"),
+        (.arrow, "arrow.up.right", "Arrow — point at something (A)"),
+        (.rectangle, "rectangle", "Box — outline a rectangle (B)"),
         (.crop, "crop", "Crop — keep only what you drag around (C)"),
     ]
 

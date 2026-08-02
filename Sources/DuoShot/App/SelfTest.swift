@@ -3713,6 +3713,21 @@ enum SelfTest {
         check("an empty list is not an edit",
               ImageEdit.render(original, edits: [], pointSize: points, cropping: true) == nil)
 
+        // The three callout tools share gesture plumbing but have separate
+        // flattening paths. Prove each one changes pixels on its own so a toolbar
+        // button cannot appear functional while exporting nothing.
+        let callouts: [(String, ImageEdit)] = [
+            ("line", .line(CGPoint(x: 40, y: 40), CGPoint(x: 260, y: 160))),
+            ("arrow", .arrow(CGPoint(x: 40, y: 160), CGPoint(x: 260, y: 40))),
+            ("rectangle", .rectangle(CGRect(x: 60, y: 50, width: 180, height: 100))),
+        ]
+        for (name, edit) in callouts {
+            let rendered = ImageEdit.render(
+                original, edits: [edit], pointSize: points, cropping: true)
+            check("the \(name) tool is flattened into the output",
+                  rendered.map { !PixelCompare.compare($0, original).identical } == true)
+        }
+
         // MARK: applying a crop, through the editor
         //
         // The one edit that changes what "the picture" is. Driven through the

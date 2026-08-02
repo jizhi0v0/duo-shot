@@ -39,6 +39,11 @@ nonisolated enum ImageEdit: Equatable {
     /// render time: a note written large stays large when a later one is written
     /// small, which is the only behaviour anyone expects from a size control.
     case text(CGPoint, String, CGFloat)
+    /// Lightweight callouts. Points stay in image coordinates so preview and
+    /// export share the exact same geometry at every backing scale.
+    case line(CGPoint, CGPoint)
+    case arrow(CGPoint, CGPoint)
+    case rectangle(CGRect)
     /// What survives. Applied last and only once — the *last* crop in the list
     /// wins, so cropping twice is a correction rather than a compounding.
     case crop(CGRect)
@@ -62,6 +67,16 @@ nonisolated enum ImageEdit: Equatable {
             return .marker(CGPoint(x: point.x + offset.x, y: point.y + offset.y))
         case .text(let point, let string, let size):
             return .text(CGPoint(x: point.x + offset.x, y: point.y + offset.y), string, size)
+        case .line(let start, let end):
+            return .line(
+                CGPoint(x: start.x + offset.x, y: start.y + offset.y),
+                CGPoint(x: end.x + offset.x, y: end.y + offset.y))
+        case .arrow(let start, let end):
+            return .arrow(
+                CGPoint(x: start.x + offset.x, y: start.y + offset.y),
+                CGPoint(x: end.x + offset.x, y: end.y + offset.y))
+        case .rectangle(let rect):
+            return .rectangle(rect.offsetBy(dx: offset.x, dy: offset.y))
         case .crop(let rect):
             return .crop(rect.offsetBy(dx: offset.x, dy: offset.y))
         }
@@ -77,6 +92,8 @@ nonisolated enum ImageEdit: Equatable {
     /// Points, at the image's own scale: a marker on a 5K capture is the same
     /// size relative to the picture as one on a small window shot.
     static let markerRadius: CGFloat = 13
+    static let strokeWidth: CGFloat = 4
+    static let arrowHeadLength: CGFloat = 14
 
     /// What the text tool offers, in points, and the one it starts on.
     ///
@@ -284,6 +301,17 @@ nonisolated extension ImageEdit {
                 draw(text: string, at: scaled(origin, by: scale), size: size,
                      wrappingAt: pixels.width, unit: unit, in: context)
                 index += 1
+            case .line(let start, let end):
+                drawStroke(from: scaled(start, by: scale), to: scaled(end, by: scale),
+                           arrow: false, unit: unit, in: context)
+                index += 1
+            case .arrow(let start, let end):
+                drawStroke(from: scaled(start, by: scale), to: scaled(end, by: scale),
+                           arrow: true, unit: unit, in: context)
+                index += 1
+            case .rectangle(let rect):
+                drawRectangle(scaled(rect, by: scale), unit: unit, in: context)
+                index += 1
             case .crop:
                 // Last, and outside the loop: a crop half way through the list
                 // would shift the coordinates of everything after it, and the
@@ -454,6 +482,44 @@ nonisolated extension ImageEdit {
             x: centre.x - bounds.width / 2 - bounds.minX,
             y: centre.y - bounds.height / 2 - bounds.minY)
         CTLineDraw(line, context)
+    }
+
+    private static func drawStroke(
+        from start: CGPoint, to end: CGPoint, arrow: Bool,
+        unit: CGFloat, in context: CGContext
+    ) {
+        let width = strokeWidth * unit
+        context.saveGState()
+        setShadow(unit: unit, in: context)
+        context.setStrokeColor(inkColor)
+        context.setLineWidth(width)
+        context.setLineCap(.round)
+        context.setLineJoin(.round)
+        context.move(to: start)
+        context.addLine(to: end)
+        if arrow {
+            let angle = atan2(end.y - start.y, end.x - start.x)
+            let head = arrowHeadLength * unit
+            for turn in [CGFloat.pi * 0.82, -CGFloat.pi * 0.82] {
+                context.move(to: end)
+                context.addLine(to: CGPoint(
+                    x: end.x + cos(angle + turn) * head,
+                    y: end.y + sin(angle + turn) * head))
+            }
+        }
+        context.strokePath()
+        context.restoreGState()
+    }
+
+    private static func drawRectangle(_ rect: CGRect, unit: CGFloat, in context: CGContext) {
+        let width = strokeWidth * unit
+        context.saveGState()
+        setShadow(unit: unit, in: context)
+        context.setStrokeColor(inkColor)
+        context.setLineWidth(width)
+        context.setLineJoin(.round)
+        context.stroke(rect.insetBy(dx: width / 2, dy: width / 2))
+        context.restoreGState()
     }
 
     private static func draw(
