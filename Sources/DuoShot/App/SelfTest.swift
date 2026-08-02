@@ -113,6 +113,7 @@ enum SelfTest {
         /// in order, onto the clipboard.
         case copyText(directory: URL)
         case sensitiveText(directory: URL)
+        case gif(directory: URL)
         /// The share pipeline against a local `wrangler dev`. Endpoint and token
         /// are arguments, never Settings: a test that read the live
         /// configuration would upload to the real bucket.
@@ -176,6 +177,9 @@ enum SelfTest {
                     directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-sensitive":
                 self = .sensitiveText(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
+            case "--selftest-gif":
+                self = .gif(
                     directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-share":
                 let configured = rest.contains("--configured")
@@ -361,6 +365,7 @@ enum SelfTest {
             case .editMenu: return await editMenuCheck()
             case .copyText(let d): return try await copyTextCheck(into: d)
             case .sensitiveText(let d): return try await sensitiveTextCheck(into: d)
+            case .gif(let d): return try await gifCheck(into: d)
             case .shareCard(let d): return try await shareCardStates(into: d)
             case .shareCredentials: return await ShareSelfTest.credentials()
             case .shareFlow: return await ShareFlowSelfTest.run()
@@ -1291,6 +1296,188 @@ enum SelfTest {
         let labels = ["Email", "Host", "Card"].filter { reread.contains($0) }
         check("while the words beside them still are", labels.count >= 2,
               "\(labels.count) of 3 labels survived: \(labels.joined(separator: ","))")
+
+        print("result:        \(failures == 0 ? "PASS" : "FAIL (\(failures))")")
+        return failures == 0 ? 0 : 1
+    }
+
+    /// A clip whose colour says what second it is: solid red for the first,
+    /// green for the second, blue for the third.
+    ///
+    /// Synthesised rather than recorded, unlike `--selftest-trim`'s fixture. A
+    /// GIF's whole job is to play the right frames in the right order at the
+    /// right speed, and a recording of whatever happened to be on screen cannot
+    /// answer any of those three. This can: frame 5 must be red, frame 15 green,
+    /// frame 25 blue, and no amount of arithmetic error survives that.
+    private static func colourClip(
+        to url: URL, seconds: Int, size: CGSize
+    ) async throws -> [(second: Int, colour: (r: UInt8, g: UInt8, b: UInt8))] {
+        try? FileManager.default.removeItem(at: url)
+        let palette: [(r: UInt8, g: UInt8, b: UInt8)] = [
+            (230, 30, 30), (30, 200, 60), (40, 70, 235),
+            (240, 200, 20), (200, 40, 200), (30, 210, 210),
+        ]
+        let width = Int(size.width)
+        let height = Int(size.height)
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+        ])
+        input.expectsMediaDataInRealTime = false
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height,
+            ])
+        writer.add(input)
+        writer.startWriting()
+        writer.startSession(atSourceTime: .zero)
+
+        let fps = 30
+        for frame in 0..<(seconds * fps) {
+            let colour = palette[(frame / fps) % palette.count]
+            guard let pool = adaptor.pixelBufferPool else { break }
+            var buffer: CVPixelBuffer?
+            CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer)
+            guard let buffer else { break }
+            CVPixelBufferLockBaseAddress(buffer, [])
+            if let base = CVPixelBufferGetBaseAddress(buffer) {
+                let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
+                let bytes = base.assumingMemoryBound(to: UInt8.self)
+                for row in 0..<height {
+                    for column in 0..<width {
+                        let i = row * rowBytes + column * 4
+                        bytes[i] = colour.b
+                        bytes[i + 1] = colour.g
+                        bytes[i + 2] = colour.r
+                        bytes[i + 3] = 255
+                    }
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(buffer, [])
+            while !input.isReadyForMoreMediaData {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            adaptor.append(
+                buffer,
+                withPresentationTime: CMTime(value: CMTimeValue(frame), timescale: CMTimeScale(fps)))
+        }
+        input.markAsFinished()
+        await writer.finishWriting()
+        return (0..<seconds).map { ($0, palette[$0 % palette.count]) }
+    }
+
+    /// `--selftest-gif`
+    private static func gifCheck(into directory: URL) async throws -> Int32 {
+        var failures = 0
+        func check(_ label: String, _ passed: Bool, _ detail: String = "") {
+            print("  \(passed ? "PASS" : "FAIL") \(label)\(detail.isEmpty ? "" : " — \(detail)")")
+            if !passed { failures += 1 }
+        }
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+
+        // Deliberately larger than `maximumEdge` in both directions, so the cap
+        // is exercised rather than assumed.
+        let clip = directory.appendingPathComponent("gif-source.mp4")
+        let seconds = 3
+        let expected = try await colourClip(
+            to: clip, seconds: seconds, size: CGSize(width: 1600, height: 900))
+        guard FileManager.default.fileExists(atPath: clip.path) else {
+            print("result:        INCONCLUSIVE — the fixture clip could not be written")
+            return 0
+        }
+
+        let destination = GIFExport.url(besides: clip)
+        try? FileManager.default.removeItem(at: destination)
+        let outcome = try await GIFExport.write(clip, to: destination)
+        print("wrote:         \(outcome.url.lastPathComponent) "
+            + String(format: "%d frames, %.0f×%.0f, %.1fs, %d bytes",
+                     outcome.frames, outcome.pixelSize.width, outcome.pixelSize.height,
+                     outcome.seconds, fileSize(outcome.url)))
+
+        check("it goes beside the recording, not over it",
+              destination != clip && FileManager.default.fileExists(atPath: clip.path))
+
+        guard let source = CGImageSourceCreateWithURL(destination as CFURL, nil) else {
+            check("the file is readable as an image", false, "no source")
+            print("result:        FAIL (\(failures + 1))")
+            return 1
+        }
+        check("it is a GIF",
+              (CGImageSourceGetType(source) as String?) == UTType.gif.identifier,
+              (CGImageSourceGetType(source) as String?) ?? "no type")
+
+        let count = CGImageSourceGetCount(source)
+        check("one frame per tenth of a second",
+              count == seconds * Int(GIFExport.frameRate),
+              "\(count) frames for \(seconds)s at \(Int(GIFExport.frameRate))fps")
+
+        // Capped, and not stretched to fill the cap: 1600×900 must come back at
+        // 16:9 with its long edge at 720, rather than 720×720 or 1600×900.
+        //
+        // Not asserted as exactly 720×405. The generator rounds to even pixel
+        // dimensions -- 405 is odd, so it lands on 404 -- and that is
+        // AVFoundation's business rather than a property of this feature. The
+        // ratio is the invariant; a pixel of rounding is not.
+        let ratio = outcome.pixelSize.width / max(outcome.pixelSize.height, 1)
+        check("the longest edge is capped without stretching",
+              max(outcome.pixelSize.width, outcome.pixelSize.height) <= GIFExport.maximumEdge
+                && max(outcome.pixelSize.width, outcome.pixelSize.height) > 700
+                && abs(ratio - 16.0 / 9) < 0.02,
+              String(format: "%.0f×%.0f, ratio %.3f vs %.3f",
+                     outcome.pixelSize.width, outcome.pixelSize.height, ratio, 16.0 / 9))
+
+        let fileProperties = CGImageSourceCopyProperties(source, nil) as? [CFString: Any]
+        let gifProperties = fileProperties?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
+        check("it loops forever",
+              (gifProperties?[kCGImagePropertyGIFLoopCount] as? Int) == 0,
+              "loopCount=\(gifProperties?[kCGImagePropertyGIFLoopCount].map { "\($0)" } ?? "none")")
+
+        let frameProperties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+            as? [CFString: Any]
+        let frameGIF = frameProperties?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
+        let delay = frameGIF?[kCGImagePropertyGIFUnclampedDelayTime] as? Double
+        // The delay browsers will not silently round up. 0.083 would have been
+        // written as 0.1 by every viewer and the clip would run long.
+        check("each frame waits a tenth of a second",
+              delay.map { abs($0 - 0.1) < 0.001 } ?? false,
+              delay.map { String(format: "%.3fs", $0) } ?? "none")
+
+        // MARK: the frames are the right frames, in the right order
+        //
+        // Everything above is satisfied by a GIF of thirty identical frames.
+        // This is not: the fixture's colour says which second it came from, so
+        // sampling the middle of each second proves both the sampling times and
+        // the ordering.
+        var wrong: [String] = []
+        for (second, colour) in expected {
+            let index = second * Int(GIFExport.frameRate) + Int(GIFExport.frameRate) / 2
+            guard index < count,
+                  let frame = CGImageSourceCreateImageAtIndex(source, index, nil) else {
+                wrong.append("frame \(index) missing")
+                continue
+            }
+            let bytes = rgba(of: frame)
+            let middle = ((frame.height / 2) * frame.width + frame.width / 2) * 4
+            let got = (r: Int(bytes[middle]), g: Int(bytes[middle + 1]), b: Int(bytes[middle + 2]))
+            // Generous: h264 is lossy and a GIF is quantised to 256 colours, so
+            // the question is which of six well-separated colours this is, not
+            // whether the channel survived exactly.
+            let near = abs(got.r - Int(colour.r)) < 40
+                && abs(got.g - Int(colour.g)) < 40
+                && abs(got.b - Int(colour.b)) < 40
+            if !near {
+                wrong.append("second \(second): wanted \(colour.r),\(colour.g),\(colour.b) "
+                    + "got \(got.r),\(got.g),\(got.b)")
+            }
+        }
+        check("every second of the clip lands on the right frame", wrong.isEmpty,
+              wrong.joined(separator: "; "))
 
         print("result:        \(failures == 0 ? "PASS" : "FAIL (\(failures))")")
         return failures == 0 ? 0 : 1

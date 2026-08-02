@@ -59,6 +59,7 @@ final class VideoTrimEditor: NSView {
         addSubview(playerView)
 
         bar.onTrim = { [weak self] in self?.beginTrimming() }
+        bar.onGIF = { [weak self] in self?.exportGIF() }
         addSubview(bar)
         addSubview(notice)
         notice.isHidden = true
@@ -137,6 +138,53 @@ final class VideoTrimEditor: NSView {
         needsLayout = true
         guard let range else { return }
         apply(range)
+    }
+
+    /// Writes an animated GIF beside the recording.
+    ///
+    /// Beside, not over, and that is the difference from Trim: this is a lossy
+    /// copy made for somewhere that will not play an MP4, and the take itself is
+    /// still the real thing. So there is no confirmation to give -- nothing can
+    /// be lost -- and the notice says where the file went rather than what it
+    /// cost.
+    ///
+    /// Shares `isExporting` with the trim. Two writers of this recording at once
+    /// is the state neither of them is written to survive, and the GIF reading
+    /// frames out of a file the trim is replacing is precisely that.
+    private func exportGIF() {
+        guard !isExporting else { return }
+        isExporting = true
+        bar.setBusy(true, saying: "Making a GIF…")
+        let destination = GIFExport.url(besides: url)
+        Task { [weak self, url] in
+            defer {
+                self?.isExporting = false
+                self?.bar.setBusy(false)
+            }
+            do {
+                let outcome = try await GIFExport.write(url, to: destination)
+                guard let self else { return }
+                self.notice.show(
+                    message: "\(outcome.frames) frames as "
+                        + "\(outcome.url.lastPathComponent) — "
+                        + String(format: "%.0f×%.0f, %.1fs",
+                                 outcome.pixelSize.width, outcome.pixelSize.height,
+                                 outcome.seconds)
+                        + ". The recording itself is untouched.",
+                    action: ("Show in Finder", {
+                        NSWorkspace.shared.activateFileViewerSelecting([outcome.url])
+                    }),
+                    symbol: "folder")
+                self.showNotice()
+            } catch {
+                let reason = (error as? LocalizedError)?.errorDescription
+                    ?? "The GIF could not be written."
+                Log.app.error("gif export: \(reason, privacy: .public)")
+                NSSound.beep()
+                self?.notice.show(message: reason, action: nil)
+                self?.showNotice()
+            }
+        }
     }
 
     /// Where the handles were left.
@@ -257,6 +305,7 @@ final class VideoTrimEditor: NSView {
 /// this to ask.
 private final class TrimBar: NSView {
     var onTrim: () -> Void = {}
+    var onGIF: () -> Void = {}
 
     private let content: NSView
     /// Not red, where `EditToolbar`'s Apply is: this button destroys nothing —
@@ -265,9 +314,15 @@ private final class TrimBar: NSView {
     /// spend the warning on the harmless half.
     private let trim = HUDPill(
         title: "Trim", mark: .symbol("scissors"), tint: NSColor(white: 1, alpha: 0.16))
+    /// Beside Trim rather than in a menu the video viewer does not have. It
+    /// writes a new file and touches nothing, so it is as untinted as Trim.
+    private let gif = HUDPill(
+        title: "GIF", mark: .symbol("square.stack.3d.down.right"),
+        tint: NSColor(white: 1, alpha: 0.16))
     private let hint = NSTextField(labelWithString: "Rewriting the recording…")
 
     private var isBusy = false
+    private var busyMessage = "Rewriting the recording…" 
 
     init() {
         let box = CGRect(x: 0, y: 0, width: 200, height: HUDMetrics.height)
@@ -284,15 +339,23 @@ private final class TrimBar: NSView {
 
         trim.onClick = { [weak self] in self?.onTrim() }
         content.addSubview(trim)
+        gif.onClick = { [weak self] in self?.onGIF() }
+        content.addSubview(gif)
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    func setBusy(_ busy: Bool) {
+    func setBusy(_ busy: Bool, saying message: String = "Rewriting the recording…") {
         isBusy = busy
+        if busy, message != busyMessage {
+            busyMessage = message
+            hint.stringValue = message
+            hint.sizeToFit()
+        }
         hint.isHidden = !busy
         trim.setLive(!busy, animated: false)
+        gif.setLive(!busy, animated: false)
         // The superview, not just this view: `fittingSize` is the one thing here
         // that depends on the state, and the only code that ever applies it is
         // `VideoTrimEditor.layout()`. Marking only this view laid the button out
@@ -306,6 +369,7 @@ private final class TrimBar: NSView {
 
     override var fittingSize: NSSize {
         var width = HUDMetrics.margin * 2 + trim.frame.width
+            + HUDMetrics.groupGap + gif.frame.width
         if isBusy { width += hint.frame.width + HUDMetrics.groupGap }
         return CGSize(width: width.rounded(), height: HUDMetrics.height)
     }
@@ -318,7 +382,9 @@ private final class TrimBar: NSView {
                 x: x, y: ((HUDMetrics.height - hint.frame.height) / 2).rounded()))
             x += hint.frame.width + HUDMetrics.groupGap
         }
-        trim.setFrameOrigin(CGPoint(
-            x: x, y: ((HUDMetrics.height - HUDMetrics.controlHeight) / 2).rounded()))
+        let y = ((HUDMetrics.height - HUDMetrics.controlHeight) / 2).rounded()
+        trim.setFrameOrigin(CGPoint(x: x, y: y))
+        x += trim.frame.width + HUDMetrics.groupGap
+        gif.setFrameOrigin(CGPoint(x: x, y: y))
     }
 }
