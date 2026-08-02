@@ -43,6 +43,7 @@ final class OverlayController {
     /// it has settings that belong to the take, and no way to undo starting one
     /// — so it gets a step where the selection is final but nothing has begun.
     private var requiresConfirmation = false
+    private var toolbarStyle: SelectionToolbarView.Style = .record
     private var isArmed = false
     /// What `hidesOverlayFromCapture` said when this presentation began.
     private var hidden = true
@@ -191,7 +192,8 @@ final class OverlayController {
     }
 
     func present(
-        windows: [WindowInfo], suggestsWindows: Bool = true, requiresConfirmation: Bool = false
+        windows: [WindowInfo], suggestsWindows: Bool = true, requiresConfirmation: Bool = false,
+        toolbarStyle: SelectionToolbarView.Style = .record
     ) async -> Outcome {
         if isPresenting { tearDown() }
         // A bar handed over by a previous presentation and never claimed would be
@@ -205,6 +207,7 @@ final class OverlayController {
 
         self.suggestsWindows = suggestsWindows
         self.requiresConfirmation = requiresConfirmation
+        self.toolbarStyle = toolbarStyle
         isArmed = false
         model.reset()
 
@@ -506,7 +509,7 @@ final class OverlayController {
         isArmed = true
         views.forEach { $0.isArmed = true }
         guard let screen = ScreenIndex.screen(for: displayID) ?? NSScreen.main else { return }
-        toolbar.show(under: rect, on: screen, hiddenFromCapture: hidden)
+        toolbar.show(under: rect, on: screen, hiddenFromCapture: hidden, style: toolbarStyle)
         Log.overlay.notice("selection armed \(self.rectString(rect), privacy: .public)")
     }
 

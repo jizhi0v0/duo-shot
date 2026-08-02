@@ -44,6 +44,7 @@ final class Preferences {
         static let recordingShowsClicks = "recordingShowsClicks"
         static let recordingFrameRate = "recordingFrameRate"
         static let hotkeys = "hotkeys.v1"
+        static let seenHotkeyActions = "hotkeys.seenActions.v1"
     }
 
     // MARK: - Stored settings
@@ -261,12 +262,42 @@ final class Preferences {
 
         if let data = defaults.data(forKey: Key.hotkeys),
            let decoded = try? JSONDecoder().decode([HotKeyAction: KeyCombo].self, from: data) {
-            hotkeys = decoded
+            let seen = defaults.stringArray(forKey: Key.seenHotkeyActions)
+                .map { Set($0.compactMap(HotKeyAction.init(rawValue:))) }
+            hotkeys = Self.migratedHotkeys(decoded, seen: seen)
         } else {
             hotkeys = HotKeyAction.allCases.reduce(into: [:]) { result, action in
                 if let combo = action.defaultCombo { result[action] = combo }
             }
         }
+        defaults.set(HotKeyAction.allCases.map(\.rawValue), forKey: Key.seenHotkeyActions)
+        if let data = try? JSONEncoder().encode(hotkeys) {
+            defaults.set(data, forKey: Key.hotkeys)
+        }
+    }
+
+    /// Gives a *newly introduced* action its default combo without disturbing
+    /// anything the user chose. `bind(nil, to:)` stores a cleared binding as
+    /// absence, so absence alone cannot distinguish "cleared on purpose" from
+    /// "did not exist when this dictionary was written" — that is what the
+    /// seen-actions ledger is for. An action the ledger has recorded is never
+    /// touched; an unseen one gets its default only if no existing binding
+    /// already holds that combo (never steals, never resurrects).
+    ///
+    /// A nil ledger means the ledger predates itself: every action that shipped
+    /// before the ledger did is treated as seen.
+    nonisolated static func migratedHotkeys(
+        _ decoded: [HotKeyAction: KeyCombo], seen: Set<HotKeyAction>?
+    ) -> [HotKeyAction: KeyCombo] {
+        let seen = seen ?? Set(HotKeyAction.allCases.filter { $0 != .captureScrolling })
+        var result = decoded
+        let taken = Set(decoded.values)
+        for action in HotKeyAction.allCases where !seen.contains(action) {
+            guard result[action] == nil,
+                  let combo = action.defaultCombo, !taken.contains(combo) else { continue }
+            result[action] = combo
+        }
+        return result
     }
 
     // MARK: - Derived

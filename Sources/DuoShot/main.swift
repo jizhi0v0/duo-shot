@@ -48,6 +48,8 @@ if let mode = SelfTest.Mode(arguments: arguments) {
           --selftest-preview <dir> [--sharing-default]
           --selftest-window <dir>
           --selftest-fullscreen <dir>
+          --selftest-scroll-stitch <dir> [--broken]
+          --selftest-scroll-flow <dir>
           --selftest-microphone
           --selftest-record <dir> [--seconds N] [--rect <x,y,w,h>] [--fps N]
                                   [--no-audio] [--mic]

@@ -20,6 +20,37 @@ final class SelectionToolbarView: NSView {
         var resized: () -> Void = {}
     }
 
+    /// What the armed selection is *for*, which decides the bar's controls.
+    /// `.scroll` is only the start pill: a scrolling capture has no audio to
+    /// configure, and the absent controls are genuinely absent — a hidden
+    /// control still hit-tests, which is how a hidden pill once ate the click
+    /// meant for the one beside it.
+    enum Style {
+        case record
+        case scroll
+
+        var pillTitle: String {
+            switch self {
+            case .record: "Record"
+            case .scroll: "Start"
+            }
+        }
+
+        var pillTint: NSColor {
+            switch self {
+            case .record: .systemRed
+            case .scroll: .systemBlue
+            }
+        }
+
+        var pillToolTip: String {
+            switch self {
+            case .record: "Start recording  ⏎"
+            case .scroll: "Start the scrolling capture  ⏎"
+            }
+        }
+    }
+
     private static let margin = HUDMetrics.margin
     private static let toggleWidth = HUDMetrics.iconWidth
     private static let chevronWidth: CGFloat = 14
@@ -27,13 +58,13 @@ final class SelectionToolbarView: NSView {
     private static let gap: CGFloat = 6
     private static let groupGap = HUDMetrics.groupGap
     private static let height = HUDMetrics.height
-    private static let recordTitle = "Record"
     private static let deviceFont = NSFont.systemFont(ofSize: 11, weight: .regular)
     /// The device name is elided past this. "MacBook Pro Microphone" is already
     /// long, and a USB interface's name can be far longer — the bar has to stay
     /// something that fits under a selection.
     private static let deviceMaxWidth: CGFloat = 132
 
+    private let style: Style
     private var callbacks: Callbacks
     private var microphoneButton: NSButton!
     private var deviceButton: NSButton!
@@ -44,7 +75,8 @@ final class SelectionToolbarView: NSView {
 
     private var preferences: Preferences { .shared }
 
-    init(callbacks: Callbacks) {
+    init(callbacks: Callbacks, style: Style = .record) {
+        self.style = style
         self.callbacks = callbacks
         super.init(frame: CGRect(x: 0, y: 0, width: 240, height: Self.height))
         wantsLayer = true
@@ -58,6 +90,14 @@ final class SelectionToolbarView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     private func buildSubviews() {
+        if style == .scroll {
+            pill = HUDPill(title: style.pillTitle, mark: .dot, tint: style.pillTint)
+            pill.toolTip = style.pillToolTip
+            pill.onClick = { [weak self] in self?.callbacks.start() }
+            addSubview(pill)
+            return
+        }
+
         microphoneButton = button(action: #selector(toggleMicrophone))
         addSubview(microphoneButton)
 
@@ -88,8 +128,8 @@ final class SelectionToolbarView: NSView {
         divider.layer?.backgroundColor = NSColor(white: 1, alpha: 0.18).cgColor
         addSubview(divider)
 
-        pill = HUDPill(title: Self.recordTitle, mark: .dot, tint: .systemRed)
-        pill.toolTip = "Start recording  ⏎"
+        pill = HUDPill(title: style.pillTitle, mark: .dot, tint: style.pillTint)
+        pill.toolTip = style.pillToolTip
         pill.onClick = { [weak self] in self?.callbacks.start() }
         addSubview(pill)
     }
@@ -107,6 +147,11 @@ final class SelectionToolbarView: NSView {
     /// Redraws both toggles from the preferences they write to, then re-lays out
     /// — the device name changes the bar's width.
     func refresh() {
+        if style == .scroll {
+            layoutControls()
+            return
+        }
+
         let granted = MicrophonePermission.isGranted
         let micOn = granted && preferences.recordingMicrophone
         microphoneButton.image = HUDMetrics.symbol(micOn ? "mic.fill" : "mic.slash.fill", pointSize: 13)
@@ -145,6 +190,18 @@ final class SelectionToolbarView: NSView {
         let y = ((Self.height - Self.controlHeight) / 2).rounded()
         var x = Self.margin
 
+        if style == .scroll {
+            let pillWidth = HUDPill.width(for: style.pillTitle)
+            pill.frame = CGRect(x: x, y: y, width: pillWidth, height: Self.controlHeight)
+            x += pillWidth + Self.margin
+            let size = CGSize(width: x.rounded(.up), height: Self.height)
+            if frame.size != size {
+                setFrameSize(size)
+                callbacks.resized()
+            }
+            return
+        }
+
         microphoneButton.frame = CGRect(
             x: x, y: y, width: Self.toggleWidth, height: Self.controlHeight)
         x += Self.toggleWidth
@@ -167,7 +224,7 @@ final class SelectionToolbarView: NSView {
         divider.frame = CGRect(x: x, y: y + 4, width: 1, height: Self.controlHeight - 8)
         x += 1 + Self.groupGap
 
-        let pillWidth = HUDPill.width(for: Self.recordTitle)
+        let pillWidth = HUDPill.width(for: style.pillTitle)
         pill.frame = CGRect(x: x, y: y, width: pillWidth, height: Self.controlHeight)
         x += pillWidth + Self.margin
 
@@ -262,13 +319,18 @@ final class SelectionToolbar {
     /// Places the bar under `selection`, or above it when there is no room
     /// below — a selection dragged to the bottom of the screen is the common
     /// case, not an edge case.
-    /// `hiddenFromCapture` is decided per presentation by `OverlayController`.
-    func show(under selection: CGRect, on screen: NSScreen, hiddenFromCapture: Bool = true) {
+    /// `hiddenFromCapture` is decided per presentation by `OverlayController`,
+    /// and so is `style` — the bar for a recording and the bar for a scrolling
+    /// capture differ only in their controls, not their window.
+    func show(
+        under selection: CGRect, on screen: NSScreen, hiddenFromCapture: Bool = true,
+        style: SelectionToolbarView.Style = .record
+    ) {
         if panel == nil {
             var callbacks = SelectionToolbarView.Callbacks()
             callbacks.start = { [weak self] in self?.onStart() }
             callbacks.resized = { [weak self] in self?.applySize() }
-            let view = SelectionToolbarView(callbacks: callbacks)
+            let view = SelectionToolbarView(callbacks: callbacks, style: style)
             let created = FloatingBarPanel(
                 role: .selection, size: view.frame.size,
                 hiddenFromCapture: hiddenFromCapture)

@@ -153,9 +153,12 @@ enum ShareFlowSelfTest {
         // at their controller weakly, so inspecting the menu of an
         // already-deallocated controller would be checking rows whose targets
         // are gone -- and the compiler rightly warned about exactly that.
+        let coordinator = CaptureCoordinator()
         let statusController = StatusItemController(
-            coordinator: CaptureCoordinator(),
-            recorder: RecordingCoordinator(overlay: OverlayController()))
+            coordinator: coordinator,
+            recorder: RecordingCoordinator(overlay: coordinator.overlay),
+            scroller: ScrollCaptureCoordinator(
+                engine: coordinator.engine, overlay: coordinator.overlay))
         let menu = statusController.menuForTest()
         let recent = menu.items.first { $0.title == "Recent Links" }
         check("menu bar has a Recent Links submenu", recent != nil)

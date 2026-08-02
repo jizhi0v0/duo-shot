@@ -8,6 +8,7 @@ nonisolated enum HotKeyAction: String, CaseIterable, Codable, Sendable {
     case captureLastArea
     case recordArea
     case recordFullscreen
+    case captureScrolling
 
     var title: String {
         switch self {
@@ -17,15 +18,19 @@ nonisolated enum HotKeyAction: String, CaseIterable, Codable, Sendable {
         case .captureLastArea: "Capture Previous Area"
         case .recordArea: "Record Area"
         case .recordFullscreen: "Record Fullscreen"
+        case .captureScrolling: "Scrolling Capture"
         }
     }
 
     /// True for the actions that toggle: pressing the same key while a recording
-    /// runs stops it rather than starting a second one.
+    /// runs stops it rather than starting a second one. `captureScrolling` also
+    /// toggles, but its toggle lives in `ScrollCaptureCoordinator` — this flag
+    /// doubles as "routes to `RecordingCoordinator`", which must keep refusing it.
     var isRecording: Bool {
         switch self {
         case .recordArea, .recordFullscreen: true
-        case .captureArea, .captureWindow, .captureFullscreen, .captureLastArea: false
+        case .captureArea, .captureWindow, .captureFullscreen, .captureLastArea,
+             .captureScrolling: false
         }
     }
 
@@ -41,6 +46,8 @@ nonisolated enum HotKeyAction: String, CaseIterable, Codable, Sendable {
             KeyCombo(keyCode: UInt16(kVK_ANSI_S), modifiers: [.shift, .command])
         case .recordArea:
             KeyCombo(keyCode: UInt16(kVK_ANSI_Y), modifiers: [.shift, .command])
+        case .captureScrolling:
+            KeyCombo(keyCode: UInt16(kVK_ANSI_L), modifiers: [.shift, .command])
         case .captureFullscreen, .captureLastArea, .recordFullscreen:
             nil
         }

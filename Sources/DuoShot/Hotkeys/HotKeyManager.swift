@@ -17,19 +17,22 @@ final class HotKeyManager {
     static let shared = HotKeyManager()
 
     struct Registration {
-        let action: HotKeyAction
+        /// nil for a transient binding — one a live session owns only while it
+        /// runs, with no `HotKeyAction` (and so no Settings row) behind it.
+        let action: HotKeyAction?
         let combo: KeyCombo
         let reference: EventHotKeyRef
         let handler: () -> Void
     }
 
     enum RegistrationError: Error, LocalizedError {
-        case alreadyBound(to: HotKeyAction)
+        case alreadyBound(to: HotKeyAction?)
         case carbon(OSStatus)
 
         var errorDescription: String? {
             switch self {
-            case .alreadyBound(let action): "already used by \(action.title)"
+            case .alreadyBound(let action):
+                "already used by \(action?.title ?? "a running session")"
             case .carbon(let status): "RegisterEventHotKey failed (\(status))"
             }
         }
@@ -58,7 +61,8 @@ final class HotKeyManager {
 
     fileprivate func handle(id: UInt32) {
         guard let registration = registrations[id] else { return }
-        Log.hotkeys.notice("fired \(registration.action.rawValue, privacy: .public)")
+        Log.hotkeys.notice(
+            "fired \(registration.action?.rawValue ?? "transient", privacy: .public)")
         registration.handler()
     }
 
@@ -67,6 +71,24 @@ final class HotKeyManager {
     @discardableResult
     func register(
         _ action: HotKeyAction, combo: KeyCombo, handler: @escaping () -> Void
+    ) throws -> UInt32 {
+        try register(action: action, combo: combo, handler: handler)
+    }
+
+    /// A binding with no action behind it, for a key a live session owns only
+    /// for its duration — the scrolling capture's Escape. Invisible to
+    /// `combo(for:)` and `unregister(_ action:)`: the caller keeps the returned
+    /// id and must release it on every exit path, or the key stays eaten
+    /// globally after the session is gone.
+    @discardableResult
+    func registerTransient(
+        _ combo: KeyCombo, handler: @escaping () -> Void
+    ) throws -> UInt32 {
+        try register(action: nil, combo: combo, handler: handler)
+    }
+
+    private func register(
+        action: HotKeyAction?, combo: KeyCombo, handler: @escaping () -> Void
     ) throws -> UInt32 {
         if let existing = registrations.first(where: { $0.value.combo == combo }) {
             throw RegistrationError.alreadyBound(to: existing.value.action)
@@ -88,7 +110,7 @@ final class HotKeyManager {
         registrations[id] = Registration(
             action: action, combo: combo, reference: reference, handler: handler)
         Log.hotkeys.notice("""
-            registered \(action.rawValue, privacy: .public) \
+            registered \(action?.rawValue ?? "transient", privacy: .public) \
             as \(combo.displayString, privacy: .public)
             """)
         return id

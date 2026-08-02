@@ -5,6 +5,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private let coordinator: CaptureCoordinator
     private let recorder: RecordingCoordinator
+    private let scroller: ScrollCaptureCoordinator
     /// Just the URLs, not the `OutputPipeline.Output` they came in.
     ///
     /// That struct carries the whole `CaptureResult`, and with it the CGImage —
@@ -22,9 +23,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     var onOpenSettings: () -> Void = {}
 
-    init(coordinator: CaptureCoordinator, recorder: RecordingCoordinator) {
+    init(
+        coordinator: CaptureCoordinator, recorder: RecordingCoordinator,
+        scroller: ScrollCaptureCoordinator
+    ) {
         self.coordinator = coordinator
         self.recorder = recorder
+        self.scroller = scroller
         super.init()
     }
 
@@ -274,6 +279,29 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             menu.addItem(.separator())
         }
 
+        // While a scrolling capture is running, same reasoning as the recording
+        // menu below: the only things worth offering are the ways to end it —
+        // and they matter more here, because if the transient Esc registration
+        // was lost this menu is the fallback that still works.
+        if scroller.isCapturing {
+            let finish = NSMenuItem(
+                title: "Finish Scrolling Capture", action: #selector(finishScrolling),
+                keyEquivalent: "")
+            finish.target = self
+            menu.addItem(finish)
+            let cancel = NSMenuItem(
+                title: "Cancel Scrolling Capture", action: #selector(cancelScrolling),
+                keyEquivalent: "")
+            cancel.target = self
+            menu.addItem(cancel)
+            menu.addItem(.separator())
+            let quit = NSMenuItem(
+                title: "Quit DuoShot", action: #selector(NSApplication.terminate(_:)),
+                keyEquivalent: "q")
+            menu.addItem(quit)
+            return menu
+        }
+
         // While a take is running the only thing worth offering is ending it.
         // A menu full of capture actions that all silently refuse is worse than
         // a short menu.
@@ -303,6 +331,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         // It stays on its hotkey, where the pointer is wherever the user left it.
         var actions: [HotKeyAction] = [.captureArea, .captureFullscreen]
         if coordinator.hasPreviousArea { actions.append(.captureLastArea) }
+        // Menu-safe, unlike `.captureWindow`: it opens a selection, so where
+        // the pointer was when the menu closed does not matter.
+        actions.append(.captureScrolling)
         actions.append(contentsOf: [.recordArea, .recordFullscreen])
         for action in actions {
             let item = NSMenuItem(
@@ -369,17 +400,42 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     func perform(_ action: HotKeyAction) async {
         switch action {
+        // The one-shot captures refuse to run over a live scrolling session:
+        // an overlay or an instant capture would fight the session's frame
+        // loop for the screen. The session's own chrome is how it ends.
         case .captureArea:
+            guard !scroller.isActive else { NSSound.beep(); return }
             await coordinator.captureArea()
         case .captureWindow:
+            guard !scroller.isActive else { NSSound.beep(); return }
             await coordinator.captureWindow()
         case .captureFullscreen:
+            guard !scroller.isActive else { NSSound.beep(); return }
             await coordinator.captureDisplay()
         case .captureLastArea:
+            guard !scroller.isActive else { NSSound.beep(); return }
             await coordinator.captureLastArea()
         case .recordArea, .recordFullscreen:
+            guard !scroller.isActive else { NSSound.beep(); return }
             await recorder.perform(action)
+        case .captureScrolling:
+            // Mutual: one screen, one session that owns it at a time.
+            guard !recorder.hasTakeInFlight else { NSSound.beep(); return }
+            await scroller.perform(action)
         }
+    }
+
+    @objc private func finishScrolling() {
+        Task { await self.scroller.finish() }
+    }
+
+    @objc private func cancelScrolling() {
+        Task { await self.scroller.cancel() }
+    }
+
+    /// Rebuilds the menu around the session — the short menu while one runs.
+    func refreshScrollState() {
+        statusItem?.menu = buildMenu()
     }
 
     @objc private func stopRecording() {

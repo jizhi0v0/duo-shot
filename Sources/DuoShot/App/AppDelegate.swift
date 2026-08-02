@@ -8,8 +8,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// screen at a time, and two controllers each owning their own panels would
     /// be two ways to end up with a stranded one.
     private lazy var recorder = RecordingCoordinator(overlay: coordinator.overlay)
+    /// Shares the capture coordinator's engine and overlay for the same
+    /// one-selection-at-a-time reason as the recorder.
+    private lazy var scroller = ScrollCaptureCoordinator(
+        engine: coordinator.engine, overlay: coordinator.overlay)
     private lazy var statusItem = StatusItemController(
-        coordinator: coordinator, recorder: recorder)
+        coordinator: coordinator, recorder: recorder, scroller: scroller)
     private var isReauthorising = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -22,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         EditMenu.install()
         wireCoordinator()
         wireRecorder()
+        wireScroller()
         wireSettings()
 
         previews.timeout = .seconds(Preferences.shared.previewTimeout)
@@ -105,6 +110,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.reportRecordingLost(error)
         }
         recorder.onAuthorisationLost = { [weak self] in
+            Task { await self?.handleAuthorisationLost() }
+        }
+    }
+
+    private func wireScroller() {
+        // Same body as `coordinator.onResult`: a stitched capture is a capture,
+        // and everything downstream — staging, clipboard, card, editor — keys
+        // off the one `CaptureResult`.
+        scroller.onResult = { [weak self] result in
+            guard let self, let output = await OutputPipeline.shared.process(result)
+            else { return }
+            self.statusItem.noteOutput(output)
+            if Preferences.shared.showsPreviewOverlay {
+                self.previews.timeout = .seconds(Preferences.shared.previewTimeout)
+                await self.previews.present(output)
+            }
+        }
+        // A preview card from an earlier capture sitting inside the region
+        // would be stitched into every frame.
+        scroller.additionalExcludedWindowIDs = { [weak self] in
+            self?.previews.panelWindowIDs ?? []
+        }
+        scroller.onStateChanged = { [weak self] in
+            self?.statusItem.refreshScrollState()
+        }
+        scroller.onAuthorisationLost = { [weak self] in
             Task { await self?.handleAuthorisationLost() }
         }
     }

@@ -245,9 +245,15 @@ test: verify
 	run "card leaks unexcluded"  --selftest-preview-in-recording $(TEST_OUT) --seconds 3 --no-exclude; \
 	run "menu-bar item recorded" --selftest-record-hud $(TEST_OUT) --seconds 2 --status-item --hud-first; \
 	run "recording flow"         --selftest-record-flow $(TEST_OUT) --seconds 2; \
+	run "scroll stitcher"        --selftest-scroll-stitch $(TEST_OUT); \
+	run "scroll capture flow"    --selftest-scroll-flow $(TEST_OUT); \
 	printf '  %-26s ' "exclusion negative control"; \
 	if "$(EXEC)" --selftest-overlay 400,300,640,400 --sharing-default --no-exclude >/dev/null 2>&1; \
 		then echo "BROKEN — the control passed, so the exclusion test cannot fail"; fail=1; \
+		else echo "fails as required"; fi; \
+	printf '  %-26s ' "stitcher negative control"; \
+	if "$(EXEC)" --selftest-scroll-stitch $(TEST_OUT) --broken >/dev/null 2>&1; \
+		then echo "BROKEN — the control passed, so the stitch test cannot fail"; fail=1; \
 		else echo "fails as required"; fi; \
 	echo; \
 	if [ $$incon -gt 0 ]; then \

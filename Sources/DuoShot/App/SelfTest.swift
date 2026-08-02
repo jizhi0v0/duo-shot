@@ -121,6 +121,15 @@ enum SelfTest {
         case recordHUD(
             directory: URL, seconds: Double, sharingNone: Bool, hudFirst: Bool,
             plainWindow: Bool, statusItem: Bool, excludeIDs: Bool)
+        /// The scrolling-capture stitcher, headless: synthetic frames cut from a
+        /// source whose every row is unique, so a mis-measured shift cannot
+        /// produce the right pixels. `broken` is the negative control — it
+        /// sabotages the shift search and the run must FAIL.
+        case scrollStitch(directory: URL, broken: Bool)
+        /// The whole session against the live screen: a real window whose
+        /// content is scrolled programmatically while the real coordinator
+        /// loop captures and stitches it, ended through the ⌘⇧L toggle.
+        case scrollFlow(directory: URL)
 
         init?(arguments: [String]) {
             let rest = arguments.dropFirst()
@@ -255,6 +264,13 @@ enum SelfTest {
                     // does not exist when `SCContentFilter` is built cannot be
                     // named in it.
                     excludeIDs: rest.contains("--exclude-ids"))
+            case "--selftest-scroll-stitch":
+                self = .scrollStitch(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"),
+                    broken: rest.contains("--broken"))
+            case "--selftest-scroll-flow":
+                self = .scrollFlow(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-microphone":
                 self = .microphone
             case "--selftest-record":
@@ -359,6 +375,10 @@ enum SelfTest {
             case .soak(let iterations, let directory):
                 return try await soak(iterations: iterations, into: directory)
             case .microphone: return await microphoneCheck()
+            case .scrollStitch(let directory, let broken):
+                return try await scrollStitchCheck(into: directory, broken: broken)
+            case .scrollFlow(let directory):
+                return try await scrollFlowCheck(into: directory)
             case .recordFlow(let directory, let seconds):
                 return try await recordFlow(into: directory, seconds: seconds)
             case .recordHUD(let d, let seconds, let sharingNone, let hudFirst, let plain,
@@ -6390,6 +6410,38 @@ enum SelfTest {
             if owner != nil { failures.append("default binding \(defaultCombo.displayString) collides") }
         }
 
+        // 2b. The seen-actions migration. `bind(nil, to:)` stores a cleared
+        // binding as absence, so absence alone cannot tell "cleared on purpose"
+        // from "did not exist when this dictionary was written" — the ledger
+        // does, and these fixtures pin its three obligations: seed the new
+        // action, never resurrect, never steal.
+        let comboL = KeyCombo(keyCode: UInt16(kVK_ANSI_L), modifiers: [.shift, .command])
+        let legacy: [HotKeyAction: KeyCombo] = [.captureArea: combo]
+        let seeded = Preferences.migratedHotkeys(legacy, seen: nil)
+        print("migration:     pre-ledger dict -> captureScrolling "
+            + (seeded[.captureScrolling]?.displayString ?? "<unbound>"))
+        if seeded[.captureScrolling] != comboL {
+            failures.append("migration did not seed ⌘⇧L for the new action")
+        }
+        if seeded[.captureArea] != combo {
+            failures.append("migration disturbed an existing binding")
+        }
+        if seeded[.captureWindow] != nil {
+            failures.append("migration resurrected a binding cleared before the ledger existed")
+        }
+        let clearedAfterSeen = Preferences.migratedHotkeys(
+            legacy, seen: Set(HotKeyAction.allCases))
+        if clearedAfterSeen[.captureScrolling] != nil {
+            failures.append("migration resurrected a deliberately cleared ⌘⇧L")
+        }
+        let conflicted = Preferences.migratedHotkeys([.captureFullscreen: comboL], seen: nil)
+        if conflicted[.captureScrolling] != nil {
+            failures.append("migration bound ⌘⇧L twice")
+        }
+        if conflicted[.captureFullscreen] != comboL {
+            failures.append("migration stole the user's ⌘⇧L from captureFullscreen")
+        }
+
         // 3. Filename template. Literal runs must survive DateFormatter, which
         // treats every ASCII letter as a pattern character — " at " would
         // otherwise come out as an AM/PM marker.
@@ -6617,6 +6669,825 @@ enum SelfTest {
     /// callback is not — it fires from wherever the mutation happened.
     private nonisolated final class ObservationWitness: @unchecked Sendable {
         var fired = false
+    }
+
+    // MARK: - Scrolling capture
+
+    /// The stitcher against frames whose provenance is exact: every row of the
+    /// source is a unique colour, so the only way the output can equal the
+    /// source is for every measured shift to have been right. Headless — no
+    /// screen involved, so this can never be INCONCLUSIVE.
+    ///
+    /// `broken` sabotages the shift search inside the stitcher and the run must
+    /// FAIL; `make test` treats a green `--broken` run as BROKEN.
+    private static func scrollStitchCheck(into directory: URL, broken: Bool) async throws -> Int32 {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var failures: [String] = []
+        func check(_ condition: Bool, _ description: String) {
+            if !condition { failures.append(description) }
+        }
+
+        let width = 400
+        let frameRows = 600
+        let sourceRows = 3000
+        let step = 380
+        guard let source = uniqueRowImage(width: width, height: sourceRows) else {
+            print("could not build the source image")
+            return 2
+        }
+
+        /// Rows [offset, offset+frameRows) of the source, top-down — what a
+        /// capture of the region would see with the content scrolled by
+        /// `offset`. `stickyHeaderRows` paints a fixed banner over the top,
+        /// the shape of a pinned page header.
+        func frame(at offset: Int, stickyHeaderRows: Int = 0) -> CaptureResult? {
+            guard var image = source.cropping(to: CGRect(
+                x: 0, y: offset, width: width, height: frameRows)) else { return nil }
+            if stickyHeaderRows > 0 {
+                guard let bannered = paintingBanner(over: image, rows: stickyHeaderRows)
+                else { return nil }
+                image = bannered
+            }
+            return CaptureResult(
+                image: image,
+                pointSize: CGSize(width: CGFloat(width) / 2, height: CGFloat(frameRows) / 2),
+                scale: 2,
+                sourceDisplayID: CGMainDisplayID(),
+                sourceDescription: "stitch test",
+                capturedAt: Date())
+        }
+
+        // 1. The full run: seed, scroll in 380-row steps, land exactly on the
+        // bottom. Every verdict is asserted, then the finished picture is
+        // compared byte-for-byte against the unscrolled source.
+        var config = ScrollStitcher.Config()
+        config.brokenOverlapSearchForTest = broken
+        let stitcher = ScrollStitcher(config: config)
+        print("source:        \(width)×\(sourceRows), frames of \(frameRows) rows, step \(step)"
+            + (broken ? "  [BROKEN SEARCH]" : ""))
+
+        guard let first = frame(at: 0) else { return 2 }
+        let seeded = await stitcher.append(first)
+        check(seeded == .seeded, "first frame -> \(seeded), expected seeded")
+
+        var offset = 0
+        while offset < sourceRows - frameRows {
+            let next = min(offset + step, sourceRows - frameRows)
+            guard let capture = frame(at: next) else { return 2 }
+            let verdict = await stitcher.append(capture)
+            let expected = ScrollStitcher.Verdict.appended(
+                newRows: next - offset, totalRows: next + frameRows)
+            check(verdict == expected, "frame@\(next) -> \(verdict), expected \(expected)")
+            offset = next
+        }
+
+        // A frame that did not move, a frame scrolled back up through stitched
+        // content, a frame from a rescaled display. None of them may grow the
+        // canvas.
+        if let still = frame(at: offset) {
+            let verdict = await stitcher.append(still)
+            check(verdict == .skippedIdentical, "duplicate frame -> \(verdict)")
+        }
+        if let up = frame(at: offset - step) {
+            let verdict = await stitcher.append(up)
+            check(verdict == .repositioned(totalRows: sourceRows),
+                  "scrolled-up frame -> \(verdict), "
+                  + "expected repositioned(totalRows: \(sourceRows))")
+        }
+
+        // Recovery after losing the thread — the "no response after the Scroll
+        // slower hint" bug. A fling leaves a gap (rejected, correctly), and
+        // then the user goes back to somewhere already stitched: far from the
+        // last aligned frame, so frame-to-frame alignment cannot see it. The
+        // stitcher must relocate against the whole canvas and resume — and it
+        // must NOT "relocate" a frame whose content the canvas has never seen.
+        if let gone = frame(at: 0), let flung = frame(at: 2000) {
+            let gapped = ScrollStitcher()
+            _ = await gapped.append(flung)
+            let fling = await gapped.append(gone)
+            check(fling == .rejected(.cannotAlign),
+                  "a fling past the whole band -> \(fling)")
+        }
+        if let ret = frame(at: 600) {
+            // `stitcher` has the full source stitched and its last aligned
+            // frame at 2020; position 600 is over 1400 rows away — far outside
+            // frame-to-frame range, squarely inside the canvas.
+            let verdict = await stitcher.append(ret)
+            check(verdict == .repositioned(totalRows: sourceRows),
+                  "returning deep into stitched content -> \(verdict), "
+                  + "expected repositioned(totalRows: \(sourceRows))")
+        }
+        if let narrow = source.cropping(to: CGRect(x: 0, y: 0, width: 200, height: frameRows)) {
+            let verdict = await stitcher.append(CaptureResult(
+                image: narrow, pointSize: CGSize(width: 100, height: 300), scale: 2,
+                sourceDisplayID: CGMainDisplayID(), sourceDescription: "stitch test",
+                capturedAt: Date()))
+            check(verdict == .rejected(.mismatchedFrame), "narrow frame -> \(verdict)")
+        }
+
+        if let result = await stitcher.finalize(
+            sourceDisplayID: CGMainDisplayID(), sourceDescription: "Scrolling Capture") {
+            print("stitched:      \(result.image.width)×\(result.image.height) px, "
+                + "\(Int(result.pointSize.width))×\(Int(result.pointSize.height)) pt @\(Int(result.scale))x")
+            try? ImageEncoder.write(
+                result.image, to: directory.appendingPathComponent("scroll-stitch.png"), scale: 2)
+            check(result.image.width == width && result.image.height == sourceRows,
+                  "stitched size \(result.image.width)×\(result.image.height), "
+                  + "expected \(width)×\(sourceRows)")
+            if result.image.height == sourceRows {
+                let comparison = PixelCompare.compare(result.image, source)
+                print("pixel diff:    \(comparison.summary)")
+                check(comparison.identical, "stitched output differs from the source")
+            }
+        } else {
+            failures.append("finalize returned nil")
+        }
+
+        if !broken {
+            // 1a. Both directions. Start mid-document, scroll *up* (prepend),
+            // scroll back down through stitched content (reposition, no
+            // growth), then past the old frontier (append). The finished
+            // picture must equal the source strip exactly — any double-counted
+            // or dropped band changes the pixels.
+            let both = ScrollStitcher()
+            if let f380 = frame(at: 380), let f0 = frame(at: 0),
+               let f380b = frame(at: 380), let f760 = frame(at: 760) {
+                _ = await both.append(f380)
+                let upward = await both.append(f0)
+                check(upward == .appended(newRows: 380, totalRows: 980),
+                      "upward scroll -> \(upward), expected appended(newRows: 380, totalRows: 980)")
+                let back = await both.append(f380b)
+                check(back == .repositioned(totalRows: 980),
+                      "scrolling back down inside the stitch -> \(back)")
+                let past = await both.append(f760)
+                check(past == .appended(newRows: 380, totalRows: 1360),
+                      "past the old frontier -> \(past)")
+                if let result = await both.finalize(
+                    sourceDisplayID: CGMainDisplayID(), sourceDescription: "Scrolling Capture"),
+                   let expected = source.cropping(to: CGRect(
+                    x: 0, y: 0, width: width, height: 1360)) {
+                    let comparison = PixelCompare.compare(result.image, expected)
+                    print("both-way diff: \(comparison.summary)")
+                    check(comparison.identical, "both-way output differs from the source")
+                } else {
+                    failures.append("both-way finalize failed")
+                }
+            }
+
+            // 1b. Chat-shaped content — the case the unique-row source cannot
+            // represent, learned from a real mis-stitched capture (2026-08-02):
+            // text lines whose *segment means* are identical (same ink
+            // density) while their pixels differ, separated by flat
+            // background. Row signatures alone cannot tell a one-row shift
+            // from the true one here — only pixels can — so this is the leg
+            // that keeps the stitcher honest about verifying its shift.
+            let chatRows = 1600
+            if let chat = chatLikeImage(width: width, height: chatRows) {
+                func chatFrame(at offset: Int) -> CaptureResult? {
+                    guard let crop = chat.cropping(to: CGRect(
+                        x: 0, y: offset, width: width, height: frameRows)) else { return nil }
+                    return CaptureResult(
+                        image: crop,
+                        pointSize: CGSize(
+                            width: CGFloat(width) / 2, height: CGFloat(frameRows) / 2),
+                        scale: 2, sourceDisplayID: CGMainDisplayID(),
+                        sourceDescription: "stitch test", capturedAt: Date())
+                }
+                let chatStitcher = ScrollStitcher()
+                // 374, not a round number: six rows *up* from the last frame,
+                // with the frame's top rows flat — the phase where a wrong
+                // positive shift can align text lines class-for-class and only
+                // their pixels disagree.
+                if let f0 = chatFrame(at: 0), let f1 = chatFrame(at: 380),
+                   let up = chatFrame(at: 374) {
+                    _ = await chatStitcher.append(f0)
+                    let verdict = await chatStitcher.append(f1)
+                    check(verdict == .appended(newRows: step, totalRows: 980),
+                          "chat-shaped scroll -> \(verdict), "
+                          + "expected appended(newRows: \(step), totalRows: 980)")
+                    let upVerdict = await chatStitcher.append(up)
+                    check(upVerdict == .repositioned(totalRows: 980),
+                          "chat-shaped upward scroll inside the stitch -> \(upVerdict), "
+                          + "expected repositioned(totalRows: 980)")
+                    if let result = await chatStitcher.finalize(
+                        sourceDisplayID: CGMainDisplayID(),
+                        sourceDescription: "Scrolling Capture"),
+                       let expected = chat.cropping(to: CGRect(
+                        x: 0, y: 0, width: width, height: 980)) {
+                        let comparison = PixelCompare.compare(result.image, expected)
+                        print("chat diff:     \(comparison.summary)")
+                        check(comparison.identical, "chat-shaped output differs from the source")
+                    } else {
+                        failures.append("chat-shaped finalize failed")
+                    }
+                } else {
+                    failures.append("could not build the chat-shaped frames")
+                }
+            } else {
+                failures.append("could not build the chat-shaped source")
+            }
+
+            // 2. A sticky header: a 40-row banner pinned over every frame. It
+            // must appear exactly once, with the content below it complete.
+            let headerRows = 40
+            let sticky = ScrollStitcher()
+            for off in [0, 380, 760] {
+                guard let capture = frame(at: off, stickyHeaderRows: headerRows) else { return 2 }
+                let verdict = await sticky.append(capture)
+                let expected: ScrollStitcher.Verdict = off == 0
+                    ? .seeded
+                    : .appended(newRows: step, totalRows: off + frameRows)
+                check(verdict == expected, "sticky frame@\(off) -> \(verdict), expected \(expected)")
+            }
+            if let result = await sticky.finalize(
+                sourceDisplayID: CGMainDisplayID(), sourceDescription: "Scrolling Capture"),
+               let expected = bannerExpectation(
+                source: source, width: width, rows: 760 + frameRows, headerRows: headerRows) {
+                let comparison = PixelCompare.compare(result.image, expected)
+                print("sticky diff:   \(comparison.summary)")
+                check(comparison.identical, "sticky-header output differs from expectation")
+            } else {
+                failures.append("sticky-header finalize or expectation failed")
+            }
+
+            // 1c. Revisit-refresh — the frozen-fade bug: rows captured
+            // mid-animation (a chat streaming in renders arriving lines at
+            // half opacity) stay wrong forever if the canvas interior is
+            // never written. Scrolling back over settled content must heal
+            // exactly the rows that changed.
+            if let dimmed = dimmingRows(of: source, from: 500, to: 560) {
+                let healer = ScrollStitcher()
+                func dimFrame(at offset: Int) -> CaptureResult? {
+                    guard let crop = dimmed.cropping(to: CGRect(
+                        x: 0, y: offset, width: width, height: frameRows)) else { return nil }
+                    return CaptureResult(
+                        image: crop,
+                        pointSize: CGSize(
+                            width: CGFloat(width) / 2, height: CGFloat(frameRows) / 2),
+                        scale: 2, sourceDisplayID: CGMainDisplayID(),
+                        sourceDescription: "stitch test", capturedAt: Date())
+                }
+                if let d0 = dimFrame(at: 0), let d380 = dimFrame(at: 380),
+                   let revisit = frame(at: 190) {
+                    _ = await healer.append(d0)
+                    _ = await healer.append(d380)
+                    let verdict = await healer.append(revisit)
+                    check(verdict == .repositioned(totalRows: 980),
+                          "revisiting settled content -> \(verdict)")
+                    if let result = await healer.finalize(
+                        sourceDisplayID: CGMainDisplayID(),
+                        sourceDescription: "Scrolling Capture"),
+                       let expected = source.cropping(to: CGRect(
+                        x: 0, y: 0, width: width, height: 980)) {
+                        let comparison = PixelCompare.compare(result.image, expected)
+                        print("heal diff:     \(comparison.summary)")
+                        check(comparison.identical,
+                              "revisit did not heal the mid-animation rows")
+                    } else {
+                        failures.append("heal finalize failed")
+                    }
+                }
+            } else {
+                failures.append("could not build the dimmed source")
+            }
+
+            // 1d. The refresh must never stamp a sticky *footer* into the
+            // canvas interior: its rows differ from the content there by
+            // construction, and they are exactly the rows revisit-refresh is
+            // forbidden to touch.
+            if let footered = paintingBottomBanner(over: source, rows: 40) {
+                let guarded = ScrollStitcher()
+                func footFrame(at offset: Int) -> CaptureResult? {
+                    guard let crop = footered.cropping(to: CGRect(
+                        x: 0, y: offset, width: width, height: frameRows - 40)),
+                        let framed = paintingBottomBanner(over: crop, rows: 40)
+                    else { return nil }
+                    return CaptureResult(
+                        image: framed,
+                        pointSize: CGSize(
+                            width: CGFloat(width) / 2,
+                            height: CGFloat(frameRows - 40) / 2),
+                        scale: 2, sourceDisplayID: CGMainDisplayID(),
+                        sourceDescription: "stitch test", capturedAt: Date())
+                }
+                _ = await guarded.append(footFrame(at: 0)!)
+                _ = await guarded.append(footFrame(at: 380)!)
+                let verdict = await guarded.append(footFrame(at: 190)!)
+                check(verdict == .repositioned(totalRows: 940),
+                      "footered revisit -> \(verdict)")
+                if let result = await guarded.finalize(
+                    sourceDisplayID: CGMainDisplayID(),
+                    sourceDescription: "Scrolling Capture") {
+                    // The banner belongs at the very bottom and nowhere else.
+                    // The match is a tight triple, not "reddish": the unique-row
+                    // source legitimately sweeps through red on one channel.
+                    let bytes = rgba(of: result.image)
+                    var strayBannerRows = 0
+                    for row in 0..<(result.image.height - 40) {
+                        let p = (row * result.image.width + result.image.width / 2) * 4
+                        if abs(Int(bytes[p]) - 204) <= 6,
+                           abs(Int(bytes[p + 1]) - 26) <= 6,
+                           abs(Int(bytes[p + 2]) - 26) <= 6 {
+                            strayBannerRows += 1
+                        }
+                    }
+                    check(strayBannerRows == 0,
+                          "no footer rows stamped mid-canvas (found \(strayBannerRows))")
+                } else {
+                    failures.append("footered finalize failed")
+                }
+            } else {
+                failures.append("could not build the footered source")
+            }
+
+            // 2b. The sticky header, scrolling *up*: revealed rows must slot
+            // in under the banner, never above it.
+            let stickyUp = ScrollStitcher()
+            if let f380 = frame(at: 380, stickyHeaderRows: 40),
+               let f0 = frame(at: 0, stickyHeaderRows: 40) {
+                _ = await stickyUp.append(f380)
+                let verdict = await stickyUp.append(f0)
+                check(verdict == .appended(newRows: step, totalRows: 980),
+                      "sticky upward -> \(verdict), expected appended(newRows: \(step), totalRows: 980)")
+                if let result = await stickyUp.finalize(
+                    sourceDisplayID: CGMainDisplayID(), sourceDescription: "Scrolling Capture"),
+                   let expected = bannerExpectation(
+                    source: source, width: width, rows: 980, headerRows: 40) {
+                    let comparison = PixelCompare.compare(result.image, expected)
+                    print("sticky-up diff:\(comparison.summary)")
+                    check(comparison.identical, "sticky upward output differs from expectation")
+                } else {
+                    failures.append("sticky upward finalize or expectation failed")
+                }
+            }
+
+            // 3. The cap. Past maxCanvasBytes the stitcher must surrender the
+            // session rather than the machine.
+            var small = ScrollStitcher.Config()
+            small.maxCanvasBytes = width * 4 * 1000
+            let capped = ScrollStitcher(config: small)
+            if let f0 = frame(at: 0), let f1 = frame(at: 380), let f2 = frame(at: 760) {
+                _ = await capped.append(f0)
+                let under = await capped.append(f1)
+                check(under == .appended(newRows: step, totalRows: 980),
+                      "under-cap append -> \(under)")
+                let over = await capped.append(f2)
+                check(over == .canvasFull(totalRows: 1360), "over-cap append -> \(over)")
+            }
+        }
+
+        return report(failures)
+    }
+
+    /// Every row its own colour, with no near-period anywhere: red and green
+    /// encode the row index exactly, and blue is the high byte of a
+    /// multiplicative hash. The hash matters — `(row * k) & 0xFF` for any `k`
+    /// repeats every 256 rows, and with the stitcher comparing rows within a
+    /// tolerance, rows 256 apart (red off by 1, green off by 1, blue off by 0)
+    /// counted as "the same row" and legitimised a wrong shift.
+    private static func uniqueRowImage(width: Int, height: Int) -> CGImage? {
+        guard let context = CGContext(
+            data: nil, width: width, height: height,
+            bitsPerComponent: 8, bytesPerRow: width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        context.setShouldAntialias(false)
+        for row in 0..<height {
+            let colour = rowColour(row)
+            context.setFillColor(CGColor(
+                srgbRed: colour.redComponent, green: colour.greenComponent,
+                blue: colour.blueComponent, alpha: 1))
+            // The context is bottom-up; top-down row i lives at CG y = height-1-i.
+            context.fill(CGRect(x: 0, y: height - 1 - row, width: width, height: 1))
+        }
+        return context.makeImage()
+    }
+
+    /// Chat-shaped content: 14-row "text lines" on a 40-row rhythm over a flat
+    /// dark background, where every text row carries *exactly* the same ink
+    /// fraction in every sampled segment — so all text rows share one segment
+    /// mean, like real prose does — but the ink sits at line-specific
+    /// positions, so their pixels differ. Signature comparison finds these
+    /// rows interchangeable; only pixel comparison can align them.
+    private static func chatLikeImage(width: Int, height: Int) -> CGImage? {
+        let bg: (UInt8, UInt8, UInt8) = (30, 30, 32)
+        let ink: (UInt8, UInt8, UInt8) = (220, 220, 225)
+        func mix(_ a: Int, _ b: Int, _ c: Int) -> UInt64 {
+            var x = UInt64(truncatingIfNeeded: a) &* 0x9E37_79B9_7F4A_7C15
+            x ^= UInt64(truncatingIfNeeded: b) &* 0xBF58_476D_1CE4_E5B9
+            x ^= UInt64(truncatingIfNeeded: c) &* 0x94D0_49BB_1331_11EB
+            x ^= x >> 31
+            x = x &* 0xD6E8_FEB8_6659_FD93
+            x ^= x >> 27
+            return x
+        }
+        var bytes = [UInt8](repeating: 0, count: width * height * 4)
+        for row in 0..<height {
+            let block = row / 40
+            let inBlock = row % 40
+            let isText = inBlock < 14
+            for x in 0..<width {
+                let p = (row * width + x) * 4
+                var colour = bg
+                if isText {
+                    // The stitcher samples every 4th pixel and averages 25
+                    // samples per segment. Each segment-aligned run of 25
+                    // sampled cells gets *exactly* 7 ink cells — same mean in
+                    // every segment of every text row, matching how two lines
+                    // of prose average out the same — at positions derived
+                    // from (line, row-in-line, segment), so the pixels differ.
+                    let cell = x / 4
+                    let group = cell / 25
+                    let slot = cell % 25
+                    let seed = mix(block, inBlock, group)
+                    let base = Int(seed % 25)
+                    var step = 1 + Int((seed >> 8) % 24)
+                    if step % 5 == 0 { step += 1 }
+                    var isInk = false
+                    for k in 0..<7 where (base + k * step) % 25 == slot {
+                        isInk = true
+                    }
+                    if isInk { colour = ink }
+                }
+                bytes[p] = colour.0
+                bytes[p + 1] = colour.1
+                bytes[p + 2] = colour.2
+                bytes[p + 3] = 255
+            }
+        }
+        let data = Data(bytes)
+        guard let provider = CGDataProvider(data: data as CFData) else { return nil }
+        return CGImage(
+            width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+            bytesPerRow: width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+            provider: provider, decode: nil, shouldInterpolate: false,
+            intent: .defaultIntent)
+    }
+
+    /// Rows [from, to) at half brightness — the shape of a streaming chat's
+    /// fade-in caught mid-animation.
+    private static func dimmingRows(of image: CGImage, from: Int, to: Int) -> CGImage? {
+        guard let context = CGContext(
+            data: nil, width: image.width, height: image.height,
+            bitsPerComponent: 8, bytesPerRow: image.width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        context.setShouldAntialias(false)
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        context.setFillColor(CGColor(gray: 0, alpha: 0.5))
+        context.fill(CGRect(
+            x: 0, y: image.height - to, width: image.width, height: to - from))
+        return context.makeImage()
+    }
+
+    private static func paintingBottomBanner(over image: CGImage, rows: Int) -> CGImage? {
+        guard let context = CGContext(
+            data: nil, width: image.width, height: image.height,
+            bitsPerComponent: 8, bytesPerRow: image.width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        context.setShouldAntialias(false)
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        context.setFillColor(CGColor(srgbRed: 0.8, green: 0.1, blue: 0.1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: image.width, height: rows))
+        return context.makeImage()
+    }
+
+    private static func paintingBanner(over image: CGImage, rows: Int) -> CGImage? {
+        guard let context = CGContext(
+            data: nil, width: image.width, height: image.height,
+            bitsPerComponent: 8, bytesPerRow: image.width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        context.setShouldAntialias(false)
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        context.setFillColor(CGColor(srgbRed: 0.8, green: 0.1, blue: 0.1, alpha: 1))
+        context.fill(CGRect(x: 0, y: image.height - rows, width: image.width, height: rows))
+        return context.makeImage()
+    }
+
+    /// What the sticky-header run should produce: the banner once, then the
+    /// source from under it down to the last frame's bottom edge.
+    private static func bannerExpectation(
+        source: CGImage, width: Int, rows: Int, headerRows: Int
+    ) -> CGImage? {
+        guard let body = source.cropping(to: CGRect(
+            x: 0, y: headerRows, width: width, height: rows - headerRows)),
+            let context = CGContext(
+                data: nil, width: width, height: rows,
+                bitsPerComponent: 8, bytesPerRow: width * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return nil }
+        context.setShouldAntialias(false)
+        context.draw(body, in: CGRect(x: 0, y: 0, width: width, height: rows - headerRows))
+        context.setFillColor(CGColor(srgbRed: 0.8, green: 0.1, blue: 0.1, alpha: 1))
+        context.fill(CGRect(x: 0, y: rows - headerRows, width: width, height: headerRows))
+        return context.makeImage()
+    }
+
+    /// The whole session, on the live screen: a borderless window of ours whose
+    /// scroll view is driven programmatically — `scroll(to:)`, never synthesized
+    /// wheel events — while the real coordinator loop captures and stitches.
+    /// Content is the unique-row pattern in *points*, so every stitched row can
+    /// be traced back to exactly one document row and compared.
+    ///
+    /// INCONCLUSIVE (exit 0, like every other INCONCLUSIVE in this file) when
+    /// the region is not static before the run — the same stability sandwich as
+    /// `--selftest-rect`.
+    private static func scrollFlowCheck(into directory: URL) async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+        if let hint = LoginSession.noDisplaysHint {
+            FileHandle.standardError.write(Data("error: \(hint)\n".utf8))
+            return 2
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        guard let screen = NSScreen.main,
+              let displayID = ScreenIndex.displayID(of: screen) else {
+            print("no main screen")
+            return 2
+        }
+
+        // Geometry, all in points. The window is 460×400 with the region inset
+        // 30 pt on every side, so the region's top edge sits 30 pt below the
+        // window's — the row at the top of the stitch is document row 30.
+        let windowSize = CGSize(width: 460, height: 400)
+        let inset: CGFloat = 30
+        let documentHeight: CGFloat = 2000
+        let scrollStep: CGFloat = 120
+        let scrollEnd: CGFloat = 1200
+        let windowFrame = CGRect(
+            x: (screen.visibleFrame.midX - windowSize.width / 2).rounded(),
+            y: (screen.visibleFrame.midY - windowSize.height / 2).rounded(),
+            width: windowSize.width, height: windowSize.height)
+        let region = windowFrame.insetBy(dx: inset, dy: inset)
+        let regionHeight = region.height   // 340
+        let topDocumentRow = Int(inset)
+
+        let window = NSWindow(
+            contentRect: windowFrame, styleMask: [.borderless], backing: .buffered,
+            defer: false)
+        window.isOpaque = true
+        window.hasShadow = false
+        window.level = .floating
+        window.ignoresMouseEvents = true
+        let scrollView = NSScrollView(frame: CGRect(origin: .zero, size: windowSize))
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
+        scrollView.verticalScrollElasticity = .none
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+        let document = UniqueRowsDocumentView(frame: CGRect(
+            x: 0, y: 0, width: windowSize.width, height: documentHeight))
+        scrollView.documentView = document
+        window.contentView = scrollView
+        window.orderFrontRegardless()
+        defer { window.orderOut(nil) }
+
+        func scroll(to offset: CGFloat) {
+            scrollView.contentView.scroll(to: CGPoint(x: 0, y: offset))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
+        scroll(to: 0)
+        try await Task.sleep(for: .milliseconds(600))
+
+        // The stability sandwich, plus a geometry sanity probe: the centre of
+        // the region must show the document row the mapping predicts, or every
+        // later assertion would be measuring the wrong thing.
+        let engine = CaptureEngine()
+        try await engine.refreshContent()
+        var probeOptions = CaptureOptions.default
+        probeOptions.showsCursor = false
+        let first = try await engine.capture(
+            .area(displayID: displayID, rectInAppKitGlobal: region), options: probeOptions)
+        try await Task.sleep(for: .milliseconds(150))
+        let second = try await engine.capture(
+            .area(displayID: displayID, rectInAppKitGlobal: region), options: probeOptions)
+        let drift = PixelCompare.compare(first.image, second.image)
+        guard drift.isSamePicture else {
+            print("live drift:    \(drift.summary)")
+            print("result:        INCONCLUSIVE — the region is not static; re-run")
+            // Exit 0: `make test` counts any non-zero exit as a failure, and
+            // "the screen moved" is not one. The harness counts the printed
+            // INCONCLUSIVE instead.
+            return 0
+        }
+        let scale = first.scale
+        print("region:        \(Int(region.width))x\(Int(regionHeight)) pt @\(Int(scale))x")
+
+        var failures: [String] = []
+        func check(_ condition: Bool, _ description: String) {
+            print("  \(condition ? "ok  " : "FAIL") \(description)")
+            if !condition { failures.append(description) }
+        }
+
+        let probeBytes = rgba(of: first.image)
+        let probeRow = Int((regionHeight / 2) * scale)
+        let probeDocRow = topDocumentRow + Int(regionHeight / 2)
+        check(pixel(probeBytes, width: first.image.width, x: first.image.width / 2,
+                    y: probeRow, matches: rowColour(probeDocRow)),
+              "the geometry probe sees document row \(probeDocRow) mid-region")
+        if !failures.isEmpty {
+            print("result:        FAIL")
+            return 1
+        }
+
+        // --- the scroll-style toolbar, clicked for real --------------------
+        // The armed bar's `.scroll` face lays its Start pill out in its own
+        // branch, and a layout branch nobody has ever hit is exactly how the
+        // editor's Redact button died while every geometry assertion passed.
+        // So: a synthesized click on whatever hit-testing returns at the
+        // pill's centre, asserted on the consequence — `present()` resuming.
+        let overlay = OverlayController()
+        let armSelection = CGRect(x: 240, y: 260, width: 420, height: 300)
+        let armBox = OutcomeBox()
+        let armFlag = CompletionFlag()
+        Task {
+            armBox.outcome = await overlay.present(
+                windows: [], suggestsWindows: false, requiresConfirmation: true,
+                toolbarStyle: .scroll)
+            armFlag.markDone()
+        }
+        try await Task.sleep(for: .milliseconds(140))
+        overlay.forceSelection(armSelection, on: screen)
+        overlay.confirmForTest()
+        try await Task.sleep(for: .milliseconds(120))
+        check(overlay.toolbarIsVisibleForTest, "the scroll-style bar is on screen once armed")
+
+        func findPill(_ view: NSView) -> HUDPill? {
+            if let pill = view as? HUDPill { return pill }
+            for sub in view.subviews {
+                if let found = findPill(sub) { return found }
+            }
+            return nil
+        }
+        let barPanel = NSApp.windows
+            .compactMap { $0 as? FloatingBarPanel }
+            .first { $0.isVisible }
+        if let barPanel, let face = barPanel.contentView,
+           let pill = findPill(face) {
+            let centre = pill.convert(
+                CGPoint(x: pill.bounds.midX, y: pill.bounds.midY), to: nil)
+            let hit = face.superview?.hitTest(centre) ?? face.hitTest(centre)
+            check(hit is HUDPill, "the Start pill is what hit-testing returns "
+                + "(got \(hit.map { "\(type(of: $0))" } ?? "nothing"))")
+            click(hit, at: centre, in: barPanel)
+        } else {
+            check(false, "the armed bar has a pill to click")
+        }
+        let started = await armFlag.wait(upTo: .seconds(2))
+        check(started, "clicking Start resumes present()")
+        if case .area(_, let rect)? = armBox.outcome {
+            check(rect == armSelection, "the outcome carries the armed rect")
+        } else {
+            check(false, "the outcome is .area (got \(String(describing: armBox.outcome)))")
+        }
+        overlay.takeHandedOverBar()?.dismiss()
+        overlay.tearDown()
+        try await Task.sleep(for: .milliseconds(200))
+
+        // --- the session, ended through the toggle -------------------------
+        let scroller = ScrollCaptureCoordinator(engine: engine, overlay: OverlayController())
+        var results: [CaptureResult] = []
+        scroller.onResult = { results.append($0) }
+
+        scroller.startForTest(displayID: displayID, rectInAppKitGlobal: region)
+        check(scroller.isActive, "the session is active")
+        check(scroller.hudIsVisibleForTest, "the session bar is on screen")
+
+        /// Waits for the stitch to reach the height this scroll position
+        /// implies, instead of guessing with sleeps.
+        func waitForRows(_ target: Int, upTo timeout: Duration) async -> Int {
+            let deadline = ContinuousClock.now.advanced(by: timeout)
+            var rows = 0
+            while ContinuousClock.now < deadline {
+                rows = await scroller.stitchedRowsForTest()
+                if rows >= target { return rows }
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            return rows
+        }
+
+        let seeded = await waitForRows(Int(regionHeight * scale), upTo: .seconds(3))
+        check(seeded >= Int(regionHeight * scale), "the first frame seeded \(seeded) rows")
+
+        var offset: CGFloat = 0
+        while offset < scrollEnd {
+            offset += scrollStep
+            scroll(to: offset)
+            let target = Int((regionHeight + offset) * scale) - Int(scale)
+            let rows = await waitForRows(target, upTo: .seconds(3))
+            if rows < target {
+                failures.append("position \(Int(offset)) never got stitched (\(rows)/\(target) rows)")
+                break
+            }
+        }
+
+        // The same binding again is the toggle that finishes it.
+        await scroller.perform(.captureScrolling)
+        check(!scroller.isActive, "the toggle ended the session")
+        check(!scroller.hudIsVisibleForTest, "the bar came down with it")
+        check(results.count == 1, "exactly one capture was delivered (got \(results.count))")
+
+        if let result = results.first {
+            check(result.sourceDescription == "Scrolling Capture",
+                  "it is labelled Scrolling Capture")
+            let expectedHeight = regionHeight + scrollEnd
+            check(abs(result.pointSize.height - expectedHeight) <= 2,
+                  "it is \(Int(result.pointSize.height)) pt tall (expected \(Int(expectedHeight)))")
+            check(abs(result.pointSize.width - region.width) <= 1,
+                  "it is \(Int(result.pointSize.width)) pt wide (expected \(Int(region.width)))")
+            try? ImageEncoder.write(
+                result.image, to: directory.appendingPathComponent("scroll-flow.png"),
+                scale: result.scale)
+
+            // Twenty rows sampled across the full height, each mapped back to
+            // the one document row that can be there.
+            let stitched = rgba(of: result.image)
+            let totalPoints = Int(result.pointSize.height)
+            var mismatches = 0
+            for i in 0..<20 {
+                let pointRow = 4 + i * (totalPoints - 8) / 20
+                let pixelRow = min(
+                    Int((CGFloat(pointRow) + 0.5) * result.scale), result.image.height - 1)
+                let docRow = topDocumentRow + pointRow
+                if !pixel(stitched, width: result.image.width, x: result.image.width / 2,
+                          y: pixelRow, matches: rowColour(docRow)) {
+                    mismatches += 1
+                }
+            }
+            check(mismatches == 0, "sampled rows match their document rows (\(mismatches)/20 off)")
+        }
+
+        // --- scrolling up on a real window, then cancel --------------------
+        // Starts mid-document and scrolls the content *up*: the stitch must
+        // grow by prepending, on real captures with real dithering — the
+        // headless legs prove the algorithm, this proves it against the
+        // window server.
+        scroll(to: 600)
+        try await Task.sleep(for: .milliseconds(400))
+        scroller.startForTest(displayID: displayID, rectInAppKitGlobal: region)
+        _ = await waitForRows(Int(regionHeight * scale), upTo: .seconds(3))
+        scroll(to: 600 - scrollStep)
+        let upRows = await waitForRows(
+            Int((regionHeight + scrollStep) * scale) - Int(scale), upTo: .seconds(3))
+        check(upRows >= Int((regionHeight + scrollStep) * scale) - Int(scale),
+              "scrolling up grew the stitch to \(upRows) rows")
+        await scroller.cancel()
+        check(!scroller.isActive, "cancel ended the second session")
+        check(!scroller.hudIsVisibleForTest, "cancel took the bar down")
+        check(results.count == 1, "cancel delivered nothing (still \(results.count))")
+
+        print("result:        \(failures.isEmpty ? "PASS" : "FAIL")")
+        return failures.isEmpty ? 0 : 1
+    }
+
+    /// The flow test's document: every point row its own colour, flipped so
+    /// row 0 is the top and the clip offset reads as "rows scrolled past".
+    private final class UniqueRowsDocumentView: NSView {
+        override var isFlipped: Bool { true }
+        override func draw(_ dirtyRect: NSRect) {
+            let start = max(0, Int(dirtyRect.minY))
+            let end = min(Int(bounds.height), Int(dirtyRect.maxY.rounded(.up)))
+            for row in start..<end {
+                SelfTest.rowColour(row).setFill()
+                NSRect(x: 0, y: CGFloat(row), width: bounds.width, height: 1).fill()
+            }
+        }
+    }
+
+    /// The colour that identifies a row in both scroll tests — red and green
+    /// encode the row index exactly; blue is the high byte of a multiplicative
+    /// hash, chosen because it has no small period (see `uniqueRowImage`).
+    private static func rowColour(_ row: Int) -> NSColor {
+        NSColor(
+            srgbRed: CGFloat(row & 0xFF) / 255,
+            green: CGFloat((row >> 8) & 0xFF) / 255,
+            blue: CGFloat(Int((UInt32(truncatingIfNeeded: row) &* 2_654_435_761) >> 24)) / 255,
+            alpha: 1)
+    }
+
+    /// ±5 per channel: the window server's colour-management dithering wobbles
+    /// single pixels ±1–3 (measured 2026-08-02), and the row identity is
+    /// carried by blue jumps of 97 per row, so ±5 cannot confuse two rows.
+    private static func pixel(
+        _ bytes: [UInt8], width: Int, x: Int, y: Int, matches colour: NSColor
+    ) -> Bool {
+        let index = (y * width + x) * 4
+        guard index + 2 < bytes.count,
+              let srgb = colour.usingColorSpace(.sRGB) else { return false }
+        let expected = [srgb.redComponent, srgb.greenComponent, srgb.blueComponent]
+            .map { Int(($0 * 255).rounded()) }
+        return abs(Int(bytes[index]) - expected[0]) <= 5
+            && abs(Int(bytes[index + 1]) - expected[1]) <= 5
+            && abs(Int(bytes[index + 2]) - expected[2]) <= 5
     }
 
     private static func report(_ failures: [String]) -> Int32 {
