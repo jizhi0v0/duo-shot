@@ -964,6 +964,11 @@ enum SelfTest {
     /// Runs the real key-equivalent path (`NSMenu.performKeyEquivalent`) rather
     /// than calling `paste:` directly, because calling `paste:` works fine with
     /// no menu at all and would pass against the broken build.
+    ///
+    /// INCONCLUSIVE when the app could not become (or stay) active: activation
+    /// is cooperative and the system refuses it while the user is working in
+    /// another app, and without it there is no key window for the paste to land
+    /// in — nothing under test was exercised, broken or not.
     private static func editMenuCheck() async -> Int32 {
         var failures = 0
         func check(_ label: String, _ passed: Bool, _ detail: String = "") {
@@ -987,8 +992,41 @@ enum SelfTest {
         // there is nothing to paste into. This cost a wrong diagnosis: the first
         // run of this check blamed the menu for a paste that never had anywhere
         // to land.
-        NSApp.activate()
-        window.makeKeyAndOrderFront(nil)
+        //
+        // And activation is only a request. `activate()` is cooperative, and
+        // while the user is working in another app the system is free to say
+        // no -- which is the same wrong diagnosis one layer up: the check would
+        // blame the menu for a paste that had nowhere to land. So insist on
+        // being active *and* key before asserting anything, and give up as
+        // INCONCLUSIVE rather than FAIL if the machine is in use.
+        //
+        // Observed on 26.6: the request is granted when the frontmost app is an
+        // ancestor of this process (the terminal `make test` was typed into),
+        // and refused -- indefinitely, not just while input is arriving -- when
+        // an unrelated app holds frontmost. So the usual run from a terminal
+        // still asserts everything, and only running it from *behind* some
+        // other app downgrades.
+        for _ in 0..<30 where !(NSApp.isActive && window.isKeyWindow) {
+            NSApp.activate()
+            // Inside the loop: a makeKey issued while the app was still
+            // inactive does not take effect retroactively when activation is
+            // finally granted.
+            window.makeKeyAndOrderFront(nil)
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        guard NSApp.isActive, window.isKeyWindow else {
+            let front = NSWorkspace.shared.frontmostApplication?.localizedName
+            print("""
+                result:        INCONCLUSIVE — activation was refused (\(front ?? "another app") \
+                stayed frontmost;
+                               active=\(NSApp.isActive) key=\(window.isKeyWindow)), so there is no \
+                key window for the
+                               paste to land in and the routing was never exercised. Re-run
+                               without touching the machine.
+                """)
+            window.orderOut(nil)
+            return 0
+        }
         try? await Task.sleep(for: .milliseconds(200))
         check("field became first responder", window.makeFirstResponder(field))
         check("field editor exists", field.currentEditor() != nil)
@@ -1024,7 +1062,22 @@ enum SelfTest {
         check("text survived end of editing", field.stringValue == secret,
               "field=\"\(field.stringValue)\"")
 
+        // Activation can also be *lost* mid-run: the reproduced failure had the
+        // field editor installed and the menu claiming ⌘V, and the paste still
+        // landed nowhere because the user's app had taken key back in between.
+        // A failure while we are no longer active+key says nothing about the
+        // menu, so it is downgraded, not reported. Read the key status before
+        // orderOut, which would clear it.
+        let disturbed = !(NSApp.isActive && window.isKeyWindow)
         window.orderOut(nil)
+        if failures > 0 && disturbed {
+            print("""
+                result:        INCONCLUSIVE — activation was lost while the check ran, so the
+                               failures above only say the machine was in use. Re-run without
+                               touching it.
+                """)
+            return 0
+        }
         print("result:        \(failures == 0 ? "PASS" : "FAIL (\(failures))")")
         return failures == 0 ? 0 : 1
     }
