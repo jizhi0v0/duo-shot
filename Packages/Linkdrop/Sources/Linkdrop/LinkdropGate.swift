@@ -32,7 +32,7 @@ public enum LinkdropGate {
     /// that can carry script, so serving one inline from a share domain is
     /// stored XSS against every other link ever shared from it. The server side
     /// enforces this too -- neither end is allowed to be the only check.
-    private static let webImages: Set<String> = ["png", "jpg", "jpeg", "gif", "webp"]
+    private static let webImages: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "avif"]
     private static let convertibleImages: Set<String> = ["heic", "heif", "tiff", "tif", "bmp"]
     private static let containers: Set<String> = ["mp4", "m4v", "mov"]
 
@@ -68,10 +68,17 @@ public enum LinkdropGate {
     ///   knows rather than a rule every caller has to remember. The service
     ///   refuses it for a video anyway; neither end is allowed to be the only
     ///   check.
-    public static func plan(
+    ///
+    /// Off the main actor for one branch out of three: `convertibleImages`
+    /// re-encodes a still, which is tens of megabytes of pixel work. The other
+    /// two read nothing and cost only the hop. Do not "simplify" this back to a
+    /// synchronous call to keep them cheap -- that puts the re-encode on
+    /// whatever actor the caller happens to be, which is the main one.
+    @concurrent
+    public nonisolated static func plan(
         image url: URL, pointSize: CGSize? = nil, ephemeral: Bool = false,
         burnAfterReading: Bool = false
-    ) -> Outcome {
+    ) async -> Outcome {
         let ext = url.pathExtension.lowercased()
 
         if webImages.contains(ext) {

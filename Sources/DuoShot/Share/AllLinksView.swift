@@ -25,8 +25,9 @@ final class AllLinksModel {
 
     private(set) var state: State = .loading
     private(set) var items: [LinkdropItem] = []
-    /// The server walked as much of the bucket as it was willing to, so these
-    /// are the newest of what it saw rather than everything there is.
+    /// There are more links than `limit`. Ordering is exact either way -- the
+    /// server reads a time-ordered index rather than sorting what it happened
+    /// to walk -- so this is "there is more", not "this may be wrong".
     private(set) var truncated = false
 
     /// Keys whose delete is in flight, so a row cannot be revoked twice while

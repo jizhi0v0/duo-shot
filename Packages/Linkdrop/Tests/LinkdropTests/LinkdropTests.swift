@@ -55,15 +55,15 @@ struct GateTests {
     // runs its script on that origin, which is stored XSS against every other
     // link ever shared from it.
     @Test("refuses SVG")
-    func refusesSVG() {
-        #expect(isRefused(LinkdropGate.plan(image: URL(fileURLWithPath: "/tmp/x.svg"))))
+    func refusesSVG() async {
+        #expect(isRefused(await LinkdropGate.plan(image: URL(fileURLWithPath: "/tmp/x.svg"))))
     }
 
-    @Test("accepts the web image formats", arguments: ["png", "jpg", "jpeg", "gif", "webp"])
-    func acceptsWebImages(ext: String) {
+    @Test("accepts the web image formats", arguments: ["png", "jpg", "jpeg", "gif", "webp", "avif"])
+    func acceptsWebImages(ext: String) async {
         // The file need not exist: nothing is read for a format already fit to
         // send, which is what makes this check free at capture time.
-        guard case .ok(let plan) = LinkdropGate.plan(
+        guard case .ok(let plan) = await LinkdropGate.plan(
             image: URL(fileURLWithPath: "/tmp/x.\(ext)"))
         else { Issue.record("refused .\(ext)"); return }
         #expect(plan.descriptor.ext == ext)
@@ -71,9 +71,9 @@ struct GateTests {
     }
 
     @Test("refuses an unknown extension")
-    func refusesUnknown() {
-        #expect(isRefused(LinkdropGate.plan(image: URL(fileURLWithPath: "/tmp/x.xcf"))))
-        #expect(isRefused(LinkdropGate.plan(image: URL(fileURLWithPath: "/tmp/x"))))
+    func refusesUnknown() async {
+        #expect(isRefused(await LinkdropGate.plan(image: URL(fileURLWithPath: "/tmp/x.xcf"))))
+        #expect(isRefused(await LinkdropGate.plan(image: URL(fileURLWithPath: "/tmp/x"))))
     }
 
     @Test("refuses a container browsers cannot play")
@@ -97,10 +97,10 @@ struct GateTests {
         case .image:
             #expect(isRefused(await LinkdropGate.plan(video: url)))
         case .video:
-            #expect(isRefused(LinkdropGate.plan(image: url)))
+            #expect(isRefused(await LinkdropGate.plan(image: url)))
             #expect(!isRefused(await LinkdropGate.plan(video: url)))
         case nil:
-            #expect(isRefused(LinkdropGate.plan(image: url)))
+            #expect(isRefused(await LinkdropGate.plan(image: url)))
             #expect(isRefused(await LinkdropGate.plan(video: url)))
         }
     }

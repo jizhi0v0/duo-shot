@@ -82,7 +82,7 @@ nonisolated enum ShareSelfTest {
         print("route:         \(route)")
 
         // 1. The gate.
-        guard case .ok(let upload) = LinkdropGate.plan(
+        guard case .ok(let upload) = await LinkdropGate.plan(
             image: source, pointSize: CGSize(width: 64, height: 64), ephemeral: false)
         else {
             print("result:        FAIL — the gate refused a plain PNG")
@@ -188,9 +188,9 @@ nonisolated enum ShareSelfTest {
         }
 
         // 8. The gate's refusals, which need no network at all.
-        check("gate refuses .svg", isRefused(LinkdropGate.plan(
+        check("gate refuses .svg", isRefused(await LinkdropGate.plan(
             image: URL(fileURLWithPath: "/tmp/x.svg"), pointSize: .zero, ephemeral: false)))
-        check("gate refuses .bmp", isRefused(LinkdropGate.plan(
+        check("gate refuses .bmp", isRefused(await LinkdropGate.plan(
             image: URL(fileURLWithPath: "/tmp/x.bmp"), pointSize: .zero, ephemeral: false)))
 
         print("result:        \(failures == 0 ? "PASS" : "FAIL (\(failures))")")

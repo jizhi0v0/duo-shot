@@ -13,7 +13,7 @@ import Linkdrop
 let endpoint = LinkdropEndpoint(base: "s.example.com", token: token)!
 let uploader = LinkdropUploader()
 
-guard case .ok(let plan) = LinkdropGate.plan(image: fileURL) else { return }
+guard case .ok(let plan) = await LinkdropGate.plan(image: fileURL) else { return }
 let link = try await uploader.upload(plan, to: endpoint) { fraction in
     print("\(Int(fraction * 100))%")
 }

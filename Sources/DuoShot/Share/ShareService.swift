@@ -38,6 +38,10 @@ final class ShareService {
     /// possible outcome of a button whose whole point is that the file is not
     /// meant to survive being looked at.
     private var oneTime: Set<URL> = []
+    /// Terminal states are useful for retries and same-session link lookup, but
+    /// they are a cache rather than history. History has its own persisted store.
+    private var completedOrder: [URL] = []
+    private static let retainedStateLimit = 200
 
     /// Where the reason a dropped file could not be shared is shown, and nil to
     /// take the last one back down.
@@ -67,6 +71,7 @@ final class ShareService {
 
     func stopObserving(_ url: URL) {
         observers[url] = nil
+        trimRetainedStates()
     }
 
     var isUploading: Bool {
@@ -126,6 +131,7 @@ final class ShareService {
         tasks[url] = Task { [weak self] in
             await self?.run(entry, endpoint: endpoint)
             self?.tasks[url] = nil
+            self?.trimRetainedStates()
         }
     }
 
@@ -176,6 +182,7 @@ final class ShareService {
         tasks[url] = Task { [weak self] in
             await self?.runDrop(url, medium: medium, endpoint: endpoint)
             self?.tasks[url] = nil
+            self?.trimRetainedStates()
         }
     }
 
@@ -188,7 +195,7 @@ final class ShareService {
             // No point size, because nothing here has opened the file. That is
             // the honest answer: a made-up one would be what the page lays the
             // image out at.
-            outcome = LinkdropGate.plan(
+            outcome = await LinkdropGate.plan(
                 image: url, ephemeral: ShareSettings.shared.ephemeralScreenshots)
         case .video:
             let duration = await Self.duration(of: url)
@@ -256,7 +263,7 @@ final class ShareService {
         let outcome: LinkdropGate.Outcome
         switch entry.kind {
         case .image(let pointSize):
-            outcome = LinkdropGate.plan(
+            outcome = await LinkdropGate.plan(
                 image: entry.url, pointSize: pointSize,
                 ephemeral: ShareSettings.shared.ephemeralScreenshots,
                 burnAfterReading: oneTime.contains(entry.url))
@@ -393,6 +400,8 @@ final class ShareService {
             states = states.filter {
                 if case .done(let link) = $0.value { link.key != key } else { true }
             }
+            completedOrder.removeAll { states[$0] == nil }
+            oneTime = oneTime.filter { states[$0] != nil }
             return true
         } catch {
             Log.share.error("""
@@ -426,6 +435,28 @@ final class ShareService {
 
     private func publish(_ state: State, for url: URL) {
         states[url] = state
+        completedOrder.removeAll { $0 == url }
+        switch state {
+        case .uploading:
+            break
+        case .done:
+            oneTime.remove(url)
+            completedOrder.append(url)
+        case .failed:
+            completedOrder.append(url)
+        }
         observers[url]?.forEach { $0(state) }
+        trimRetainedStates()
+    }
+
+    private func trimRetainedStates() {
+        while completedOrder.count > Self.retainedStateLimit,
+              let index = completedOrder.firstIndex(where: {
+                  tasks[$0] == nil && observers[$0] == nil
+              }) {
+            let expired = completedOrder.remove(at: index)
+            states[expired] = nil
+            oneTime.remove(expired)
+        }
     }
 }
