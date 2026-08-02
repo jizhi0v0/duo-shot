@@ -114,6 +114,7 @@ enum SelfTest {
         case copyText(directory: URL)
         case sensitiveText(directory: URL)
         case gif(directory: URL)
+        case history(directory: URL)
         /// The share pipeline against a local `wrangler dev`. Endpoint and token
         /// are arguments, never Settings: a test that read the live
         /// configuration would upload to the real bucket.
@@ -180,6 +181,9 @@ enum SelfTest {
                     directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-gif":
                 self = .gif(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
+            case "--selftest-history":
+                self = .history(
                     directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-share":
                 let configured = rest.contains("--configured")
@@ -366,6 +370,7 @@ enum SelfTest {
             case .copyText(let d): return try await copyTextCheck(into: d)
             case .sensitiveText(let d): return try await sensitiveTextCheck(into: d)
             case .gif(let d): return try await gifCheck(into: d)
+            case .history(let d): return try await historyCheck(into: d)
             case .shareCard(let d): return try await shareCardStates(into: d)
             case .shareCredentials: return await ShareSelfTest.credentials()
             case .shareFlow: return await ShareFlowSelfTest.run()
@@ -1369,6 +1374,156 @@ enum SelfTest {
         input.markAsFinished()
         await writer.finishWriting()
         return (0..<seconds).map { ($0, palette[$0 % palette.count]) }
+    }
+
+    /// `--selftest-history`
+    ///
+    /// Same split as `--selftest-sensitive`, for the same reason. Search is
+    /// exactly answerable when it is handed text; it is only as answerable as
+    /// OCR when it is handed a picture. The index gets its own file under the
+    /// test's directory rather than the real one in Application Support -- a
+    /// self-test that wrote into the user's actual history would be a strange
+    /// thing to run twice.
+    private static func historyCheck(into directory: URL) async throws -> Int32 {
+        var failures = 0
+        func check(_ label: String, _ passed: Bool, _ detail: String = "") {
+            print("  \(passed ? "PASS" : "FAIL") \(label)\(detail.isEmpty ? "" : " — \(detail)")")
+            if !passed { failures += 1 }
+        }
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+
+        let store = directory.appendingPathComponent("history-index.json")
+        try? FileManager.default.removeItem(at: store)
+        let index = CaptureIndex(location: store)
+
+        // Real files, because `forgetMissingFiles` is part of what is under
+        // test and it asks the filesystem.
+        func plant(_ name: String, _ text: String, _ ago: TimeInterval) async -> URL {
+            let url = directory.appendingPathComponent(name)
+            try? Data("x".utf8).write(to: url)
+            await index.record(url, text: text, capturedAt: Date(timeIntervalSinceNow: -ago))
+            return url
+        }
+
+        _ = await plant(
+            "old.png", "Fatal error\nNullPointerException in AuthService\nline 42", 300)
+        let invoice = await plant(
+            "mid.png", "INVOICE\nAcme Corporation\nService charge\nTotal due £480.00", 200)
+        _ = await plant(
+            "new.png", "会议纪要\n下周三发布新版本\n负责人：李波", 100)
+
+        // MARK: finding things
+
+        func names(_ query: String) async -> [String] {
+            await index.search(query).map(\.name)
+        }
+        check("finds a word from the middle of a capture",
+              await names("NullPointer") == ["old.png"])
+        check("is case-insensitive", await names("nullpointerexception") == ["old.png"])
+        check("matches inside a word, so Chinese works at all",
+              await names("发布新版本") == ["new.png"])
+        check("finds by filename too", await names("invoice") == ["mid.png"])
+        // AND rather than OR. The second word someone types is there to narrow
+        // the answer; if it widened it, adding detail would make things worse.
+        check("two words must both appear",
+              await names("acme total") == ["mid.png"])
+        check("and a word that appears in neither finds nothing",
+              await names("acme kubernetes").isEmpty)
+        check("no query lists everything, newest first",
+              await names("") == ["new.png", "mid.png", "old.png"])
+        // "service" is in both old.png (AuthService) and mid.png (Service
+        // charge); mid.png is the newer of the two and has to come first.
+        check("two matches come back newest first",
+              await names("service") == ["mid.png", "old.png"],
+              "\(await names("service"))")
+
+        // The snippet is what makes a row answerable at a glance, so it has to
+        // be the line that matched rather than the first line of the capture.
+        let hit = await index.search("NullPointer").first
+        check("the row shows the line that matched",
+              hit?.snippet == "NullPointerException in AuthService",
+              hit?.snippet ?? "none")
+
+        // MARK: surviving a relaunch
+
+        let reopened = CaptureIndex(location: store)
+        check("the index is still there after a restart",
+              await reopened.search("NullPointer").map(\.name) == ["old.png"])
+        check("and knows how much it holds", await reopened.count == 3,
+              "\(await reopened.count)")
+
+        // MARK: forgetting
+
+        try? FileManager.default.removeItem(at: invoice)
+        let dropped = await reopened.forgetMissingFiles()
+        check("a deleted capture drops out of the index", dropped == 1,
+              "\(dropped) dropped")
+        // Asked of `reopened`, not of `index`. Two instances over one file each
+        // hold their own copy of it and will disagree the moment either writes;
+        // the app has exactly one, and the second here exists only to prove the
+        // file survives a relaunch. Asking the stale one was this check's first
+        // draft, and it failed for that reason rather than a real one.
+        check("and stops being findable",
+              await reopened.search("acme").isEmpty,
+              "\(await reopened.search("acme").map(\.name))")
+
+        // MARK: through Vision
+
+        let shot = directory.appendingPathComponent("history-ocr.png")
+        try ImageEncoder.write(wordsImage(["Kubernetes", "pod evicted"]), to: shot)
+
+        // Whether this half can run is decided by OCR alone, asked directly.
+        // Deciding it from the search result instead conflates "Vision read
+        // nothing" with "search is broken" -- and the negative control for the
+        // checks above breaks search, so it printed INCONCLUSIVE while failing.
+        // A test that changes its own verdict when the code under test breaks is
+        // worth nothing.
+        guard let readable = await TextRecognition.text(inFileAt: shot),
+              readable.localizedCaseInsensitiveContains("kubernetes") else {
+            print("""
+                result:        INCONCLUSIVE — Vision could not read the fixture, so only the \
+                search half was exercised. Those checks still stand.
+                """)
+            return failures == 0 ? 0 : 1
+        }
+        await index.index(shot, capturedAt: .now)
+        let read = await index.search("kubernetes").map(\.name)
+        check("a real capture is indexed by what Vision read in it",
+              read == ["history-ocr.png"], "\(read)")
+        // Indexing is skipped for a file already known, so re-running over a
+        // folder costs nothing. Without this, every launch would re-OCR
+        // everything.
+        let countBefore = await index.count
+        await index.index(shot, capturedAt: .now)
+        check("indexing the same file twice does not add a second row",
+              await index.count == countBefore, "\(countBefore) -> \(await index.count)")
+
+        // MARK: the way in
+        //
+        // Everything above is reachable only if something opens it.
+        //
+        // The menu bar row is asserted in `--selftest-share-flow` rather than
+        // here. Building the status menu reads the share settings, which reads
+        // the Keychain, which in a run with no credentials set up blocks on a
+        // prompt nobody is there to answer -- measured: this check hung for the
+        // full ten minutes and printed nothing.
+        let search = CaptureSearchWindowController.shared
+        search.activatesOnShow = false
+        defer { search.close() }
+        check("the window is not open to begin with", !search.isOpen)
+        search.show()
+        check("and opening it puts one on screen", search.isOpen)
+        search.close()
+        // Closing has to be observed, or the next open would find a stale window
+        // and hand back one that is no longer on screen.
+        for _ in 0..<20 where search.isOpen {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        check("closing it lets go of the window", !search.isOpen)
+
+        print("result:        \(failures == 0 ? "PASS" : "FAIL (\(failures))")")
+        return failures == 0 ? 0 : 1
     }
 
     /// `--selftest-gif`

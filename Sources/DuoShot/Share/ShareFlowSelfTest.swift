@@ -170,6 +170,16 @@ enum ShareFlowSelfTest {
             check("each row has an ⌥ delete alternate", deletable.count == copyable.count,
                   "\(deletable.count) alternates for \(copyable.count) rows")
         }
+        // Not a share check, and it is here anyway: this is the only self-test
+        // that builds the whole status menu with credentials in place. Building
+        // it anywhere else reads the Keychain with nothing configured and blocks
+        // on a prompt nobody is there to answer -- ten minutes, no output.
+        let searchItem = menu.items.first { $0.title == "Search Captures…" }
+        check("menu bar offers Search Captures…", searchItem != nil)
+        // An item with no action is disabled by AppKit's own menu validation, so
+        // one that exists and does nothing looks identical in a screenshot.
+        check("and it is wired to a target",
+              searchItem?.action != nil && searchItem?.target != nil)
         withExtendedLifetime(statusController) {}
 
         // MARK: - Put the bucket back

@@ -276,6 +276,7 @@ test: verify
 	run "image editor"           --selftest-edit $(TEST_OUT); \
 	run "recording trim"         --selftest-trim $(TEST_OUT); \
 	run "gif export"             --selftest-gif $(TEST_OUT); \
+	run "capture history"        --selftest-history $(TEST_OUT); \
 	run "recording area"         --selftest-record $(TEST_OUT) --seconds 2 --rect 400,300,640,400; \
 	run "recording fullscreen"   --selftest-record $(TEST_OUT) --seconds 2; \
 	run "hud recorded (readOnly)" --selftest-record-hud $(TEST_OUT) --seconds 2; \

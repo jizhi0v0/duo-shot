@@ -255,6 +255,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         Task { await ShareService.shared.revoke(key) }
     }
 
+    @objc private func openCaptureSearch() {
+        CaptureSearchWindowController.shared.show()
+    }
+
     @objc private func openAllLinks() {
         AllLinksWindowController.shared.show()
     }
@@ -372,6 +376,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             menu.addItem(recent)
             menu.addItem(.separator())
         }
+
+        // Beside "Open Save Folder" rather than under Recent Links: this is
+        // about what is on *this* machine, and the folder is the other way of
+        // asking the same question.
+        let search = NSMenuItem(
+            title: "Search Captures…", action: #selector(openCaptureSearch), keyEquivalent: "f")
+        search.target = self
+        menu.addItem(search)
 
         let folder = NSMenuItem(
             title: "Open Save Folder", action: #selector(openSaveFolder), keyEquivalent: "")

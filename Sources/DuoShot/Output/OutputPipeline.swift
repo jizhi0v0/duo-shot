@@ -78,6 +78,12 @@ final class OutputPipeline {
         }
 
         Log.app.notice("output \(finalURL.lastPathComponent, privacy: .public) saved=\(wasSaved, privacy: .public)")
+        // Detached and unawaited: the capture is finished as far as the user is
+        // concerned, and reading it takes the better part of a second. Nothing
+        // downstream needs the answer, and making the shutter wait for Vision
+        // would put OCR in the critical path of every screenshot.
+        let indexed = finalURL
+        Task.detached { await CaptureIndex.shared.index(indexed, capturedAt: result.capturedAt) }
         staging.prune()
         return Output(
             result: result, url: finalURL, wasSaved: wasSaved, saveFailed: saveFailed)
