@@ -3,12 +3,17 @@ BUNDLE_ID := com.boli.duoshot
 TEAM_ID   := RS59HDH7Y3
 SIGN_ID   := Developer ID Application: BO LI ($(TEAM_ID))
 CONFIG    ?= release
+MACOS_MIN ?= 26.0
+NOTARY_PROFILE ?= DuoShot
 
 APP       := build/$(APP_NAME).app
 CONTENTS  := $(APP)/Contents
 MACOS_DIR := $(CONTENTS)/MacOS
 RES_DIR   := $(CONTENTS)/Resources
 EXEC      := $(MACOS_DIR)/$(APP_NAME)
+UNIVERSAL_EXEC := build/universal/$(APP_NAME)
+ARM64_SCRATCH  := .build/universal-arm64
+X86_64_SCRATCH := .build/universal-x86_64
 # Hardened Runtime denies the microphone outright, with NO prompt, unless the
 # binary claims com.apple.security.device.audio-input. Measured 2026-07-31:
 # --selftest-microphone reported `before=not determined after=denied` on a
@@ -25,13 +30,14 @@ EXEC      := $(MACOS_DIR)/$(APP_NAME)
 # anywhere in it fails the sign with "AMFIUnserializeXML: syntax error".
 ENTITLEMENTS := Resources/DuoShot.entitlements
 
-.PHONY: all build bundle sign verify run launch logs selftest mic-check install dist clean help
+.PHONY: all build universal bundle sign dr-check verify run launch logs selftest mic-check install dist clean help
 
 all: verify
 
 help:
 	@echo "make build     - swift build ($(CONFIG))"
-	@echo "make bundle    - assemble build/$(APP_NAME).app"
+	@echo "make universal - build arm64 + x86_64 and merge them (dist only)"
+	@echo "make bundle    - assemble build/$(APP_NAME).app from this machine's slice"
 	@echo "make sign      - codesign with Developer ID"
 	@echo "make verify    - assert the Designated Requirement has not drifted (guards TCC)"
 	@echo "make run       - verify, then exec the inner binary with stdout attached"
@@ -39,7 +45,7 @@ help:
 	@echo "make selftest  - headless capture checks"
 	@echo "make logs      - stream os_log for $(BUNDLE_ID)"
 	@echo "make install   - copy to /Applications, restarting a running instance"
-	@echo "make dist      - notarization-ready build (real timestamp) + zip"
+	@echo "make dist      - sign, notarize, staple, validate and zip"
 	@echo "make check-26  - compile against an older macOS SDK on $(CHECK_HOST)"
 	@echo "make share-check - typecheck + test the share Worker (needs node)"
 	@echo "make share-selftest - run the app's share pipeline against a local wrangler dev"
@@ -47,13 +53,40 @@ help:
 build:
 	swift build -c $(CONFIG)
 
+# SwiftPM builds one target triple at a time. A released app has to carry both
+# slices while macOS 26 still runs on Intel Macs, so build into isolated scratch
+# directories and merge only the executable that goes into the bundle.
+universal:
+	@set -eu; \
+	ARM_TRIPLE="arm64-apple-macosx$(MACOS_MIN)"; \
+	INTEL_TRIPLE="x86_64-apple-macosx$(MACOS_MIN)"; \
+	swift build -c $(CONFIG) --triple "$$ARM_TRIPLE" --scratch-path "$(ARM64_SCRATCH)"; \
+	swift build -c $(CONFIG) --triple "$$INTEL_TRIPLE" --scratch-path "$(X86_64_SCRATCH)"; \
+	ARM_BIN="$$(swift build -c $(CONFIG) --triple "$$ARM_TRIPLE" \
+		--scratch-path "$(ARM64_SCRATCH)" --show-bin-path)/$(APP_NAME)"; \
+	INTEL_BIN="$$(swift build -c $(CONFIG) --triple "$$INTEL_TRIPLE" \
+		--scratch-path "$(X86_64_SCRATCH)" --show-bin-path)/$(APP_NAME)"; \
+	test -x "$$ARM_BIN"; test -x "$$INTEL_BIN"; \
+	mkdir -p "$$(dirname "$(UNIVERSAL_EXEC)")"; \
+	lipo -create "$$ARM_BIN" "$$INTEL_BIN" -output "$(UNIVERSAL_EXEC)"; \
+	lipo "$(UNIVERSAL_EXEC)" -verify_arch arm64 x86_64; \
+	echo "universal $$(lipo -archs "$(UNIVERSAL_EXEC)")"
+
 # --- bundle ------------------------------------------------------------------
 # Assembled by hand on purpose. No SwiftPM resources anywhere in this project:
 # .process()/.copy() would emit DuoShot_DuoShot.bundle, which is nested code and
 # must be signed inside-out. Not worth it for one .icns.
-bundle: build
+#
+# Bundles this machine's own slice. `dist` overrides both variables below to
+# bundle the lipo'd binary instead -- deliberately, because the second slice
+# costs a second full compile and `make verify` is the innermost loop in this
+# project. It runs dozens of times a day and not one of those runs is a release.
+BUNDLE_DEPS ?= build
+BUNDLE_EXEC ?= $$(swift build -c $(CONFIG) --show-bin-path)/$(APP_NAME)
+
+bundle: $(BUNDLE_DEPS)
 	@set -eu; \
-	BIN="$$(swift build -c $(CONFIG) --show-bin-path)/$(APP_NAME)"; \
+	BIN="$(BUNDLE_EXEC)"; \
 	test -x "$$BIN" || { echo "missing product: $$BIN"; exit 1; }; \
 	rm -rf "$(APP)"; \
 	mkdir -p "$(MACOS_DIR)" "$(RES_DIR)"; \
@@ -84,7 +117,11 @@ sign: bundle
 # The screen-recording grant is keyed on the Designated Requirement. For a
 # Developer ID signature the DR contains no cdhash, so it is byte-identical
 # across rebuilds -- and that invariant IS the test. Build twice and diff.
-verify: sign
+# Factored out of `verify` because it has to run twice on a release: `dist`
+# signs a second time, with --timestamp, which is a different codesign
+# invocation from the one `verify` checked. The build that actually ships is
+# the last one that should be taken on trust.
+dr-check:
 	@codesign --verify --strict --verbose=2 "$(APP)" 2>&1 | sed 's/^/  /'
 	@codesign -d -r- "$(APP)" 2>/dev/null > build/actual-requirements.txt
 	@if diff -u Resources/expected-requirements.txt build/actual-requirements.txt; then \
@@ -93,6 +130,8 @@ verify: sign
 		echo "!! Designated Requirement drifted -- the TCC grant WILL be lost."; \
 		exit 1; \
 	fi
+
+verify: sign dr-check
 	@otool -l "$(EXEC)" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print "  minos " $$2; exit}'
 
 # --- running -----------------------------------------------------------------
@@ -325,7 +364,11 @@ install: verify
 	@open -a "/Applications/$(APP_NAME).app"
 	@echo "installed and relaunched /Applications/$(APP_NAME).app"
 
-dist: bundle
+# One-time setup on a release machine:
+#   xcrun notarytool store-credentials DuoShot
+# Override the profile name with `make dist NOTARY_PROFILE=...`.
+dist:
+	@$(MAKE) verify BUNDLE_DEPS=universal BUNDLE_EXEC='$(UNIVERSAL_EXEC)'
 	@codesign --force \
 		--sign "$(SIGN_ID)" \
 		--identifier $(BUNDLE_ID) \
@@ -333,11 +376,18 @@ dist: bundle
 		--entitlements $(ENTITLEMENTS) \
 		--timestamp \
 		"$(APP)"
+	@$(MAKE) dr-check
 	@mkdir -p dist
+	@rm -f "dist/$(APP_NAME)-submit.zip" "dist/$(APP_NAME).zip"
+	@ditto -c -k --keepParent "$(APP)" "dist/$(APP_NAME)-submit.zip"
+	@xcrun notarytool submit "dist/$(APP_NAME)-submit.zip" \
+		--keychain-profile "$(NOTARY_PROFILE)" --wait
+	@xcrun stapler staple "$(APP)"
+	@xcrun stapler validate "$(APP)"
+	@spctl --assess --type execute --verbose=2 "$(APP)"
 	@ditto -c -k --keepParent "$(APP)" "dist/$(APP_NAME).zip"
-	@echo "dist/$(APP_NAME).zip"
-	@echo "On the second Mac, either notarize this or run:"
-	@echo "  xattr -dr com.apple.quarantine /Applications/$(APP_NAME).app"
+	@rm -f "dist/$(APP_NAME)-submit.zip"
+	@echo "notarized dist/$(APP_NAME).zip"
 
 clean:
 	rm -rf .build build dist
