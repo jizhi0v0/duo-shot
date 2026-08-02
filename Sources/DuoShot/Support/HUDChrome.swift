@@ -191,7 +191,11 @@ final class HUDPill: NSView {
     /// a red button, and this one must not be pressed yet.
     private static let inertFill = NSColor(white: 1, alpha: 0.10)
 
+    /// An empty title is a pill that is only its mark — what a bar full of tools
+    /// needs, where four words would be wider than the window and the four marks
+    /// read as one control. Such a pill carries its meaning in a `toolTip`.
     static func width(for title: String) -> CGFloat {
+        guard !title.isEmpty else { return horizontalPadding * 2 + markSize }
         let text = (title as NSString).size(withAttributes: [.font: font]).width.rounded(.up)
         return horizontalPadding * 2 + markSize + markTextGap + text
     }
@@ -206,17 +210,21 @@ final class HUDPill: NSView {
     init(title: String, mark: Mark, tint: NSColor, height: CGFloat = HUDMetrics.controlHeight) {
         self.tint = tint
         self.label = NSTextField(labelWithString: title)
-        super.init(frame: CGRect(x: 0, y: 0, width: Self.width(for: title), height: height))
+        let width = Self.width(for: title)
+        super.init(frame: CGRect(x: 0, y: 0, width: width, height: height))
         wantsLayer = true
         layer?.cornerRadius = HUDMetrics.controlRadius
         layer?.cornerCurve = .continuous
         layer?.backgroundColor = tint.cgColor
 
         let markY = ((height - Self.markSize) / 2).rounded()
+        // Centred when there is no title to sit beside.
+        let markX = title.isEmpty
+            ? ((width - Self.markSize) / 2).rounded() : Self.horizontalPadding
         switch mark {
         case .dot:
             let dot = NSView(frame: CGRect(
-                x: Self.horizontalPadding, y: markY,
+                x: markX, y: markY,
                 width: Self.markSize, height: Self.markSize))
             dot.wantsLayer = true
             dot.layer?.backgroundColor = NSColor.white.cgColor
@@ -225,7 +233,7 @@ final class HUDPill: NSView {
             markDot = dot
         case .symbol(let name):
             let glyph = NSImageView(frame: CGRect(
-                x: Self.horizontalPadding, y: markY,
+                x: markX, y: markY,
                 width: Self.markSize, height: Self.markSize))
             glyph.image = HUDMetrics.symbol(name, pointSize: 10, weight: .bold)
             glyph.contentTintColor = .white
@@ -243,11 +251,44 @@ final class HUDPill: NSView {
         addSubview(label)
     }
 
+    /// Whether this pill is the chosen one of a set — the tool in force in
+    /// `EditToolbar`, where four pills are one control and three of them have to
+    /// look like the road not taken.
+    ///
+    /// Starts true because the constructor fills with `tint`, and the two must
+    /// agree or the first `setSelected(false)` would be a no-op against a pill
+    /// that is already coloured in. Distinct from `isLive`: an unselected tool is
+    /// perfectly pressable, and keeps its white ink to say so.
+    private(set) var isSelected = true
+
+    func setSelected(_ selected: Bool, animated: Bool) {
+        guard selected != isSelected else { return }
+        isSelected = selected
+        guard isLive else { return }
+        HUDMetrics.fill(self, with: selected ? tint : Self.inertFill, animated: animated)
+    }
+
+    /// Changes the word without changing the pill's width.
+    ///
+    /// Only for a control whose titles are all the same length — the text tool's
+    /// point sizes are two digits apiece — because a pill that resized itself
+    /// would move everything to its right, and `EditToolbar` is built on its
+    /// geometry being a constant.
+    func setTitle(_ title: String) {
+        guard label.stringValue != title else { return }
+        label.stringValue = title
+        label.sizeToFit()
+        label.setFrameOrigin(CGPoint(
+            x: Self.horizontalPadding + Self.markSize + Self.markTextGap,
+            y: ((bounds.height - label.frame.height) / 2).rounded()))
+    }
+
     func setLive(_ live: Bool, animated: Bool) {
         guard live != isLive else { return }
         isLive = live
         let ink: NSColor = isLive ? .white : .tertiaryLabelColor
-        HUDMetrics.fill(self, with: isLive ? tint : Self.inertFill, animated: animated)
+        HUDMetrics.fill(
+            self, with: isLive && isSelected ? tint : Self.inertFill, animated: animated)
         if animated {
             HUDMetrics.crossfade(label)
             if let markGlyph { HUDMetrics.crossfade(markGlyph) }
@@ -262,8 +303,15 @@ final class HUDPill: NSView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     /// The subviews are decoration; the pill owns the click.
+    ///
+    /// `isHidden` has to be answered here, because the check that normally makes
+    /// a hidden view untouchable lives in `NSView`'s own `hitTest` — the one this
+    /// replaces. `EditToolbar` keeps every pill it has and hides the ones its
+    /// state does not use, and without this an invisible pill parked at the
+    /// container's origin sat over the visible one and ate every click on it.
     override func hitTest(_ point: NSPoint) -> NSView? {
-        bounds.contains(convert(point, from: superview)) ? self : nil
+        guard !isHidden else { return nil }
+        return bounds.contains(convert(point, from: superview)) ? self : nil
     }
 
     override func mouseDown(with event: NSEvent) {
