@@ -27,15 +27,6 @@ final class ViewerWindowController {
     var activatesOnShow = true
 
     /// Called with a capture's URL and a fresh thumbnail once a redaction has
-    /// been written over its file.
-    ///
-    /// Injected by whoever owns the preview stack, the way
-    /// `CaptureCoordinator.additionalExcludedWindowIDs` is. The viewer must not
-    /// reach for the stack itself: a card is a thing that may or may not still be
-    /// on screen six seconds after a capture, and a window that knew how to find
-    /// one would also have to know when there is nothing to find.
-    var onImageRedacted: ((URL, NSImage) -> Void)?
-
     /// The same for a recording that has been trimmed: the URL, and a poster
     /// frame decoded from the file as it is now. Separate from the still's hook
     /// rather than one "edited" callback, because the two are wired to the same
@@ -74,12 +65,28 @@ final class ViewerWindowController {
         // title bar said "DuoShot 2026-08-01 at 16.11.07.png — DuoShot".
         // Content is dark whatever the file is — a screenshot letterboxed against
         // a light window reads as part of the image.
+        //
+        // `isOpaque = false` afterwards, and it is not optional: setting an
+        // opaque `backgroundColor` sets the flag, and an opaque window is drawn
+        // by the window server without the rounded-corner mask. On screen that is
+        // a window with square corners, which is odd; in a *capture* of that
+        // window it is worse, because a window shot carries the window's own
+        // alpha — so DuoShot's own viewer came out square-cornered inside the
+        // rounded card `ImagePadding` draws around it. The window still paints
+        // the same colour; it just no longer claims every pixel of its frame.
         window.backgroundColor = NSColor(white: 0.11, alpha: 1)
+        window.isOpaque = false
         window.setContentSize(content.size)
         // Space plays and pauses a recording, and the arrow keys step it — but
         // only while AVPlayerView holds the keyboard, and it does not take it on
         // its own.
         window.initialFirstResponder = content.keyView ?? content.view
+        if let editor = content.view as? ImageEditor {
+            editor.onPictureResized = { [weak self, weak window] size in
+                guard let self, let window else { return }
+                resize(window, toPicture: size)
+            }
+        }
         place(window, onDisplay: entry.sourceDisplayID)
 
         windows[entry.url] = window
@@ -177,37 +184,99 @@ final class ViewerWindowController {
         else { return nil }
 
         // Recognition runs against `url`, not against `image`, so zoom cannot
-        // affect it. `RedactionEditor` puts the same menu on all three of its
+        // affect it. `ImageEditor` puts the same menu on all three of its
         // views for the reason its comment gives.
         let menu = NSMenu()
         menu.addItem(.action("Copy Text") { CopyText.run(fileAt: url) })
 
+        // The picture's own size, clamped into a band.
+        //
+        // Two failures to avoid, and they pull opposite ways. Sizing the window
+        // to the capture makes the editor a different shape every time it opens:
+        // a tall phone screenshot is a narrow column, the next one is a
+        // letterbox, and the tools are somewhere else in both. Sizing it to a
+        // fixed frame instead leaves a modest capture floating in the middle of a
+        // window twice its size, because the fit refuses to scale a screenshot
+        // *up* — magnifying pixels to fill a frame is the one thing a screenshot
+        // viewer must not do.
+        //
+        // So: a floor wide enough for the toolbar, a ceiling that keeps a
+        // full-screen grab inside the display, and the capture's own size plus
+        // its margin in between.
+        //
         // `NSImage.size` is in POINTS — the encoder stamps the DPI, so a 2× 5K
-        // capture reports 2560×1440 here, not 5120×2880. That is the right unit
-        // for a window: it makes "actual size" mean the size the thing was on
-        // screen when it was taken.
-        let size = fitted(image.size)
-        guard let editor = RedactionEditor(
+        // capture reports 2560×1440 here rather than 5120×2880 — and it still
+        // decides how far the picture is scaled to fit inside that frame.
+        let picture = fitted(Self.band(around: image.size), reserving: ImageEditor.chromeHeight)
+        let size = CGSize(
+            width: picture.width, height: picture.height + ImageEditor.chromeHeight)
+        guard let editor = ImageEditor(
             url: url, image: image, menu: menu,
             frame: CGRect(origin: .zero, size: size))
         else { return nil }
-        editor.onRedacted = { [weak self] thumbnail in
-            self?.onImageRedacted?(url, thumbnail)
-        }
 
         return Content(view: editor, size: size, onShown: { editor.zoomToFit() })
     }
 
     // MARK: - Geometry
 
+    /// The largest the picture area gets before the screen has its say. A shade
+    /// wider than tall because most captures are, and large enough that a
+    /// full-screen grab is still legible inside it.
+    static let standardPicture = CGSize(width: 1080, height: 720)
+
+    /// The smallest it gets. Wide enough for the toolbar to sit in with room
+    /// either side of it, since a bar that touched both edges of its own window
+    /// would look like a mistake, and tall enough that the picture is the thing
+    /// in the window rather than the thing between two bands.
+    static let minimumPicture = CGSize(width: 560, height: 420)
+
     /// The largest window that shows the whole thing without covering the screen.
     ///
     /// A full-screen capture is by definition as big as the display it came from,
     /// so opening at natural size would produce a window that cannot fit —
     /// title bar off the top, and no way to see the bottom edge.
-    private func fitted(_ size: CGSize) -> CGSize {
+    /// The picture's own size with its margin, clamped into the band.
+    private static func band(around picture: CGSize) -> CGSize {
+        let margin = ZoomingScrollView.fitPadding * 2
+        return CGSize(
+            width: min(max(picture.width + margin, minimumPicture.width),
+                       standardPicture.width),
+            height: min(max(picture.height + margin, minimumPicture.height),
+                        standardPicture.height))
+    }
+
+    /// Re-sizes a viewer around a picture that has just changed size, which only
+    /// a crop does.
+    ///
+    /// Same rule as opening, applied again: a window that keeps the shape of the
+    /// picture it *used* to hold leaves the cropped one floating in the middle of
+    /// a frame two sizes too big, which is the state this whole band of sizes
+    /// exists to avoid.
+    ///
+    /// The top left stays put. Growing or shrinking about the centre moves the
+    /// title bar out from under the pointer that just finished a drag, and every
+    /// other window on this system resizes downward and to the right.
+    private func resize(_ window: NSWindow, toPicture size: CGSize) {
+        let picture = fitted(Self.band(around: size), reserving: ImageEditor.chromeHeight)
+        let content = CGSize(
+            width: picture.width, height: picture.height + ImageEditor.chromeHeight)
+        let frame = window.frameRect(forContentRect: CGRect(origin: .zero, size: content))
+        guard abs(frame.width - window.frame.width) > 1
+            || abs(frame.height - window.frame.height) > 1 else { return }
+        window.setFrame(
+            CGRect(x: window.frame.minX, y: window.frame.maxY - frame.height,
+                   width: frame.width, height: frame.height),
+            display: true, animate: false)
+    }
+
+    /// `reserving` is height the window needs for something that is not the
+    /// picture, and comes off the screen's allowance before the ratio is taken.
+    private func fitted(_ size: CGSize, reserving chrome: CGFloat = 0) -> CGSize {
         guard let visible = NSScreen.main?.visibleFrame else { return size }
-        let cap = CGSize(width: visible.width * 0.85, height: visible.height * 0.85)
+        let cap = CGSize(
+            width: visible.width * 0.85,
+            height: max(120, visible.height * 0.85 - chrome))
         let ratio = min(cap.width / size.width, cap.height / size.height, 1)
         return CGSize(
             width: max(320, (size.width * ratio).rounded()),
@@ -255,8 +324,8 @@ final class ViewerWindowController {
         editorForTest(url)?.magnification
     }
 
-    func editorForTest(_ url: URL) -> RedactionEditor? {
-        windows[url]?.contentView as? RedactionEditor
+    func editorForTest(_ url: URL) -> ImageEditor? {
+        windows[url]?.contentView as? ImageEditor
     }
 
     func trimEditorForTest(_ url: URL) -> VideoTrimEditor? {
@@ -294,6 +363,29 @@ private final class ViewerWindow: NSWindow {
     }
 }
 
+/// The clip view that keeps a small picture in the middle.
+///
+/// `NSScrollView` pins its document to the bottom left when the document is
+/// smaller than the clip — the scroll origin has nowhere to go, so it stays at
+/// zero — which puts a fitted screenshot in the corner of its own viewer with all
+/// the empty space on two sides. Constraining the proposed bounds is the only
+/// hook that catches every way the origin can change: zooming, resizing, fitting,
+/// and the scroll that follows each of them.
+final class CenteringClipView: NSClipView {
+    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect {
+        var rect = super.constrainBoundsRect(proposedBounds)
+        guard let document = documentView else { return rect }
+        let frame = document.frame
+        if rect.width > frame.width {
+            rect.origin.x = ((frame.width - rect.width) / 2).rounded()
+        }
+        if rect.height > frame.height {
+            rect.origin.y = ((frame.height - rect.height) / 2).rounded()
+        }
+        return rect
+    }
+}
+
 /// A scroll view that knows how to frame the thing inside it.
 ///
 /// Zoom-to-fit has to live here rather than at the call site because it is
@@ -302,12 +394,23 @@ private final class ViewerWindow: NSWindow {
 /// a growing margin around it, which reads as the window and the picture coming
 /// apart.
 ///
-/// Internal rather than private because `RedactionEditor` is what holds one now:
+/// Internal rather than private because `ImageEditor` is what holds one now:
 /// the still viewer's content view is the editor, and the scroll view is the
 /// layer of it that owns zoom.
 final class ZoomingScrollView: NSScrollView {
     /// The document's size in points, which is what "actual size" means.
     var naturalSize: CGSize = .zero
+
+    /// The gap left around the picture when it is fitted, so it reads as a thing
+    /// on a surface rather than as the window's own contents. Only the fit uses
+    /// it: zooming in is for looking at pixels and a margin there would be a
+    /// margin taken out of them.
+    ///
+    /// Small on purpose. This is the breathing room around a picture, not a
+    /// border — and `ViewerWindowController` sizes the window from the same
+    /// number, so anything generous here is doubled into empty window.
+    static let fitPadding: CGFloat = 10
+    var padding: CGFloat = ZoomingScrollView.fitPadding
 
     /// True while the magnification is whatever it takes to fit, false once the
     /// user has zoomed. Only the fitting state follows a resize — chasing the
@@ -348,8 +451,45 @@ final class ZoomingScrollView: NSScrollView {
         // be taken against the *frame* — using bounds here makes the fit depend
         // on the magnification it is trying to compute.
         let box = contentSize
-        let ratio = min(box.width / naturalSize.width, box.height / naturalSize.height)
-        magnification = min(max(ratio, minMagnification), maxMagnification)
+        // Never above 1: the window is a fixed frame now and a small capture
+        // sits in the middle of it, so without this a 320-point window shot
+        // would be blown up to fill the viewer and shown blurrier than it is.
+        // Fitting means "no larger than it really is", not "as large as the
+        // space allows".
+        let ratio = min(
+            max(box.width - padding * 2, 1) / naturalSize.width,
+            max(box.height - padding * 2, 1) / naturalSize.height,
+            1)
+        magnification = min(max(Self.snapped(ratio), minMagnification), maxMagnification)
+    }
+
+    /// The largest 1/n at or below `ratio` — 1, ½, ⅓, ¼ …
+    ///
+    /// A picture shown at 0.62 has every one of its pixels resampled into a
+    /// fraction of a screen pixel: fine for a photograph, visibly wrong for a
+    /// screenshot, whose whole content is one-pixel lines and hinted text. At
+    /// 1/n each screen pixel is a clean average of exactly n² image pixels, and
+    /// glyph edges land where they were drawn.
+    ///
+    /// It matters most for the thing that is *not* in the picture: text being
+    /// typed is drawn live at screen resolution while the same words already
+    /// committed are image pixels being resampled. At a fraction like 0.62 the
+    /// two land on different subpixel phases and the committed line reads as
+    /// very slightly tighter — measured on a report of exactly that, one pixel
+    /// per glyph, about one per cent over a line. At 1/n they agree.
+    ///
+    /// The cost is honest: a picture that would have fitted at 0.62 is shown at
+    /// 0.5 instead. A capture is worth more sharp and smaller than fuzzy and
+    /// larger.
+    static func snapped(_ ratio: CGFloat) -> CGFloat {
+        guard ratio > 0, ratio < 1 else { return min(ratio, 1) }
+        let steps = (1 / ratio).rounded(.up)
+        let clean = 1 / max(1, steps)
+        // Only when it is nearly free. Snapping 0.9 down to 0.5 would halve the
+        // picture to sharpen it, which is not a trade anyone asked for; snapping
+        // 0.55 down to 0.5 costs nine per cent and buys a screenshot whose
+        // one-pixel lines are still one pixel.
+        return ratio / clean <= 1.15 ? clean : ratio
     }
 
     /// Double-click toggles between fitting and actual size, zooming about the

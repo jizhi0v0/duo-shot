@@ -83,10 +83,21 @@ final class ImageEditor: NSView {
     private var renderTask: Task<Void, Never>?
     private var stack = EditList()
     private var tool: Tool = .pointer
+    /// The size the next piece of text is written at. Kept here rather than in
+    /// the canvas because the toolbar sets it and re-opening an annotation reads
+    /// it back — the canvas is told, never asked.
+    private var textSize: CGFloat = ImageEdit.textSize
     /// Bumped on every re-render so a slow one cannot land on top of a newer one:
     /// an undo races the render it is undoing, and losing that race would leave
     /// the picture showing an edit the list no longer has.
     private var renderGeneration = 0
+
+    /// Called when the picture itself changes size — which only a crop does.
+    ///
+    /// The window is not this view's to resize, and the rule for how big it
+    /// should be belongs with the rule that sized it when it opened. Injected,
+    /// like every other thing this view needs from outside itself.
+    var onPictureResized: ((CGSize) -> Void)?
 
     init?(url: URL, image: NSImage, menu: NSMenu, frame: CGRect) {
         guard image.size.width >= 1, image.size.height >= 1,
@@ -158,6 +169,17 @@ final class ImageEditor: NSView {
         addSubview(scrollView)
 
         canvas.onEdit = { [weak self] edit in self?.add(edit) }
+        canvas.takeTextForEditing = { [weak self] point in self?.takeText(at: point) }
+        canvas.textUnder = { [weak self] point in self?.textBounds(at: point) }
+        canvas.moveText = { [weak self] from, to in self?.moveText(from: from, to: to) }
+        canvas.textSize = textSize
+        canvas.textRasterScale = (pixelSize.width / originalPointSize.width
+            + pixelSize.height / originalPointSize.height) / 2
+        canvas.onTypingNeedsCleanPreview = { [weak self] in self?.renderNow() }
+        canvas.onTextSizeAdopted = { [weak self] size in
+            self?.textSize = size
+            self?.refreshBar()
+        }
         canvas.markerCount = { [weak self] in
             self?.stack.edits.count { if case .marker = $0 { true } else { false } } ?? 0
         }
@@ -167,6 +189,7 @@ final class ImageEditor: NSView {
         }
         bar.onTool = { [weak self] tool in self?.choose(tool) }
         bar.onUndo = { [weak self] in self?.undo() }
+        bar.onTextSize = { [weak self] size in self?.chooseTextSize(size) }
         footer.onCopy = { [weak self] in self?.copyOut() }
 
         addSubview(bar)
@@ -295,6 +318,69 @@ final class ImageEditor: NSView {
     /// every write is flattened onto, and because undoing the crop must leave the
     /// marks where they were drawn rather than shifted by the crop that no longer
     /// exists.
+    /// The text under a point, removed from the list and handed back so the box
+    /// can re-open on it.
+    ///
+    /// The list is in the original picture's coordinates and the canvas is in
+    /// the cropped one, so both directions go through the crop's origin — the
+    /// same conversion `add` makes, in reverse.
+    /// The same lookup `takeText` does, without taking anything: what the hover
+    /// highlight is drawn around.
+    private func textBounds(at point: CGPoint) -> CGRect? {
+        let offset = stack.crop?.origin ?? .zero
+        let hit = CGPoint(x: point.x + offset.x, y: point.y + offset.y)
+        for edit in stack.edits.reversed() {
+            guard case .text(let anchor, let string, let size) = edit else { continue }
+            let box = ImageEdit.bounds(ofText: string, at: anchor, size: size,
+                                       within: originalPointSize)
+            guard box.insetBy(dx: -4, dy: -4).contains(hit) else { continue }
+            return box.offsetBy(dx: -offset.x, dy: -offset.y)
+        }
+        return nil
+    }
+
+    /// Moves the text under `from` by the drag's distance.
+    ///
+    /// Replaces the entry rather than removing and re-adding it, so the list
+    /// keeps its order — a note dragged out of the way must not jump in front of
+    /// the redaction it was drawn behind — and so one drag is one step to undo.
+    private func moveText(from: CGPoint, to: CGPoint) {
+        let offset = stack.crop?.origin ?? .zero
+        let hit = CGPoint(x: from.x + offset.x, y: from.y + offset.y)
+        let delta = CGPoint(x: to.x - from.x, y: to.y - from.y)
+        for index in stack.edits.indices.reversed() {
+            guard case .text(let anchor, let string, let size) = stack.edits[index],
+                  ImageEdit.bounds(ofText: string, at: anchor, size: size,
+                                   within: originalPointSize)
+                    .insetBy(dx: -4, dy: -4).contains(hit)
+            else { continue }
+            stack.replace(at: index, with: .text(
+                CGPoint(x: anchor.x + delta.x, y: anchor.y + delta.y), string, size))
+            scheduleRender()
+            refreshBar()
+            return
+        }
+    }
+
+    private func takeText(
+        at point: CGPoint
+    ) -> (anchor: CGPoint, string: String, size: CGFloat)? {
+        let offset = stack.crop?.origin ?? .zero
+        let hit = CGPoint(x: point.x + offset.x, y: point.y + offset.y)
+        // Last first: the most recently made annotation is the one on top.
+        for index in stack.edits.indices.reversed() {
+            guard case .text(let anchor, let string, let size) = stack.edits[index],
+                  ImageEdit.bounds(ofText: string, at: anchor, size: size,
+                                   within: originalPointSize)
+                    .insetBy(dx: -4, dy: -4).contains(hit)
+            else { continue }
+            stack.remove(at: index)
+            refreshBar()
+            return (CGPoint(x: anchor.x - offset.x, y: anchor.y - offset.y), string, size)
+        }
+        return nil
+    }
+
     private func add(_ edit: ImageEdit) {
         let offset = stack.crop?.origin ?? .zero
         stack.push(edit.moved(by: offset))
@@ -314,9 +400,18 @@ final class ImageEditor: NSView {
         refreshBar()
     }
 
+    /// Sets the size the next piece of text is written at, and re-arms the text
+    /// tool while doing it: picking a size is asking to write something.
+    private func chooseTextSize(_ size: CGFloat) {
+        textSize = size
+        canvas.textSize = size
+        if tool != .text { choose(.text) } else { refreshBar() }
+    }
+
     private func refreshBar() {
         bar.setState(
-            tool: tool, canUndo: stack.canUndo, canRedo: stack.canRedo, isBusy: isExporting)
+            tool: tool, textSize: textSize,
+            canUndo: stack.canUndo, canRedo: stack.canRedo, isBusy: isExporting)
         footer.setState(hasEdits: !stack.isEmpty, isBusy: isExporting)
         needsLayout = true
     }
@@ -337,7 +432,6 @@ final class ImageEditor: NSView {
     private static let renderDelay = Duration.milliseconds(120)
 
     private func scheduleRender() {
-        canvas.crop = nil
         renderTask?.cancel()
         let edits = stack.edits
         renderTask = Task { [weak self] in
@@ -345,6 +439,15 @@ final class ImageEditor: NSView {
             guard !Task.isCancelled else { return }
             await self?.rerender(edits)
         }
+    }
+
+    /// Removes a re-opened annotation from the preview only after its contents
+    /// actually change. A plain click keeps the exact old bitmap pixels; that is
+    /// the only hand-off with zero per-glyph raster difference.
+    private func renderNow() {
+        renderTask?.cancel()
+        let edits = stack.edits
+        renderTask = Task { [weak self] in await self?.rerender(edits) }
     }
 
     private func rerender(_ edits: [ImageEdit]) async {
@@ -378,13 +481,14 @@ final class ImageEditor: NSView {
 
     private func adopt(_ image: CGImage, pointSize size: CGSize) {
         let resized = size != pointSize
-        // The *point* size, not the pixel size: the capture's DPI is what makes a
-        // 2× picture the size it was on screen rather than twice that.
-        imageView.image = NSImage(cgImage: image, size: size)
-        pointSize = size
-        pixelSize = CGSize(width: CGFloat(image.width), height: CGFloat(image.height))
-        canvas.clearPending()
         if resized {
+            // Frames first, picture second, and in that order for a reason: set
+            // the image while the views are still the old size and there is one
+            // layout pass where a smaller bitmap is stretched across a larger
+            // frame. It lasts a frame and it looks like the whole picture
+            // flinching — most visible on the text, which squashes and springs
+            // back.
+            //
             // A crop takes effect the moment the drag ends, so the canvas is a
             // different size now and everything drawn on it from here is in the
             // new picture's coordinates — see `add`, which puts them back into
@@ -393,7 +497,20 @@ final class ImageEditor: NSView {
             canvas.frame = box
             imageView.frame = box
             scrollView.naturalSize = size
+        }
+        // The *point* size, not the pixel size: the capture's DPI is what makes a
+        // 2× picture the size it was on screen rather than twice that.
+        imageView.image = NSImage(cgImage: image, size: size)
+        pointSize = size
+        pixelSize = CGSize(width: CGFloat(image.width), height: CGFloat(image.height))
+        canvas.clearPending(revealTyping: true)
+        if resized {
+            onPictureResized?(size)
             zoomToFit()
+            // The crop frame is drawn from the canvas's bounds, and the canvas
+            // has just changed size: without this it keeps the shape the picture
+            // had before the crop, hanging off the edge of the one it has now.
+            canvas.refreshCropFrame()
         }
         refreshBar()
     }
@@ -577,12 +694,20 @@ final class ImageEditor: NSView {
     /// Edit button that did nothing at all once passed every other check here.
     var barFrameForTest: CGRect { bar.frame }
 
+    /// Where the picture is scrolled to, which nothing about opening a text box
+    /// may change.
+    var scrollOriginForTest: CGPoint { scrollView.documentVisibleRect.origin }
+
     /// Where the picture actually is, which is the half of the layout the bar's
     /// own frame cannot answer.
     var pictureFrameForTest: CGRect { scrollView.frame }
 
 
     var isEditingForTest: Bool { isEditing }
+
+    /// What the hover highlight is currently drawn around, if anything.
+    var hoverForTest: CGRect? { canvas.hoverForTest }
+
 
     func chooseForTest(_ tool: Tool) { choose(tool) }
 }
@@ -600,7 +725,7 @@ final class ImageEditor: NSView {
 /// the viewer's existing behaviour intact — `hitTest` answering nil sends every
 /// click, drag and scroll straight through to the scroll view, which is where
 /// double-click-to-zoom and pinch-to-magnify already live.
-private final class EditCanvas: NSView, NSTextFieldDelegate {
+private final class EditCanvas: NSView, NSTextViewDelegate, NSLayoutManagerDelegate {
     var isActive = false {
         didSet {
             marks.isHidden = !isActive
@@ -615,6 +740,7 @@ private final class EditCanvas: NSView, NSTextFieldDelegate {
             guard tool != oldValue else { return }
             cancelTyping()
             draft = nil
+            marks.hover = nil
             showCropFrame()
             window?.invalidateCursorRects(for: self)
         }
@@ -629,6 +755,10 @@ private final class EditCanvas: NSView, NSTextFieldDelegate {
     /// dragged across the picture would otherwise push a hundred entries onto the
     /// undo stack, and ⌘Z would take a hundred presses to get back.
     private var draft: CGRect?
+
+    /// Re-reads the frame from the canvas's current bounds, for when those have
+    /// changed under it.
+    func refreshCropFrame() { showCropFrame() }
 
     /// The crop frame is the crop tool's own affordance and disappears with it.
     /// With no crop made yet it is the whole picture, so the first thing the tool
@@ -646,9 +776,29 @@ private final class EditCanvas: NSView, NSTextFieldDelegate {
     /// Where a finished gesture goes. The editor turns it into an entry in the
     /// list; this view never holds one.
     var onEdit: (ImageEdit) -> Void = { _ in }
+    /// The size new text is written at, chosen in the toolbar.
+    var textSize: CGFloat = ImageEdit.textSize
+    /// The capture's pixels per point. The renderer creates fonts at this pixel
+    /// size rather than scaling a point-sized font through a CGContext, and the
+    /// live box must do the same for identical hinting.
+    var textRasterScale: CGFloat = 1
+    var onTypingNeedsCleanPreview: () -> Void = {}
+    /// Told back to the editor when re-opening an annotation adopts its size, so
+    /// the toolbar shows the size that is actually being typed at.
+    var onTextSizeAdopted: (CGFloat) -> Void = { _ in }
     /// How many markers are already down, so the one being placed can be drawn
     /// with the number it is about to be given.
     var markerCount: () -> Int = { 0 }
+    /// Asks whether a click landed on text that has already been made, and takes
+    /// it out of the list if it has: what comes back is where it was and what it
+    /// said, so the box can open on top of it holding the same words.
+    var takeTextForEditing: (CGPoint) -> (anchor: CGPoint, string: String, size: CGFloat)? = {
+        _ in nil
+    }
+    /// The same question without the taking, for the pointer passing over.
+    var textUnder: (CGPoint) -> CGRect? = { _ in nil }
+    /// Moves the piece of text under the first point by the drag's distance.
+    var moveText: (CGPoint, CGPoint) -> Void = { _, _ in }
     /// Called when the text field goes away, so the keyboard goes back to the
     /// editor rather than to whichever of the scroll view's parts happens to be
     /// next in the chain — the tool letters are the editor's.
@@ -661,11 +811,14 @@ private final class EditCanvas: NSView, NSTextFieldDelegate {
 
     private var anchor: CGPoint?
     private let marks = EditMarks()
-    private var field: NSTextField?
+    private var box: TypingView?
     /// Where the pointer was when the field opened, which is where the baseline
     /// of the finished text goes. Kept rather than read back off the field: the
     /// field grows as it is typed into, and its frame is not the anchor.
     private var typingAnchor: CGPoint = .zero
+    /// A box that has been committed and is standing in for its own words until
+    /// the render lands.
+    private var committed: NSTextView?
 
     /// What a crop drag is doing to the frame: pulling one corner, sliding the
     /// whole thing, or drawing a new one where there was nothing.
@@ -676,6 +829,9 @@ private final class EditCanvas: NSView, NSTextFieldDelegate {
     }
 
     private var cropGrab: CropGrab?
+    /// A press that landed on a piece of text, before it is known whether it is
+    /// a click that opens it or a drag that moves it.
+    private var textGrab: (start: CGPoint, moved: Bool)?
 
     /// How close to a corner counts as grabbing it. In image points, so it grows
     /// and shrinks with the zoom the way the corner mark itself does.
@@ -697,7 +853,7 @@ private final class EditCanvas: NSView, NSTextFieldDelegate {
         // The text field is a real control and has to keep receiving clicks:
         // selecting what has been typed is the one interaction inside this view
         // that is not a gesture on the picture.
-        if let field, let inside = field.hitTest(convert(point, from: superview)) {
+        if let box, let inside = box.hitTest(convert(point, from: superview)) {
             return inside
         }
         return bounds.contains(convert(point, from: superview)) ? self : nil
@@ -710,12 +866,54 @@ private final class EditCanvas: NSView, NSTextFieldDelegate {
         addCursorRect(bounds, cursor: tool == .text ? .iBeam : .crosshair)
     }
 
+    /// Tracking for the hover highlight, rebuilt whenever the canvas changes
+    /// size — a crop changes it, and a tracking area that outlived its bounds
+    /// would report the pointer as being somewhere it is not.
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self))
+    }
+
+    /// What the text tool can re-open, lit up as the pointer passes over it.
+    ///
+    /// Clicking a piece of text to correct it is not a thing anyone would guess
+    /// at, and an affordance nobody can see is a feature nobody has.
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        let hit = isActive && tool == .text && !isTyping
+            ? textUnder(convert(event.locationInWindow, from: nil))
+            : nil
+        guard hit != marks.hover else { return }
+        marks.hover = hit
+        marks.needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        guard marks.hover != nil else { return }
+        marks.hover = nil
+        marks.needsDisplay = true
+    }
+
     /// Cleared by the editor once the re-render has landed, so a committed mark
     /// does not blink out of existence for the length of a decode.
-    func clearPending() {
+    func clearPending(revealTyping: Bool = false) {
         marks.pending = nil
         marks.pendingMarker = nil
+        draft = nil
+        showCropFrame()
         marks.needsDisplay = true
+        committed?.removeFromSuperview()
+        committed = nil
+        if revealTyping, let box, box.revealsAfterPreviewUpdate {
+            box.revealsAfterPreviewUpdate = false
+            box.showsAnnotation = true
+            box.needsDisplay = true
+        }
     }
 
     // MARK: - Gestures
@@ -742,13 +940,55 @@ private final class EditCanvas: NSView, NSTextFieldDelegate {
             marks.pendingMarker = (point, markerCount() + 1)
             onEdit(.marker(point))
         case .text:
-            beginTyping(at: point)
+            // A drag on a piece of text moves it, and a click opens it. Which
+            // one this is cannot be known yet, so the press only remembers where
+            // it started; `mouseDragged` decides.
+            if !isTyping, textUnder(point) != nil {
+                textGrab = (start: point, moved: false)
+                return
+            }
+            // A click while something is being typed finishes it, and does
+            // nothing else. Opening the next box in the same gesture is what it
+            // used to do, and it meant clicking away from a note left an empty
+            // box sitting where you clicked — the click was a full stop, not the
+            // start of a sentence.
+            if isTyping {
+                commitTyping()
+                return
+            }
+            // Clicking a piece of text opens it again rather than starting a
+            // second one on top of it. Anything else makes an annotation a thing
+            // you can only make and never fix — and the undo stack is not an
+            // editing tool.
+            if let existing = takeTextForEditing(point) {
+                // Re-opened at the size it was written at, not at the size the
+                // toolbar happens to be set to now.
+                textSize = existing.size
+                onTextSizeAdopted(existing.size)
+                beginTyping(at: existing.anchor, holding: existing.string)
+            } else {
+                beginTyping(at: point)
+            }
         }
         marks.needsDisplay = true
     }
 
     override func mouseDragged(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        if var grab = textGrab {
+            // Four points of travel before a press becomes a drag: a click on a
+            // word is never perfectly still, and text that jumped a point every
+            // time it was opened would be worse than text that cannot be moved.
+            if !grab.moved, hypot(point.x - grab.start.x, point.y - grab.start.y) < 4 {
+                return
+            }
+            grab.moved = true
+            textGrab = grab
+            marks.hover = textUnder(grab.start)?.offsetBy(
+                dx: point.x - grab.start.x, dy: point.y - grab.start.y)
+            marks.needsDisplay = true
+            return
+        }
         if cropGrab != nil {
             dragCrop(to: point)
             return
@@ -762,6 +1002,22 @@ private final class EditCanvas: NSView, NSTextFieldDelegate {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if let grab = textGrab {
+            textGrab = nil
+            let point = convert(event.locationInWindow, from: nil)
+            if grab.moved {
+                moveText(grab.start, point)
+                marks.hover = nil
+                marks.needsDisplay = true
+            } else if let existing = takeTextForEditing(grab.start) {
+                // Still a click: open it, the way it did before dragging was a
+                // thing this view knew about.
+                textSize = existing.size
+                onTextSizeAdopted(existing.size)
+                beginTyping(at: existing.anchor, holding: existing.string)
+            }
+            return
+        }
         if cropGrab != nil {
             endCrop()
             return
@@ -863,200 +1119,409 @@ private final class EditCanvas: NSView, NSTextFieldDelegate {
             showCropFrame()
             return
         }
-        draft = nil
+        // The draft stays up until the cropped picture arrives — the same
+        // stand-in every other tool leaves behind. Clearing it here put the
+        // whole uncropped picture back on screen, undimmed, for the length of a
+        // render: one frame of "nothing happened" between letting go and the
+        // crop appearing.
         onEdit(.crop(frame))
     }
 
     // MARK: - Typing
 
-    var isTyping: Bool { field != nil }
+    var isTyping: Bool { box != nil }
 
     var typingAnchorForTest: CGPoint { typingAnchor }
 
-    /// The field is a real `NSTextField` sitting in the document view, so it is
-    /// magnified along with the picture and what is typed is the size it will be
-    /// — the font and the padding come from `ImageEdit`, shared with the renderer
-    /// for exactly that reason.
-    private func beginTyping(at point: CGPoint) {
+    var hoverForTest: CGRect? { marks.hover }
+
+
+    /// The attributes every typed line is drawn with, here and in the renderer.
+    ///
+    /// The paragraph style is the load-bearing part: pinning the line height to
+    /// `ImageEdit.textLineHeight(at: textSize)` is what makes TextKit put a second line where
+    /// `ImageEdit.render` will put it. Kerning is nailed to zero for the reason
+    /// `typeset` gives — the system font's tracking table is applied differently
+    /// by the two typesetters, and on Han characters the difference is visible.
+    /// What every line is drawn with, here and in the renderer — shadow
+    /// included.
+    ///
+    /// The shadow is not decoration and it is not optional: `ImageEdit.render`
+    /// draws one under every annotation, so text without it is text that will
+    /// change the moment it is committed. It did, and it was reported three
+    /// times as the words "shaking" or "getting smaller" — measured on the
+    /// reporter's own screenshots, the box was carrying fourteen per cent more
+    /// ink than the same words rendered, because a shadow eats into the contrast
+    /// at every glyph edge.
+    private func typingAttributes(shadowed: Bool = true) -> [NSAttributedString.Key: Any] {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.minimumLineHeight = ImageEdit.textLineHeight(at: textSize)
+        paragraph.maximumLineHeight = ImageEdit.textLineHeight(at: textSize)
+        var attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.boldSystemFont(ofSize: textSize),
+            .foregroundColor: NSColor(cgColor: ImageEdit.inkColor) ?? .systemRed,
+            .kern: 0,
+            .tracking: 0,
+            .paragraphStyle: paragraph,
+        ]
+        guard shadowed else { return attributes }
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor(white: 0, alpha: 0.55)
+        shadow.shadowOffset = CGSize(width: 0, height: -1)
+        shadow.shadowBlurRadius = 3
+        attributes[.shadow] = shadow
+        return attributes
+    }
+
+    /// An `NSTextView` rather than an `NSTextField`, for two reasons that turned
+    /// out to be one.
+    ///
+    /// A field is one line: long text ran off the end of it and could not be
+    /// read back. And a field's text is inset and centred by amounts its cell
+    /// does not publish, which meant the box had to be *probed* — draw a glyph,
+    /// find its ink, work backwards — to sit where the render would. A text view
+    /// with `textContainerInset` and `lineFragmentPadding` both zero puts the
+    /// first baseline exactly one ascent below its top edge, and that is a
+    /// number, not a measurement.
+    /// `holding` re-opens an annotation that was already made: the anchor is its
+    /// own, not the pointer's, so the words stay exactly where they were.
+    private func beginTyping(at point: CGPoint, holding existing: String? = nil) {
         commitTyping()
-        let font = NSFont.boldSystemFont(ofSize: ImageEdit.textSize)
-        let metrics = TextFieldInk.metrics(for: font)
-        let box = NSTextField(frame: CGRect(
-            x: 0, y: 0, width: 150, height: metrics.height))
-        // The click lands in the middle of the line, not on its baseline.
+        // The click lands in the middle of the first line, and the anchor is that
+        // line's *top* — a constant, unlike its baseline, which moves with
+        // whatever script is typed into it.
+        typingAnchor = existing == nil
+            ? CGPoint(x: point.x, y: point.y + ImageEdit.textLineHeight(at: textSize) / 2)
+            : point
+
+        let view = TypingView(frame: CGRect(
+            x: 0, y: 0, width: textSize * 4, height: ImageEdit.textLineHeight(at: textSize)))
+        view.annotationSize = textSize
+        view.annotationScale = textRasterScale
+        // Re-opening starts while the old annotation is still baked into the
+        // preview bitmap. Showing this second copy immediately does not move its
+        // bounds, but it composites every antialiased edge twice and adds about
+        // 2.7% ink — perceived as a tiny zoom/stretch. `clearPending` reveals
+        // the live copy only after the old one has left the new preview.
+        view.showsAnnotation = existing == nil
+        view.originalString = existing
+        view.textContainerInset = .zero
+        view.textContainer?.lineFragmentPadding = 0
+        // Wrapped at the right edge of the picture, and nowhere else.
         //
-        // The baseline is what the model stores and what the renderer draws
-        // from, and anchoring the click straight onto it is the arithmetically
-        // tidy thing — but a line of text sits *on* its baseline, so the whole
-        // line, and the caret with it, appears above the pointer. Half a cap
-        // height down puts the click through the middle of the letters, which is
-        // where a pointer feels like it is.
-        typingAnchor = CGPoint(x: point.x, y: point.y - font.capHeight / 2)
-        box.font = font
-        box.textColor = NSColor(cgColor: ImageEdit.inkColor) ?? .systemRed
-        // No plate behind it. A white box is the size of the *field* rather than
-        // of the words, so before anything is typed it is a large grey slab
-        // sitting on the picture — and it makes the moment of committing look
-        // like a change of style rather than the same text staying put. The
-        // dashed frame in `EditMarks` is what says where the typing is going.
-        box.backgroundColor = .clear
-        box.drawsBackground = false
-        box.isBordered = false
-        box.isBezeled = false
-        box.focusRingType = .none
-        box.delegate = self
-        // Small and grey, against the annotation's own 20-point bold: a
-        // placeholder set in the text's font is a line of shouting grey letters
-        // the size of the thing you are about to write, and it reads as content.
-        box.placeholderAttributedString = NSAttributedString(
-            string: "Type, then ⏎",
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 12),
-                .foregroundColor: NSColor(white: 0.75, alpha: 0.9),
-            ])
-        // Placed by where the field actually puts ink, not by where its metrics
-        // suggest it might. `TextFieldInk` draws a probe glyph and looks — see
-        // the comment there for why every arithmetic version of this was wrong.
-        box.setFrameOrigin(CGPoint(
-            x: typingAnchor.x - metrics.inkLeft,
-            y: typingAnchor.y - metrics.baselineFromBottom))
-        addSubview(box)
-        field = box
-        window?.makeFirstResponder(box)
-        marks.typing = box.frame
+        // The renderer wraps at the same width with the same line breaker, so
+        // the lines in the box are the lines in the file. Anything narrower is a
+        // box inventing breaks the picture does not have; anything wider — an
+        // infinite container, which this was — lets a long sentence run off the
+        // side of the picture where it cannot be read back.
+        view.textContainer?.widthTracksTextView = false
+        view.textContainer?.size = CGSize(
+            width: max(textSize * 4, bounds.width - point.x), height: .greatestFiniteMagnitude)
+        view.annotationWrappingWidth = view.textContainer?.size.width ?? bounds.width
+        view.maxSize = CGSize(
+            width: CGFloat.greatestFiniteMagnitude, height: .greatestFiniteMagnitude)
+        // Rich text on, which reads backwards for a box that only ever holds one
+        // style: with it *off*, `NSTextView` forces its own font and colour onto
+        // everything typed and quietly drops the rest of the attributes — the
+        // paragraph style that pins the line height, the kerning, the tracking.
+        // Those three are the whole of what makes the typing and the render
+        // agree, so they have to survive. `textDidChange` re-stamps the lot, so
+        // nothing pasted in can bring its own style along.
+        view.isRichText = true
+        view.usesFontPanel = false
+        view.font = NSFont.boldSystemFont(ofSize: textSize)
+        view.textColor = NSColor(cgColor: ImageEdit.inkColor) ?? .systemRed
+        view.drawsBackground = false
+        // Clipped to itself, which an `NSView` is not by default.
+        //
+        // This is the one that was actually painting the picture grey. A text
+        // view draws its selection across the whole *line fragment*, and the
+        // fragments here are as wide as the container — ten million points, so
+        // that nothing wraps. Nothing stops that drawing at the edge of the box
+        // unless the box is told to clip, so a drag-selection filled the canvas
+        // with highlight while the box itself stayed the size of its words.
+        view.clipsToBounds = true
+
+        // Neither: this view does not get to decide how big it is.
+        //
+        // A resizable text view sizes itself to its container, and the container
+        // here is infinitely wide so that nothing wraps. That is fine until a
+        // drag-selection, which makes AppKit lay the view out again — and the
+        // box balloons to something the size of its container, with the
+        // selection highlight painted across all of it. `place` is the only
+        // thing that sets this frame, and it sets it to the width of the words.
+        view.isVerticallyResizable = false
+        view.isHorizontallyResizable = false
+        view.typingAttributes = typingAttributes()
+        view.insertionPointColor = NSColor(cgColor: ImageEdit.inkColor) ?? .systemRed
+        // Selected text keeps its own colour on a tint, instead of the system's
+        // default — which is a grey plate with white letters on it, drawn across
+        // the full width of every selected line, and looks for all the world
+        // like the annotation has been replaced by a grey box. It is only
+        // AppKit's unfocused-selection style, but nothing about it says so.
+        view.selectedTextAttributes = [
+            .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.35),
+        ]
+        view.delegate = self
+        view.layoutManager?.delegate = self
+        view.onCommit = { [weak self] in self?.commitTyping() }
+        view.onCancel = { [weak self] in _ = self?.cancelTyping() }
+        view.onMarkedTextChange = { [weak self, weak view] in
+            guard let view else { return }
+            self?.typingContentsDidChange(view)
+        }
+        marks.hover = nil
+        addSubview(view)
+        box = view
+        if let existing {
+            view.textStorage?.setAttributedString(NSAttributedString(
+                string: existing, attributes: typingAttributes()))
+        }
+        place(view)
+        window?.makeFirstResponder(view)
+        if existing != nil {
+            view.setSelectedRange(NSRange(location: (existing! as NSString).length, length: 0))
+        }
+        marks.typing = view.frame
         marks.needsDisplay = true
     }
 
+    /// Top-anchored: the first baseline stays on the anchor and new lines grow
+    /// downwards, which is where a second line goes.
+    private func place(_ view: NSTextView) {
+        guard let layout = view.layoutManager, let container = view.textContainer else { return }
+        layout.ensureLayout(for: container)
+        // Counted in lines, not measured in points. A line of Han characters is
+        // three points shorter than a line of Latin ones, so a box sized to what
+        // its text happens to need changes height as soon as the two are mixed —
+        // which is a box that twitches while you type in it. Every line is one
+        // pinned line height, and the box is however many of those there are.
+        let height = CGFloat(max(1, lineCount(of: layout))) * ImageEdit.textLineHeight(at: textSize)
+        // The glyphs' own width plus a caret, and no more.
+        //
+        // Measured with `boundingRect(forGlyphRange:in:)` rather than
+        // `usedRect(for:)`, which answers with the *container's* width — and this
+        // container is ten million points wide so that nothing ever wraps. A box
+        // that wide is invisible until something is selected, at which point the
+        // selection fills its line to the end of the box and paints a highlight
+        // across the entire picture.
+        let renderedWidth = ImageEdit.bounds(
+            ofText: view.string, at: .zero, size: textSize,
+            within: CGSize(width: container.size.width, height: .greatestFiniteMagnitude)).width
+        let width = max(textSize, inkedWidth(of: layout), renderedWidth) + 2
+
+        view.setFrameSize(CGSize(width: width, height: height))
+        // The view is flipped and the canvas is not, so its top edge is
+        // `frame.maxY` — and the anchor *is* that top edge. Nothing here reads
+        // the text's metrics, which is the point: the frame used to be placed by
+        // asking TextKit where it had put the first baseline, and that answer
+        // changes by a point when the first line stops being pure Chinese. The
+        // compensation arrived a frame after the layout it was compensating for,
+        // so the line twitched every time the script changed.
+        view.setFrameOrigin(CGPoint(x: typingAnchor.x, y: typingAnchor.y - height))
+    }
+
+    /// The widest line's *used* width, walked fragment by fragment.
+    ///
+    /// Neither `usedRect(for:)` nor `boundingRect(forGlyphRange:in:)` will do:
+    /// both answer with the container's width, and this container is ten million
+    /// points wide so that nothing wraps. `lineFragmentUsedRect` is the one that
+    /// reports where the glyphs stop.
+    private func inkedWidth(of layout: NSLayoutManager) -> CGFloat {
+        var width: CGFloat = 0
+        var glyph = 0
+        while glyph < layout.numberOfGlyphs {
+            var effective = NSRange()
+            let used = layout.lineFragmentUsedRect(forGlyphAt: glyph, effectiveRange: &effective)
+            width = max(width, used.maxX)
+            glyph = max(effective.upperBound, glyph + 1)
+        }
+        return width
+    }
+
+    private func lineCount(of layout: NSLayoutManager) -> Int {
+        var lines = 0
+        var glyph = 0
+        while glyph < layout.numberOfGlyphs {
+            var effective = NSRange()
+            _ = layout.lineFragmentRect(forGlyphAt: glyph, effectiveRange: &effective)
+            lines += 1
+            glyph = max(effective.upperBound, glyph + 1)
+        }
+        // A trailing newline gets no fragment of its own until something is
+        // typed into it, and a box that does not grow when ⏎ is pressed reads as
+        // ⏎ having done nothing.
+        if box?.string.hasSuffix("\n") == true { lines += 1 }
+        return lines
+    }
+
     /// Pushes what has been typed into the list, if anything has been.
+    ///
+    /// The view stays on screen afterwards, inert, until the render that
+    /// contains its words arrives — the same trick `marks.pending` plays for a
+    /// redaction and `pendingMarker` for a number. Removing it at the moment of
+    /// commit is the obvious thing and it makes the text blink out for the
+    /// length of a decode and a render, which reads as having lost it.
     private func commitTyping() {
-        guard let box = field else { return }
-        field = nil
+        guard let view = box else { return }
+        box = nil
         marks.typing = nil
         marks.needsDisplay = true
-        let string = box.stringValue
-        box.removeFromSuperview()
+        let string = view.string
         onFocusReturn()
-        guard !string.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-        onEdit(.text(typingAnchor, string))
+        guard !string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            view.removeFromSuperview()
+            return
+        }
+        view.isEditable = false
+        view.isSelectable = false
+        view.textStorage?.setAttributes(
+            typingAttributes(),
+            range: NSRange(location: 0, length: (string as NSString).length))
+        committed?.removeFromSuperview()
+        committed = view
+        onEdit(.text(typingAnchor, string, textSize))
     }
 
     /// Answers whether there was any typing to cancel, because Escape means
     /// something else entirely when there is not.
     @discardableResult
     func cancelTyping() -> Bool {
-        guard let box = field else { return false }
-        field = nil
+        guard let view = box else { return false }
+        box = nil
         marks.typing = nil
         marks.needsDisplay = true
-        box.removeFromSuperview()
+        view.removeFromSuperview()
         onFocusReturn()
         return true
     }
 
-    func controlTextDidChange(_ notification: Notification) {
-        guard let box = field else { return }
-        // Grown to fit rather than scrolled: the field is standing in for the
-        // finished annotation, and text that scrolls out of a fixed box is not
-        // standing in for anything.
-        let width = max(120, box.fittingSize.width + ImageEdit.textSize)
-        box.setFrameSize(CGSize(width: width, height: box.frame.height))
-        marks.typing = box.frame
-        marks.needsDisplay = true
+    /// Pins every line's baseline to the same place inside its box.
+    ///
+    /// This is the hook that makes typing hold still. Without it TextKit sets the
+    /// baseline from the line's own metrics, and a line of Han characters has a
+    /// shallower descent than one with Latin in it — so adding a single letter to
+    /// a Chinese line lifted every glyph in it by a point and a half. The
+    /// renderer uses the same constant, so what is typed and what is drawn agree
+    /// line for line.
+    func layoutManager(
+        _ layoutManager: NSLayoutManager,
+        shouldSetLineFragmentRect lineFragmentRect: UnsafeMutablePointer<CGRect>,
+        lineFragmentUsedRect: UnsafeMutablePointer<CGRect>,
+        baselineOffset: UnsafeMutablePointer<CGFloat>,
+        in textContainer: NSTextContainer,
+        forGlyphRange glyphRange: NSRange
+    ) -> Bool {
+        baselineOffset.pointee = ImageEdit.textBaselineFromTop(at: textSize)
+        return true
     }
 
-    func control(
-        _ control: NSControl, textView: NSTextView, doCommandBy selector: Selector
-    ) -> Bool {
-        switch selector {
-        case #selector(NSResponder.insertNewline(_:)):
-            commitTyping()
-            return true
-        case #selector(NSResponder.cancelOperation(_:)):
-            return cancelTyping()
-        default:
-            return false
+
+
+    func textDidChange(_ notification: Notification) {
+        guard let view = box else { return }
+        // Re-stamped over everything, not just applied to what is typed next:
+        // pasted text arrives with whatever attributes it was copied with, and
+        // one pasted word in the system's default tracking is exactly the kind
+        // of difference that shows up as a twitch on commit.
+        view.textStorage?.setAttributes(
+            typingAttributes(),
+            range: NSRange(location: 0, length: (view.string as NSString).length))
+        typingContentsDidChange(view)
+    }
+
+    /// Shared by ordinary committed input and an IME's in-progress marked text.
+    /// AppKit does not promise `textDidChange` for every marked-text update, but
+    /// the box must grow while 拼音 is still underlined, not only after a
+    /// candidate is chosen.
+    private func typingContentsDidChange(_ view: TypingView) {
+        if let original = view.originalString, view.string != original {
+            view.originalString = nil
+            view.revealsAfterPreviewUpdate = true
+            onTypingNeedsCleanPreview()
         }
+        place(view)
+        view.needsDisplay = true
+        marks.typing = view.frame
+        marks.needsDisplay = true
     }
 }
 
-/// Where an `NSTextField` actually puts its ink, measured rather than derived.
+/// The box being typed into.
 ///
-/// The text has to start at the point that was clicked, because that is where
-/// `ImageEdit.render` will draw it when ⏎ turns the field into an edit — and any
-/// difference between the two is a line of text that jumps as you commit it.
-///
-/// Three arithmetic versions of this were wrong before it was measured. A cell
-/// insets its title horizontally by an amount it does not publish; it centres a
-/// single line vertically inside whatever height the field has, so the baseline
-/// depends on the *field's* height and not only on the font's; and
-/// `titleRect(forBounds:)` on a borderless cell hands back the full bounds, so
-/// asking politely gets an answer that is not the one being drawn. Rendering one
-/// glyph into a bitmap and finding its edges answers all three at once, on any
-/// macOS, for any font — "H" has no descender and no left side-bearing to speak
-/// of, so its lowest ink row *is* the baseline and its leftmost column *is* the
-/// inset.
-///
-/// Cached per font size: it costs one 150×30 offscreen draw, and the answer
-/// cannot change while the app is running.
-@MainActor
-private enum TextFieldInk {
-    struct Metrics {
-        /// The field's height, which is what the vertical centring is measured
-        /// against — so the field must be created at exactly this height.
-        let height: CGFloat
-        /// How far in from the field's left edge the first glyph starts.
-        let inkLeft: CGFloat
-        /// How far up from the field's bottom edge the baseline sits.
-        let baselineFromBottom: CGFloat
-    }
+/// ⏎ is a newline, because text on a screenshot is often two lines and a key
+/// that ends the sentence cannot also break it. ⌘⏎ finishes — as does clicking
+/// anywhere else, which is what most people do — and Escape throws it away.
+private final class TypingView: NSTextView {
+    var onCommit: () -> Void = {}
+    var onCancel: () -> Void = {}
+    var onMarkedTextChange: () -> Void = {}
+    var annotationSize: CGFloat = ImageEdit.textSize
+    var annotationScale: CGFloat = 1
+    var annotationWrappingWidth: CGFloat = .greatestFiniteMagnitude
+    var showsAnnotation = true
+    var originalString: String?
+    var revealsAfterPreviewUpdate = false
 
-    private static var cache: [CGFloat: Metrics] = [:]
-
-    static func metrics(for font: NSFont) -> Metrics {
-        if let known = cache[font.pointSize] { return known }
-        let height = (font.ascender - font.descender).rounded(.up)
-        var measured = Metrics(
-            height: height, inkLeft: 2,
-            baselineFromBottom: (height - (font.ascender - font.descender)) / 2
-                + abs(font.descender))
-
-        let probe = NSTextField(frame: CGRect(x: 0, y: 0, width: 120, height: height))
-        probe.font = font
-        probe.textColor = .white
-        probe.backgroundColor = .clear
-        probe.drawsBackground = false
-        probe.isBordered = false
-        probe.isBezeled = false
-        probe.stringValue = "H"
-        if let rep = probe.bitmapImageRepForCachingDisplay(in: probe.bounds) {
-            probe.cacheDisplay(in: probe.bounds, to: rep)
-            let width = rep.pixelsWide, tall = rep.pixelsHigh
-            let scale = CGFloat(tall) / max(height, 1)
-            var left = Int.max
-            var bottom = -1
-            for row in 0..<tall {
-                for column in 0..<width {
-                    // Any ink at all: the probe is white on nothing, so alpha is
-                    // the whole test and antialiasing counts.
-                    guard (rep.colorAt(x: column, y: row)?.alphaComponent ?? 0) > 0.35 else {
-                        continue
-                    }
-                    left = min(left, column)
-                    bottom = max(bottom, row)
-                }
-            }
-            if left < Int.max, bottom >= 0 {
-                // `colorAt` counts rows from the top; the frame counts from the
-                // bottom.
-                measured = Metrics(
-                    height: height,
-                    inkLeft: CGFloat(left) / scale,
-                    baselineFromBottom: CGFloat(tall - bottom - 1) / scale)
-            }
+    /// TextKit owns editing, selection and the insertion point, but not the
+    /// visible glyphs.  The flattened annotation is rasterised by CoreText and
+    /// NSTextView's screen drawing can snap the very same fractional advances
+    /// four pixels wider at 40 pt.  Drawing the visible line through the output
+    /// renderer removes that last state-dependent change while leaving native
+    /// text interaction intact.
+    override func draw(_ dirtyRect: NSRect) {
+        let range = NSRange(location: 0, length: (string as NSString).length)
+        if range.length > 0 {
+            layoutManager?.addTemporaryAttribute(
+                .foregroundColor, value: NSColor.clear, forCharacterRange: range)
         }
-        cache[font.pointSize] = measured
-        return measured
+        super.draw(dirtyRect)
+        if range.length > 0 {
+            layoutManager?.removeTemporaryAttribute(
+                .foregroundColor, forCharacterRange: range)
+        }
+
+        guard showsAnnotation, !string.isEmpty,
+              let context = NSGraphicsContext.current?.cgContext else { return }
+        ImageEdit.drawEditorText(
+            string, size: annotationSize, unit: annotationScale,
+            wrappingAt: annotationWrappingWidth, in: context)
     }
+
+    override func keyDown(with event: NSEvent) {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if flags.contains(.command), event.charactersIgnoringModifiers == "\r" {
+            onCommit()
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    override func setMarkedText(
+        _ string: Any, selectedRange: NSRange, replacementRange: NSRange
+    ) {
+        super.setMarkedText(
+            string, selectedRange: selectedRange, replacementRange: replacementRange)
+        onMarkedTextChange()
+    }
+
+    override func cancelOperation(_ sender: Any?) {
+        onCancel()
+    }
+
+    /// Never scrolls the picture to show itself.
+    ///
+    /// `NSTextView` asks to be scrolled into view when it takes the keyboard and
+    /// again as the caret moves, and it is inside the scroll view that holds the
+    /// picture — so opening a box near an edge slid the whole capture under the
+    /// pointer. From the outside that is the text jumping the moment you click
+    /// it, which is exactly what it was reported as. The box is always placed
+    /// inside the picture, so there is nothing it needs scrolled into view.
+    override func scrollRangeToVisible(_ range: NSRange) {}
+
+    override func scroll(_ point: NSPoint) {}
+
+    override func scrollToVisible(_ rect: NSRect) -> Bool { false }
 }
 
 /// Draws the gesture in progress over the picture.
@@ -1076,6 +1541,18 @@ private final class EditMarks: NSView {
     /// The box being typed into. Drawn as a dashed outline rather than filled,
     /// because what goes into the file is the words and not a plate behind them.
     var typing: CGRect?
+    /// A piece of text the pointer is over and the text tool could re-open.
+    var hover: CGRect?
+
+    /// How far outside the words every outline sits — the hover highlight and
+    /// the box being typed in alike.
+    ///
+    /// One number, because the two are the same annotation half a second apart:
+    /// hovering draws a plate around the words, clicking replaces it with the
+    /// typing frame, and if those are different sizes the words look like they
+    /// moved when they did not. They were 4 and 2 points, and the report was
+    /// "there is still an offset at the moment of clicking — is it the padding?"
+    static let outlineInset = CGSize(width: 3, height: 2)
 
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
@@ -1094,13 +1571,44 @@ private final class EditMarks: NSView {
             path.stroke()
         }
         if let pendingMarker { drawMarker(pendingMarker) }
-        if let typing {
-            NSColor.controlAccentColor.setStroke()
-            let frame = NSBezierPath(rect: typing.insetBy(dx: -2, dy: -2))
-            frame.lineWidth = 1
-            frame.setLineDash([4, 3], count: 2, phase: 0)
-            frame.stroke()
+        if let hover, typing == nil {
+            NSColor.controlAccentColor.withAlphaComponent(0.22).setFill()
+            let plate = NSBezierPath(
+                roundedRect: hover.insetBy(
+                    dx: -Self.outlineInset.width, dy: -Self.outlineInset.height),
+                xRadius: 4, yRadius: 4)
+            plate.fill()
+            NSColor.controlAccentColor.withAlphaComponent(0.8).setStroke()
+            plate.lineWidth = 1
+            plate.stroke()
         }
+        if let typing { drawTyping(typing) }
+    }
+
+    /// The box being typed into, and the one thing it has to say for itself.
+    ///
+    /// A text view has no placeholder, and the sentence that used to be in one
+    /// is wrong now anyway: ⏎ breaks the line, so the key that finishes has to
+    /// be named somewhere. Under the box rather than inside it, so an empty box
+    /// is an empty box and not a box with grey words sitting in it.
+    private func drawTyping(_ frame: CGRect) {
+        NSColor.controlAccentColor.setStroke()
+        let outline = NSBezierPath(rect: frame.insetBy(
+            dx: -Self.outlineInset.width, dy: -Self.outlineInset.height))
+        outline.lineWidth = 1
+        outline.setLineDash([4, 3], count: 2, phase: 0)
+        outline.stroke()
+
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor(white: 0, alpha: 0.7)
+        shadow.shadowBlurRadius = 3
+        ("⌘⏎ to finish" as NSString).draw(
+            at: CGPoint(x: frame.minX - 2, y: frame.minY - 17),
+            withAttributes: [
+                .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+                .foregroundColor: NSColor(white: 1, alpha: 0.75),
+                .shadow: shadow,
+            ])
     }
 
     /// The crop frame: a hairline rectangle, four corner brackets to pull, and
@@ -1192,9 +1700,23 @@ private final class EditMarks: NSView {
 private final class EditToolbar: NSView {
     var onTool: (ImageEditor.Tool) -> Void = { _ in }
     var onUndo: () -> Void = {}
+    var onTextSize: (CGFloat) -> Void = { _ in }
 
     private let content: NSView
     private let tools: [(tool: ImageEditor.Tool, pill: HUDPill)]
+    /// How big the next piece of text is: the number, and a menu of the sizes
+    /// worth having behind it.
+    ///
+    /// A menu rather than a control that steps through them, which is what this
+    /// was first: three sizes was too coarse to be called a size, and stepping
+    /// through eight is worse than picking one. The pill shows the number and
+    /// never changes width — every label is two digits — so the bar's geometry
+    /// is still a constant.
+    private let size = HUDPill(
+        title: "20", mark: .symbol("textformat.size"),
+        tint: NSColor(white: 1, alpha: 0.16))
+    private var currentSize = ImageEdit.textSize
+
     /// The only control here that is not a tool. There is no Apply and no
     /// Cancel: the file follows the list, so there is nothing to confirm and
     /// nothing to throw away that this cannot walk back.
@@ -1223,6 +1745,8 @@ private final class EditToolbar: NSView {
         super.init(frame: box)
         addSubview(chrome.glass)
 
+        size.onClick = { [weak self] in self?.showSizeMenu() }
+        size.toolTip = "Text size"
         undo.onClick = { [weak self] in self?.onUndo() }
         undo.toolTip = "Undo the last edit (⌘Z) — ⇧⌘Z puts it back"
         for (tool, pill) in tools {
@@ -1231,8 +1755,10 @@ private final class EditToolbar: NSView {
             content.addSubview(pill)
         }
         for divider in dividers { content.addSubview(divider) }
+        content.addSubview(size)
         content.addSubview(undo)
-        setState(tool: .pointer, canUndo: false, canRedo: false, isBusy: false)
+        setState(tool: .pointer, textSize: ImageEdit.textSize,
+                 canUndo: false, canRedo: false, isBusy: false)
         setFrameSize(fittingSize)
         layoutSubtreeIfNeeded()
     }
@@ -1240,15 +1766,44 @@ private final class EditToolbar: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    func setState(tool: ImageEditor.Tool, canUndo: Bool, canRedo: Bool, isBusy: Bool) {
+    func setState(
+        tool: ImageEditor.Tool, textSize: CGFloat,
+        canUndo: Bool, canRedo: Bool, isBusy: Bool
+    ) {
         for (candidate, pill) in tools {
             pill.setLive(!isBusy, animated: false)
             pill.setSelected(candidate == tool, animated: false)
         }
+        // The number itself, and tinted while the text tool is the one in force
+        // so the size reads as belonging to it rather than to the picture.
+        currentSize = textSize
+        size.setTitle("\(Int(textSize))")
+        size.setLive(!isBusy, animated: false)
+        size.setSelected(tool == .text && !isBusy, animated: false)
         // Inert rather than hidden: a control that appears only once it becomes
         // usable moves whatever was beside it out from under the pointer already
         // heading for it — and here it would move the whole bar.
         undo.setLive((canUndo || canRedo) && !isBusy, animated: false)
+    }
+
+    /// Popped under the pill, with the size in force ticked.
+    private func showSizeMenu() {
+        let menu = NSMenu()
+        for option in ImageEdit.textSizes {
+            let item = NSMenuItem(
+                title: "\(Int(option)) pt", action: #selector(pickSize(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = Int(option)
+            item.state = option == currentSize ? .on : .off
+            menu.addItem(item)
+        }
+        menu.popUp(positioning: nil,
+                   at: CGPoint(x: size.frame.minX, y: size.frame.minY - 6),
+                   in: content)
+    }
+
+    @objc private func pickSize(_ sender: NSMenuItem) {
+        onTextSize(CGFloat(sender.tag))
     }
 
     /// Where a tool's button is, for the self-test that presses the real one.
@@ -1263,7 +1818,7 @@ private final class EditToolbar: NSView {
             + tools.reduce(0) { $0 + $1.pill.frame.width }
             + CGFloat(tools.count - 1) * HUDMetrics.gap
             + HUDMetrics.groupGap * 2 + 1
-            + undo.frame.width
+            + size.frame.width + HUDMetrics.gap + undo.frame.width
         return CGSize(width: width.rounded(), height: HUDMetrics.height)
     }
 
@@ -1279,6 +1834,8 @@ private final class EditToolbar: NSView {
         x += HUDMetrics.groupGap
         dividers[0].setFrameOrigin(CGPoint(x: x, y: dividers[0].frame.minY))
         x += 1 + HUDMetrics.groupGap
+        size.setFrameOrigin(CGPoint(x: x, y: midY))
+        x += size.frame.width + HUDMetrics.gap
         undo.setFrameOrigin(CGPoint(x: x, y: midY))
     }
 }

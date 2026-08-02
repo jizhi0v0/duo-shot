@@ -92,15 +92,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.previews.panelWindowIDs ?? []
         }
         previews.isRecordingActive = { [weak self] in self?.recorder.isRecording ?? false }
-        // The viewer rewrites the staged file when a redaction is applied, and a
-        // card that is still up is drawing the version that no longer exists.
-        ViewerWindowController.shared.onImageRedacted = { [weak self] url, thumbnail in
-            self?.previews.refreshThumbnail(thumbnail, for: url)
-        }
-        // And the same for a trim, which replaces the recording the card's poster
-        // frame was taken from. The card's duration pill is left as it was: it is
-        // built once at card time and the card is a six-second affordance over a
-        // file that has already changed.
+        // A trim replaces the recording the card's poster frame was taken from,
+        // so the card has to be told. Nothing like it for stills: the image
+        // editor exports a copy and never touches the capture, so the card is
+        // still showing the file it points at. The card's duration pill is left
+        // as it was: it is built once at card time and the card is a six-second
+        // affordance over a file that has already changed.
         ViewerWindowController.shared.onVideoTrimmed = { [weak self] url, poster in
             self?.previews.refreshThumbnail(poster, for: url)
         }

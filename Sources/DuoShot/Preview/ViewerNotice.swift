@@ -33,14 +33,17 @@ final class ViewerNotice: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    func show(message: String, action: (title: String, run: () -> Void)?) {
+    func show(
+        message: String, action: (title: String, run: () -> Void)?,
+        symbol: String = "link.badge.plus"
+    ) {
         label.stringValue = message
         pill?.removeFromSuperview()
         pill = nil
         self.action = action?.run
         guard let action else { return }
         let button = HUDPill(
-            title: action.title, mark: .symbol("link.badge.plus"),
+            title: action.title, mark: .symbol(symbol),
             tint: NSColor(white: 1, alpha: 0.16))
         button.onClick = { [weak self] in self?.action?() }
         content.addSubview(button)

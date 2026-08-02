@@ -115,7 +115,7 @@ enum PreviewThumbnail {
     /// the file no longer contains.
     ///
     /// Synchronous and `nonisolated` because its one caller is already off the
-    /// main actor — `RedactionEditor.redact` does the rewrite and the thumbnail
+    /// main actor — `ImageEditor.commit` does the rewrite and the thumbnail
     /// in a single hop rather than sending a 5K bitmap back and forth.
     nonisolated static func image(_ source: CGImage, cap: CGSize) -> NSImage {
         scaled(source, cap: cap)

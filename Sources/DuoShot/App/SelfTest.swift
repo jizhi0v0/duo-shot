@@ -38,9 +38,10 @@ enum SelfTest {
         /// The in-app viewer: window geometry for a still, a full-screen still
         /// and a recording, plus the one-window-per-file rule.
         case viewer(directory: URL)
-        /// Redaction, image in and image out: the point-to-pixel mapping at 2×,
-        /// and whether the bytes under a rectangle are really gone.
-        case redact(directory: URL)
+        /// The image editor, image in and image out: the point-to-pixel mapping
+        /// at 2×, whether the bytes under a rectangle are really gone, and whether
+        /// the list that ⌘Z walks backwards renders what it says it does.
+        case edit(directory: URL)
         /// Trimming a recording: whether the export, the swap and the reload
         /// leave one shorter file where the long one was.
         case trim(directory: URL)
@@ -283,8 +284,8 @@ enum SelfTest {
                 self = .previewStack(
                     count: value(for: "--count").flatMap(Int.init) ?? 3,
                     directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
-            case "--selftest-redact":
-                self = .redact(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
+            case "--selftest-edit":
+                self = .edit(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-trim":
                 self = .trim(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-viewer":
@@ -328,7 +329,7 @@ enum SelfTest {
             case .previewStack(let count, let directory):
                 return try await previewStack(count: count, into: directory)
             case .viewer(let directory): return try await viewerWindow(into: directory)
-            case .redact(let directory): return try await redactCheck(into: directory)
+            case .edit(let directory): return try await editCheck(into: directory)
             case .trim(let directory): return try await trimCheck(into: directory)
             case .windowMode(let directory): return try await windowMode(into: directory)
             case .fullscreen(let directory): return try await fullscreenMode(into: directory)
@@ -2156,7 +2157,18 @@ enum SelfTest {
 
         let cornerAlpha = PixelCompare.alpha(padded, atX: 1, y: 1) ?? 255
         let edgeAlpha = PixelCompare.alpha(padded, atX: padded.width / 2, y: 1) ?? 0
-        let ok = radiusOK && cornerAlpha == 0 && edgeAlpha > 250
+        // The card's own curve: half an inset past the window's, which is a
+        // judgement rather than a derivation — so it is pinned here, where
+        // changing it means saying so.
+        let cardRadius = ImagePadding.cornerRadius(of: padded)
+        let wanted = CGFloat(radius) + CGFloat(padding) / 2
+        let cardOK = cardRadius.map { abs($0 - wanted) <= 3 } ?? false
+        if !cardOK {
+            print(String(format: "  card radius: %@ px, wanted %.0f -> MISMATCH",
+                         cardRadius.map { String(format: "%.0f", $0) } ?? "none" as NSString,
+                         wanted))
+        }
+        let ok = radiusOK && cardOK && cornerAlpha == 0 && edgeAlpha > 250
         print(String(format: "  card corner: window radius %@ px (drawn %d), "
                      + "card corner alpha %d, top edge alpha %d -> %@",
                      measured.map { String(format: "%.0f", $0) } as NSString? ?? "none",
@@ -2400,16 +2412,96 @@ enum SelfTest {
             + "\(rectString(stillWindow.contentLayoutRect))")
         checkFits(stillWindow, "still")
 
-        // Aspect, not size: the window is allowed to be capped, but a capped
-        // window that does not keep the shape of the picture is letterboxing the
-        // user's screenshot inside their own viewer.
-        let content = stillWindow.contentLayoutRect.size
-        let wanted = small.width / small.height
-        let got = content.width / max(content.height, 1)
-        let aspectOK = abs(wanted - got) < 0.02
-        print(String(format: "  aspect %.3f vs %.3f -> %@", got, wanted,
-                     (aspectOK ? "matches" : "MISMATCH") as NSString))
-        if !aspectOK { failures.append("still window aspect \(got) != image aspect \(wanted)") }
+        // The still viewer's picture area is the capture's own size clamped into
+        // a band — see `standardPicture` and `minimumPicture`. Two things to hold
+        // it to: it never swims (a capture inside the band gets its own size plus
+        // the fit's margin and no more) and it never exceeds the ceiling, which
+        // the full-screen case below checks.
+        let stillContent = stillWindow.contentLayoutRect.size
+        let stillPicture = CGSize(
+            width: stillContent.width,
+            height: stillContent.height - ImageEditor.chromeHeight)
+        let slack = CGSize(width: stillPicture.width - small.width,
+                           height: stillPicture.height - small.height)
+        // "Its own size plus the margin" on each axis, unless the floor got
+        // there first — a 200-point capture cannot have a 200-point window, the
+        // toolbar has to fit in it.
+        func hugged(_ area: CGFloat, _ capture: CGFloat, floor: CGFloat) -> Bool {
+            area - capture <= ZoomingScrollView.fitPadding * 2 + 1 || abs(area - floor) <= 1
+        }
+        let hugs = hugged(stillPicture.width, small.width,
+                          floor: ViewerWindowController.minimumPicture.width)
+            && hugged(stillPicture.height, small.height,
+                      floor: ViewerWindowController.minimumPicture.height)
+        print(String(format: "  picture area %.0f×%.0f for a %.0f×%.0f capture -> %@",
+                     stillPicture.width, stillPicture.height, small.width, small.height,
+                     (hugs ? "hugs it" : "SWIMS") as NSString))
+        if !hugs {
+            failures.append("the viewer leaves "
+                + "\(Int(slack.width))×\(Int(slack.height)) pt of empty window")
+        }
+
+        // MARK: the window's own corners
+        //
+        // Two checks, because the squareness has two halves and only one of them
+        // is visible to a capture.
+        //
+        // On screen: an opaque `backgroundColor` sets `isOpaque`, and an opaque
+        // window is drawn by the window server without the rounded-corner mask —
+        // square corners, to the eye and to any screen-area capture of it. That
+        // is a flag, so it is checked as one.
+        //
+        // In a window capture: ScreenCaptureKit renders the window's own layer
+        // tree and masks the corners itself, so this half passes either way. It
+        // is here anyway, because it is the half that ends up in a file.
+        let opaque = stillWindow.isOpaque
+        print("  window opaque: \(opaque) -> \(opaque ? "SQUARE ON SCREEN" : "rounded")")
+        if opaque {
+            failures.append("the viewer window is opaque, so macOS draws it square-cornered")
+        }
+        try await coordinator.engine.refreshContent()
+        let viewerID = CGWindowID(stillWindow.windowNumber)
+        if let shot = try? await coordinator.engine.capture(.window(viewerID)) {
+            let corner = alpha(of: shot.image, atX: 1, y: 1)
+            let inside = alpha(of: shot.image, atX: shot.image.width / 2,
+                               y: shot.image.height / 2)
+            let rounded = corner == 0 && inside == 255
+            print("  window corner: alpha \(corner) at the corner, \(inside) in the middle"
+                + " -> \(rounded ? "rounded" : "SQUARE")")
+            if !rounded {
+                failures.append("the viewer window captures with square corners")
+            }
+        } else {
+            failures.append("could not capture the viewer's own window")
+        }
+
+        // MARK: and it follows a crop
+        //
+        // The same rule applied again. A window that keeps the shape of the
+        // picture it used to hold leaves the cropped one floating in the middle
+        // of a frame two sizes too big.
+        if let editor = viewer.editorForTest(still.url) {
+            let before = stillWindow.frame
+            editor.addEditForTest(.crop(CGRect(x: 40, y: 30, width: 300, height: 180)))
+            await editor.flushForTest()
+            try await Task.sleep(for: .milliseconds(120))
+            let after = stillWindow.contentLayoutRect.size
+            let picture = CGSize(
+                width: after.width, height: after.height - ImageEditor.chromeHeight)
+            // 300×180 is under the floor, so the floor is what it gets — the
+            // point is that it shrank and that the top left stayed put.
+            let shrank = after.width < before.width - 10 || after.height < before.height - 10
+            let anchored = abs(stillWindow.frame.maxY - before.maxY) <= 1
+                && abs(stillWindow.frame.minX - before.minX) <= 1
+            print(String(format: "  after a crop: picture area %.0f×%.0f -> %@, %@",
+                         picture.width, picture.height,
+                         (shrank ? "smaller" : "UNCHANGED") as NSString,
+                         (anchored ? "top left held" : "MOVED") as NSString))
+            if !shrank { failures.append("the window did not shrink to the cropped picture") }
+            if !anchored { failures.append("the window jumped when it resized") }
+            editor.undoForTest()
+            await editor.flushForTest()
+        }
 
         // The whole picture has to be visible when it opens. A viewer that lands
         // zoomed in on the top-left corner is technically showing the file and is
@@ -2456,6 +2548,20 @@ enum SelfTest {
             print("fullscreen:    image \(Int(fullResult.pointSize.width))x"
                 + "\(Int(fullResult.pointSize.height)) pt")
             checkFits(fullWindow, "fullscreen")
+
+            // The ceiling. A capture the size of the display must not ask for a
+            // window the size of the display.
+            let fullPicture = CGSize(
+                width: fullWindow.contentLayoutRect.width,
+                height: fullWindow.contentLayoutRect.height - ImageEditor.chromeHeight)
+            let capped = fullPicture.width <= ViewerWindowController.standardPicture.width + 1
+                && fullPicture.height <= ViewerWindowController.standardPicture.height + 1
+            print(String(format: "  picture area %.0f×%.0f for the whole display -> %@",
+                         fullPicture.width, fullPicture.height,
+                         (capped ? "capped" : "UNCAPPED") as NSString))
+            if !capped {
+                failures.append("a full-screen capture opens a window of its own size")
+            }
         } else {
             failures.append("no window for the full-screen still")
         }
@@ -2588,7 +2694,7 @@ enum SelfTest {
     /// differ by a factor of two — applying the drawn numbers unchanged would
     /// destroy a quarter of the intended area in the wrong corner and look
     /// perfectly plausible doing it.
-    private static func redactCheck(into directory: URL) async throws -> Int32 {
+    private static func editCheck(into directory: URL) async throws -> Int32 {
         var failures = 0
         func check(_ label: String, _ passed: Bool, _ detail: String = "") {
             print("  \(passed ? "PASS" : "FAIL") \(label)\(detail.isEmpty ? "" : " — \(detail)")")
@@ -2600,13 +2706,22 @@ enum SelfTest {
 
         try FileManager.default.createDirectory(
             at: directory, withIntermediateDirectories: true)
+        // Yesterday's exports, gone. `ImageEdit.exportURL` counts up from
+        // "(edited)" to avoid clobbering anything, so a directory left over from
+        // the last run makes this one's filenames wrong in a way that says
+        // nothing about the code.
+        for file in (try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil)) ?? []
+        where file.lastPathComponent.contains("(edited") {
+            try? FileManager.default.removeItem(at: file)
+        }
 
         // Fine stripes: every block average lands on the same mid-grey, so a
         // block that is still striped afterwards is a redaction that did not
         // happen, and one that is uniform cannot be inverted back into stripes.
         let pixels = CGSize(width: 1200, height: 800)
         let points = CGSize(width: 600, height: 400)
-        let file = directory.appendingPathComponent("redact-sample.png")
+        let file = directory.appendingPathComponent("edit-sample.png")
         guard let original = stripedImage(
             width: Int(pixels.width), height: Int(pixels.height)) else {
             print("result:        FAIL — could not build the sample bitmap")
@@ -2618,14 +2733,14 @@ enum SelfTest {
 
         let drawn = CGRect(x: 100, y: 50, width: 200, height: 120)
         let expected = CGRect(x: 200, y: 100, width: 400, height: 240)
-        let mapped = Redaction.regions([drawn], atPointSize: points, inPixels: pixels)
+        let mapped = ImageEdit.regions([drawn], atPointSize: points, inPixels: pixels)
         check("a 2× rect maps to twice its pixels", mapped == [expected],
               "\(rectString(mapped.first ?? .zero))")
 
         // Through the real view, which is where the point size and the pixel
         // size are read off the file rather than passed in by a test.
         guard let image = NSImage(contentsOf: file),
-              let editor = RedactionEditor(
+              let editor = ImageEditor(
                 url: file, image: image, menu: NSMenu(),
                 frame: CGRect(origin: .zero, size: points))
         else {
@@ -2636,17 +2751,682 @@ enum SelfTest {
               image.size == points, "got \(sizeString(image.size))")
         check("editor reads the bitmap as \(Int(pixels.width))×\(Int(pixels.height)) px",
               editor.pixelSizeForTest == pixels, "got \(sizeString(editor.pixelSizeForTest))")
-        editor.addRegionForTest(drawn)
+
+        // MARK: the toolbar
+        //
+        // Driven as clicks on the real buttons rather than by calling the
+        // handlers, because the one bug this feature has shipped lived entirely
+        // between the two: the bar's hidden pills sat at the container's origin,
+        // `HUDPill.hitTest` replaced the implementation that skips hidden views,
+        // and an invisible Apply sat over Redact and swallowed every press of it.
+        // Every other check here passed while the button did nothing at all.
+        do {
+            let window = NSWindow(
+                contentRect: CGRect(origin: .zero, size: points),
+                styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            window.contentView = editor
+            window.orderFrontRegardless()
+            editor.layoutSubtreeIfNeeded()
+
+            // The bar is a fixture at the top now, and the viewer opens holding
+            // the pointer: until a tool is picked, a click on the picture is
+            // still a click on the picture.
+            check("the viewer opens with the pointer", editor.toolForTest == .pointer,
+                  "\(editor.toolForTest)")
+            check("so the canvas is not armed", !editor.isEditingForTest)
+            let barTop = editor.barFrameForTest
+            check("the bar sits at the top of the window",
+                  barTop.maxY > editor.bounds.midY, rectString(barTop))
+            // Above the picture, not over it: the whole point of the band. The
+            // scroll view has to stop below the bar, or a permanent toolbar is a
+            // permanent hole in every capture's title bar.
+            check("and the picture starts below it, not under it",
+                  editor.pictureFrameForTest.maxY <= barTop.minY,
+                  "picture \(rectString(editor.pictureFrameForTest)) vs bar \(rectString(barTop))")
+
+            guard let redactPill = editor.pillFrameForTest(.redact) else {
+                print("result:        FAIL — the bar has no Redact button")
+                return 1
+            }
+            let centre = CGPoint(x: redactPill.midX, y: redactPill.midY)
+            let hit = editor.hitTest(centre)
+            check("Redact's button hit-tests to a visible pill",
+                  (hit as? HUDPill).map { !$0.isHidden } ?? false,
+                  hit.map { "\(type(of: $0))\(($0 as? HUDPill)?.isHidden == true ? ", hidden" : "")" }
+                    ?? "nothing")
+            click(hit, at: editor.convert(centre, to: nil), in: window)
+            check("clicking it arms the tool", editor.toolForTest == .redact,
+                  "\(editor.toolForTest)")
+
+            // Every pill in the bar, not only the one that was pressed: the bug
+            // was one hidden pill covering one visible one, and there are eight
+            // of them now.
+            var covered = 0
+            for x in stride(from: barTop.minX + 2, to: barTop.maxX - 2, by: 3) {
+                let pill = editor.hitTest(CGPoint(x: x, y: barTop.midY)) as? HUDPill
+                if pill?.isHidden == true { covered += 1 }
+            }
+            check("no hidden pill sits over the bar", covered == 0,
+                  "\(covered) sampled points hit one")
+
+            // Nothing about a press may move the bar. It is over the picture and
+            // permanent, so a bar that re-measured itself per state would jump
+            // under the pointer on its way to the next button.
+            editor.chooseForTest(.crop)
+            editor.addEditForTest(.crop(CGRect(x: 20, y: 20, width: 200, height: 150)))
+            editor.layoutSubtreeIfNeeded()
+            check("the bar does not move when the state changes",
+                  editor.barFrameForTest == barTop,
+                  "\(rectString(barTop)) -> \(rectString(editor.barFrameForTest))")
+            editor.undoForTest()
+
+            // The keyboard half of the same control.
+            press("c", on: editor, in: window)
+            check("pressing C picks the crop tool", editor.toolForTest == .crop,
+                  "\(editor.toolForTest)")
+            press("v", on: editor, in: window)
+            check("and V puts the pointer back", editor.toolForTest == .pointer,
+                  "\(editor.toolForTest)")
+            press("r", on: editor, in: window)
+            check("and R picks redact again", editor.toolForTest == .redact,
+                  "\(editor.toolForTest)")
+
+            // MARK: typing, end to end
+            //
+            // The newest and most fragile path in the editor: a click has to
+            // produce a field, and ⏎ in that field has to produce an edit. Both
+            // halves are wiring, which is the kind of thing that ships dead.
+            press("t", on: editor, in: window)
+            let spot = CGPoint(x: 120, y: 260)
+            // The picture fills the view at 1×, so anywhere over it hit-tests to
+            // the canvas; the click itself is placed in the canvas's own space.
+            if let canvas = editor.hitTest(CGPoint(x: 200, y: 200)) {
+                let inWindow = canvas.convert(spot, to: nil)
+                if let down = NSEvent.mouseEvent(
+                    with: .leftMouseDown, location: inWindow, modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime,
+                    windowNumber: window.windowNumber, context: nil,
+                    eventNumber: 0, clickCount: 1, pressure: 1) {
+                    canvas.mouseDown(with: down)
+                }
+                let field = firstTextBox(in: canvas)
+                check("clicking with the text tool opens a box", field != nil)
+                if let field {
+                    // Typed rather than assigned: `string = x` skips the
+                    // text-input path, and with it everything that path keeps in
+                    // step — attributes, layout, the stamp.
+                    field.insertText("account number", replacementRange: field.selectedRange())
+                    commitTyping(field, in: window)
+                }
+                // The edit's point is the text's *baseline*, and the click sits
+                // half a cap height above it so that the pointer goes through
+                // the letters rather than under them — see `beginTyping`.
+                //
+                // Compared with a tolerance rather than for equality: the click
+                // is placed in the canvas's space, converted to the window's and
+                // back through a scroll view that is no longer at the origin, so
+                // the point that arrives is the one that was sent to within a
+                // rounding error, and a rounding error is not a wrong place.
+                // The edit's point is the *top* of the first line's box, and the
+                // click sits half a line below it so the pointer goes through the
+                // letters rather than under them.
+                let lift = ImageEdit.textLineHeight() / 2
+                var landed = false
+                if case .text(let origin, let string, _) = editor.editsForTest.last {
+                    landed = string == "account number"
+                        && abs(origin.x - spot.x) < 0.01
+                        && abs(origin.y - (spot.y + lift)) < 0.01
+                }
+                check("and ⏎ turns what was typed into an edit", landed,
+                      editor.editsForTest.last.map { "\($0)" } ?? "no edit")
+                // Still there, and no longer editable: the words stand in for
+                // themselves until the render that contains them arrives, or
+                // they blink out for the length of a decode.
+                let standIn = firstTextBox(in: canvas)
+                check("the words stay on screen while the render catches up",
+                      standIn?.string == "account number" && standIn?.isEditable == false,
+                      standIn.map { "editable \($0.isEditable)" } ?? "nothing left")
+                await editor.flushForTest()
+                check("and the stand-in goes when the render lands",
+                      firstTextBox(in: canvas) == nil)
+
+                // MARK: what is typed is the pixels that get written
+                //
+                // The checks that used to live here compared the box's live
+                // glyphs against the renderer's, by position, size and weight.
+                // There is nothing left to compare: the box draws
+                // `ImageEdit.stamp`, which is the renderer's own bitmap scaled
+                // the way the picture is scaled. Live glyphs at screen
+                // resolution and glyphs baked into a 2× picture are two
+                // rasterisations of one string at two sizes, and type hinting
+                // makes them disagree by about one per cent however carefully
+                // the fonts, kerning, tracking and baselines are matched — which
+                // is six rounds of this report, each fixing something real and
+                // none of them this.
+                if let box = openField(at: CGPoint(x: 300, y: 200),
+                                       on: canvas, in: window) {
+                    box.insertText("Hxy", replacementRange: box.selectedRange())
+                    // The renderer draws every annotation with a shadow; the box
+                    // being typed in has to carry the same one, or the words
+                    // change weight the moment they are committed.
+                    let dressed = box.textStorage?.attribute(
+                        .shadow, at: 0, effectiveRange: nil) as? NSShadow
+                    check("what is being typed carries the render's shadow",
+                          dressed?.shadowBlurRadius == 3
+                            && dressed?.shadowOffset == CGSize(width: 0, height: -1),
+                          dressed.map { "blur \($0.shadowBlurRadius)" } ?? "no shadow")
+
+                    // Chinese input first arrives as underlined marked text.
+                    // It must resize the box before a candidate is committed.
+                    window.makeFirstResponder(box)
+                    box.selectAll(nil)
+                    let beforeMarked = box.frame.width
+                    box.setMarkedText(
+                        "zhongwenshuru", selectedRange: NSRange(location: 13, length: 0),
+                        replacementRange: box.selectedRange())
+                    check("Chinese composition stretches the input box",
+                          box.hasMarkedText() && box.frame.width > beforeMarked + 20,
+                          String(format: "%.1f -> %.1f pt", beforeMarked, box.frame.width))
+                    box.unmarkText()
+
+                    // MARK: and in a script with different metrics
+                        //
+                        // Han characters are where the two were reported to
+                        // disagree — a line of Chinese that tightened the moment
+                        // it was committed. Everything that could make them
+                        // disagree is pinned now: the same bold system font, the
+                        // same line height, kerning and tracking nailed to zero
+                        // on both sides. This is the check that says so.
+                        //
+                        // Laid-out width, not ink: the box and the renderer use
+                        // different rasterisers, and where each of them decides
+                        // an antialiased edge stops differs by about a point
+                        // over a line. That difference is real and it is not
+                        // spacing — measuring it as spacing produced a failure
+                        // that no change to the text could fix.
+                        window.makeFirstResponder(box)
+                        box.selectAll(nil)
+                        box.insertText("测试文字", replacementRange: box.selectedRange())
+                        window.makeFirstResponder(nil)
+                        if let layout = box.layoutManager, let container = box.textContainer {
+                            let full = NSRange(
+                                location: 0, length: (box.string as NSString).length)
+                            let glyphs = layout.glyphRange(
+                                forCharacterRange: full, actualCharacterRange: nil)
+                            let typed = layout.boundingRect(
+                                forGlyphRange: glyphs, in: container)
+                            let drawn = ImageEdit.advance(of: "测试文字")
+                            check("Chinese is laid out the same in both",
+                                  abs(typed.width - drawn) <= 0.1,
+                                  String(format: "%.2f pt typed, %.2f rendered",
+                                         typed.width, drawn))
+                            check("and on the same line height",
+                                  abs(typed.height - ImageEdit.textLineHeight()) <= 0.1,
+                                  String(format: "%.2f vs %.2f",
+                                         typed.height, ImageEdit.textLineHeight()))
+                        } else {
+                            check("Chinese is laid out the same in both", false, "no layout")
+                        }
+
+                        // MARK: mixed scripts do not change the box's height
+                        //
+                        // A line of Han characters is three points shorter than
+                        // a line of Latin ones. A box sized to what its text
+                        // needs therefore changes height the moment the two are
+                        // mixed, which is a box that twitches as you type.
+                        window.makeFirstResponder(box)
+                        box.selectAll(nil)
+                        box.insertText("漢字", replacementRange: box.selectedRange())
+                        let hanHeight = box.bounds.height
+                        box.insertText(" Test", replacementRange: box.selectedRange())
+                        let mixedHeight = box.bounds.height
+                        window.makeFirstResponder(nil)
+                        check("mixing scripts does not change the box's height",
+                              abs(hanHeight - mixedHeight) <= 0.01
+                                && abs(hanHeight - ImageEdit.textLineHeight()) <= 0.01,
+                              String(format: "%.2f then %.2f", hanHeight, mixedHeight))
+
+                        // MARK: the box does not move as the script changes
+                        //
+                        // It used to, by a point, and a frame late: the frame was
+                        // placed by asking TextKit where it had put the first
+                        // baseline, and that answer is a point higher for a line
+                        // of Han characters than for a line with any Latin in it.
+                        // Type one letter after a Chinese character and the whole
+                        // line twitched.
+                        window.makeFirstResponder(box)
+                        box.selectAll(nil)
+                        box.insertText("啊", replacementRange: box.selectedRange())
+                        let han = box.frame.origin.y
+                        box.insertText("A", replacementRange: box.selectedRange())
+                        let mixed = box.frame.origin.y
+                        box.selectAll(nil)
+                        box.insertText("Ag", replacementRange: box.selectedRange())
+                        let latin = box.frame.origin.y
+                        window.makeFirstResponder(nil)
+                        check("the box holds still as the script changes",
+                              abs(han - mixed) < 0.01 && abs(mixed - latin) < 0.01,
+                              String(format: "han %.2f, mixed %.2f, latin %.2f",
+                                     han, mixed, latin))
+
+                        // And so do the letters, which is not the same question:
+                        // the frame can hold still while TextKit moves the
+                        // baseline inside it, and it is the letters that anyone
+                        // watches. Measured as ink on screen, in canvas
+                        // coordinates.
+                        func inkBaseline() -> CGFloat {
+                            window.makeFirstResponder(nil)
+                            return box.frame.minY + ink(of: box).bottom
+                        }
+                        window.makeFirstResponder(box)
+                        box.selectAll(nil)
+                        box.insertText("啊", replacementRange: box.selectedRange())
+                        let hanInk = inkBaseline()
+                        window.makeFirstResponder(box)
+                        box.insertText("A", replacementRange: box.selectedRange())
+                        let mixedInk = inkBaseline()
+                        check("and so do the letters in it",
+                              abs(hanInk - mixedInk) <= 0.5,
+                              String(format: "han ink at %.2f, mixed at %.2f",
+                                     hanInk, mixedInk))
+
+                        // MARK: the size control
+                        //
+                        // The size travels with the text, so a note written
+                        // large stays large when the next one is written small.
+                        // Both halves are checked: the box changes, and so does
+                        // what comes out of the renderer.
+                        let large = ImageEdit.textSizes.last ?? 56
+                        let smallLine = ImageEdit.textLineHeight()
+                        let largeLine = ImageEdit.textLineHeight(at: large)
+                        check("a larger size is a taller line",
+                              largeLine > smallLine + 4,
+                              String(format: "%.0f vs %.0f", smallLine, largeLine))
+                        if let ground = flatImage(
+                            width: Int(pixels.width), height: Int(pixels.height)),
+                           let big = ImageEdit.render(
+                            ground, edits: [.text(CGPoint(x: 60, y: 200), "Ag", large)],
+                            pointSize: points, cropping: false),
+                           let small = ImageEdit.render(
+                            ground, edits: [.text(CGPoint(x: 60, y: 200), "Ag",
+                                                  ImageEdit.textSize)],
+                            pointSize: points, cropping: false),
+                           let bigInk = ink(of: big, against: rgba(of: ground)),
+                           let smallInk = ink(of: small, against: rgba(of: ground)) {
+                            check("and the render honours it",
+                                  bigInk.height > smallInk.height * 1.3,
+                                  String(format: "%.0f px tall vs %.0f",
+                                         bigInk.height, smallInk.height))
+                        } else {
+                            check("and the render honours it", false, "no render")
+                        }
+
+                        // MARK: two lines
+                        //
+                        // ⏎ breaks the line now and ⌘⏎ finishes, because text on
+                        // a screenshot is often two lines and a key that ends the
+                        // sentence cannot also break it.
+                        window.makeFirstResponder(box)
+                        box.selectAll(nil)
+                        box.insertText("A", replacementRange: box.selectedRange())
+                        // A real Return, through `keyDown`, because the point of
+                        // the check is that nothing between the keyboard and the
+                        // box claims that key for something else.
+                        if let newline = NSEvent.keyEvent(
+                            with: .keyDown, location: .zero, modifierFlags: [],
+                            timestamp: ProcessInfo.processInfo.systemUptime,
+                            windowNumber: window.windowNumber, context: nil,
+                            characters: "\r", charactersIgnoringModifiers: "\r",
+                            isARepeat: false, keyCode: 36) {
+                            box.keyDown(with: newline)
+                        }
+                        box.insertText("B", replacementRange: box.selectedRange())
+                        window.makeFirstResponder(nil)
+                        check("⏎ inside the box is a line break", box.string == "A\nB",
+                              box.string.replacingOccurrences(of: "\n", with: "⏎"))
+                        // Not wrapped, ever: the box grows sideways instead, so
+                        // the lines in it are the lines that come out. A box
+                        // that wrapped would break where the renderer does not.
+                        // A drag-selection used to balloon the box: AppKit
+                        // lays a resizable text view out again when the drag
+                        // starts, and this one's container is infinitely wide so
+                        // that nothing wraps — so the box grew to something like
+                        // its container's size with the selection highlight
+                        // painted across all of it.
+                        //
+                        // Checked as the flag rather than by dragging.
+                        // `NSTextView.mouseDown` runs its own event-tracking loop
+                        // until it sees a real mouse-up, and a synthesised drag
+                        // hangs in it forever — the test ran for ten minutes
+                        // before it was killed. The flag is the whole cause.
+                        // The selection is drawn per line fragment, and the
+                        // fragments are as wide as the container — so whatever
+                        // the box's own size is, its drawing has to be confined
+                        // to it. `NSView` does not do that on its own.
+                        check("the box clips its drawing to itself", box.clipsToBounds)
+
+                        check("the box never resizes itself",
+                              !box.isHorizontallyResizable && !box.isVerticallyResizable,
+                              "h \(box.isHorizontallyResizable) v \(box.isVerticallyResizable)")
+                        window.makeFirstResponder(box)
+                        box.selectAll(nil)
+                        box.insertText("21212122112", replacementRange: box.selectedRange())
+                        box.insertNewline(nil)
+                        box.insertNewline(nil)
+                        window.makeFirstResponder(nil)
+                        check("and empty lines do not widen it",
+                              box.frame.width - inkedWidth(of: box) <= 4,
+                              String(format: "%.1f pt box, %.1f pt text",
+                                     box.frame.width, inkedWidth(of: box)))
+
+                        // The box hugs its words: a selection fills the line to
+                        // the end of the box, so every point of slack is a tail
+                        // of highlight hanging off the end of the text.
+                        check("the box is no wider than the words in it",
+                              box.bounds.width - inkedWidth(of: box) <= 4,
+                              String(format: "%.1f pt box, %.1f pt text",
+                                     box.bounds.width, inkedWidth(of: box)))
+
+                        window.makeFirstResponder(box)
+                        box.selectAll(nil)
+                        box.insertText(String(repeating: "wide ", count: 40),
+                                       replacementRange: box.selectedRange())
+                        window.makeFirstResponder(nil)
+                        check("a long line wraps at the picture's edge instead",
+                              box.frame.maxX <= points.width + 1
+                                && box.bounds.height > ImageEdit.textLineHeight(),
+                              String(format: "%.0f×%.0f box ending at %.0f of %.0f",
+                                     box.bounds.width, box.bounds.height,
+                                     box.frame.maxX, points.width))
+                        // And the render breaks it in the same places, which is
+                        // the whole reason the box is allowed to wrap at all.
+                        let boxLines = box.layoutManager.map { layout -> Int in
+                            var count = 0
+                            var glyph = 0
+                            while glyph < layout.numberOfGlyphs {
+                                var effective = NSRange()
+                                _ = layout.lineFragmentRect(
+                                    forGlyphAt: glyph, effectiveRange: &effective)
+                                count += 1
+                                glyph = max(effective.upperBound, glyph + 1)
+                            }
+                            return count
+                        } ?? 0
+                        let renderLines = ImageEdit.lines(
+                            of: box.string, size: ImageEdit.textSize,
+                            wrappingAt: points.width - box.frame.minX).count
+                        check("and the renderer agrees about where",
+                              boxLines == renderLines,
+                              "\(boxLines) in the box, \(renderLines) rendered")
+
+                        window.makeFirstResponder(box)
+                        box.selectAll(nil)
+                        box.insertText("A", replacementRange: box.selectedRange())
+                        if let newline2 = NSEvent.keyEvent(
+                            with: .keyDown, location: .zero, modifierFlags: [],
+                            timestamp: ProcessInfo.processInfo.systemUptime,
+                            windowNumber: window.windowNumber, context: nil,
+                            characters: "\r", charactersIgnoringModifiers: "\r",
+                            isARepeat: false, keyCode: 36) {
+                            box.keyDown(with: newline2)
+                        }
+                        box.insertText("B", replacementRange: box.selectedRange())
+                        window.makeFirstResponder(nil)
+
+                        check("and the box grows to hold both lines",
+                              abs(box.bounds.height - ImageEdit.textLineHeight() * 2) <= 1,
+                              String(format: "%.1f pt tall", box.bounds.height))
+
+                        if let ground = flatImage(
+                            width: Int(pixels.width), height: Int(pixels.height)),
+                           let two = ImageEdit.render(
+                            ground, edits: [.text(CGPoint(x: 60, y: 200), "A\nB", ImageEdit.textSize)],
+                            pointSize: points, cropping: false),
+                           let both = ink(of: two, against: rgba(of: ground)),
+                           let one = ImageEdit.render(
+                            ground, edits: [.text(CGPoint(x: 60, y: 200), "A", ImageEdit.textSize)],
+                            pointSize: points, cropping: false),
+                           let single = ink(of: one, against: rgba(of: ground)) {
+                            // The second line hangs exactly one line height below
+                            // the first, which is what the box was pinned to.
+                            let grew = (both.height - single.height) / (pixels.height / points.height)
+                            check("the second line renders one line below the first",
+                                  abs(grew - ImageEdit.textLineHeight()) <= 1.5,
+                                  String(format: "%.1f pt taller, line height %.1f",
+                                         grew, ImageEdit.textLineHeight()))
+                        } else {
+                            check("the second line renders one line below the first",
+                                  false, "no render")
+                        }
+                    // Closed the way Escape does. `perform(Selector(...))` on a
+                    // Swift method that is not `@objc` is a crash waiting for a
+                    // test run, and it got one; `cancelOperation` is AppKit's
+                    // own and the box overrides it.
+                    box.cancelOperation(nil)
+                }
+                editor.undoForTest()
+
+                // MARK: a click while typing is a full stop
+                //
+                // Clicking away from a note finishes it. It used to finish it
+                // *and* open the next box where the click landed, which left an
+                // empty box behind every time anyone clicked off a note.
+                if let open = openField(at: CGPoint(x: 320, y: 320),
+                                        on: canvas, in: window) {
+                    open.insertText("done", replacementRange: open.selectedRange())
+                    let elsewhere = NSEvent.mouseEvent(
+                        with: .leftMouseDown,
+                        location: canvas.convert(CGPoint(x: 120, y: 120), to: nil),
+                        modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                        windowNumber: window.windowNumber, context: nil,
+                        eventNumber: 0, clickCount: 1, pressure: 1)
+                    if let elsewhere { canvas.mouseDown(with: elsewhere) }
+                    let committed = editor.editsForTest.last
+                    var landed = false
+                    if case .text(_, let string, _) = committed { landed = string == "done" }
+                    check("clicking away commits what was being typed", landed,
+                          committed.map { "\($0)" } ?? "nothing")
+                    // The box that is gone is the point: the click was a full
+                    // stop, and a full stop does not open a new box.
+                    check("and does not open another box",
+                          firstTextBox(in: canvas)?.isEditable != true)
+                    while !editor.editsForTest.isEmpty { editor.undoForTest() }
+                    // The committed words stand in for themselves until the
+                    // render lands; without waiting for it, the next check finds
+                    // that stand-in and reads it as an open box.
+                    await editor.flushForTest()
+                }
+
+                // MARK: the hover highlight
+                //
+                // Clicking a piece of text to correct it is not a thing anyone
+                // would guess at, so the pointer passing over one has to light
+                // it up. Driven as a real mouse-moved event, because the
+                // tracking area and the hit test are the two halves that have
+                // to meet.
+                editor.addEditForTest(.text(CGPoint(x: 200, y: 150), "hover me",
+                                            ImageEdit.textSize))
+                if let moved = NSEvent.mouseEvent(
+                    with: .mouseMoved, location: canvas.convert(CGPoint(x: 210, y: 152), to: nil),
+                    modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                    windowNumber: window.windowNumber, context: nil,
+                    eventNumber: 0, clickCount: 0, pressure: 0) {
+                    canvas.mouseMoved(with: moved)
+                }
+                check("the pointer over a piece of text lights it up",
+                      editor.hoverForTest != nil,
+                      editor.hoverForTest.map(rectString) ?? "nothing lit")
+                if let away = NSEvent.mouseEvent(
+                    with: .mouseMoved, location: canvas.convert(CGPoint(x: 500, y: 350), to: nil),
+                    modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                    windowNumber: window.windowNumber, context: nil,
+                    eventNumber: 0, clickCount: 0, pressure: 0) {
+                    canvas.mouseMoved(with: away)
+                }
+                check("and goes dark again when it moves off",
+                      editor.hoverForTest == nil,
+                      editor.hoverForTest.map(rectString) ?? "dark")
+                while !editor.editsForTest.isEmpty { editor.undoForTest() }
+
+                // MARK: dragging a piece of text
+                //
+                // A press on text is a click *or* a drag, and which one it is is
+                // not known until the pointer moves. Four points of travel is
+                // the line between them.
+                editor.addEditForTest(.text(CGPoint(x: 200, y: 150), "move me",
+                                            ImageEdit.textSize))
+                let steps = editor.editsForTest.count
+                drag(canvas, from: CGPoint(x: 210, y: 152),
+                     to: CGPoint(x: 260, y: 122), in: window)
+                if case .text(let moved, let string, _) = editor.editsForTest.last {
+                    check("dragging text moves it",
+                          string == "move me"
+                            && abs(moved.x - 250) < 1 && abs(moved.y - 120) < 1,
+                          String(format: "%@ at %.0f,%.0f", string as NSString,
+                                 moved.x, moved.y))
+                } else {
+                    check("dragging text moves it", false, "no text")
+                }
+                check("and it is one step, not a delete and a re-add",
+                      editor.editsForTest.count == steps,
+                      "\(steps) -> \(editor.editsForTest.count)")
+                check("and the box did not open",
+                      firstTextBox(in: canvas) == nil)
+                while !editor.editsForTest.isEmpty { editor.undoForTest() }
+                await editor.flushForTest()
+
+                // MARK: opening a box does not move the picture
+                //
+                // A text view asks to be scrolled into view when it takes the
+                // keyboard, and this one lives inside the scroll view that holds
+                // the capture — so opening a box near an edge slid the whole
+                // picture. Seen from outside, the text jumps the moment you
+                // click it.
+                editor.addEditForTest(.text(CGPoint(x: 40, y: 40), "near the edge",
+                                            ImageEdit.textSize))
+                await editor.flushForTest()
+                let restingScroll = editor.scrollOriginForTest
+                _ = openField(at: CGPoint(x: 60, y: 30), on: canvas, in: window)
+                check("opening a box near the edge does not scroll the picture",
+                      abs(editor.scrollOriginForTest.x - restingScroll.x) < 0.5
+                        && abs(editor.scrollOriginForTest.y - restingScroll.y) < 0.5,
+                      String(format: "%.1f,%.1f -> %.1f,%.1f",
+                             restingScroll.x, restingScroll.y,
+                             editor.scrollOriginForTest.x, editor.scrollOriginForTest.y))
+                if let open = firstTextBox(in: canvas) { open.cancelOperation(nil) }
+                while !editor.editsForTest.isEmpty { editor.undoForTest() }
+                await editor.flushForTest()
+
+                // MARK: opening a piece of text again
+                //
+                // An annotation you can only make and never fix is half a
+                // feature, and the undo stack is not an editing tool. Clicking
+                // text with the text tool takes it back out of the list and puts
+                // it in a box, holding the same words in the same place.
+                editor.addEditForTest(.text(CGPoint(x: 200, y: 150), "typo", ImageEdit.textSize))
+                let held = editor.editsForTest.count
+                if let reopened = openField(at: CGPoint(x: 210, y: 152),
+                                            on: canvas, in: window) {
+                    check("clicking text opens it again", reopened.string == "typo",
+                          reopened.string)
+                    check("and takes it out of the list while it is being edited",
+                          editor.editsForTest.count == held - 1,
+                          "\(held) -> \(editor.editsForTest.count)")
+                    reopened.setSelectedRange(NSRange(location: 4, length: 0))
+                    reopened.insertText("!", replacementRange: reopened.selectedRange())
+                    commitTyping(reopened, in: window)
+                    if case .text(let anchor, let string, _) = editor.editsForTest.last {
+                        check("the correction lands where the original was",
+                              string == "typo!"
+                                && abs(anchor.x - 200) < 0.01 && abs(anchor.y - 150) < 0.01,
+                              String(format: "%@ at %.1f,%.1f", string as NSString,
+                                     anchor.x, anchor.y))
+                    } else {
+                        check("the correction lands where the original was", false, "no text")
+                    }
+                } else {
+                    check("clicking text opens it again", false, "nothing opened")
+                }
+                // Wound all the way back rather than a fixed number of times:
+                // re-opening a piece of text is two entries in the history — the
+                // removal and the retyping — and counting them here is how the
+                // checks after this one started reading someone else's list.
+                while !editor.editsForTest.isEmpty { editor.undoForTest() }
+            } else {
+                check("clicking with the text tool opens a field", false, "no canvas")
+            }
+            // MARK: the crop frame
+            //
+            // The crop tool holds a frame rather than asking for a rectangle to
+            // be drawn: with nothing cropped yet the frame is the whole picture,
+            // and its corners are what get pulled. One drag must leave one entry
+            // on the undo stack, not one per mouse-moved event.
+            press("c", on: editor, in: window)
+            if let canvas = editor.hitTest(CGPoint(x: 200, y: 200)) {
+                let before = editor.editsForTest.count
+                drag(canvas, from: CGPoint(x: 598, y: 398),
+                     to: CGPoint(x: 400, y: 300), in: window)
+                let cropped = editor.editsForTest.last?.cropRect
+                let wanted = CGRect(x: 0, y: 0, width: 400, height: 300)
+                check("dragging a corner crops from that corner",
+                      cropped.map { abs($0.width - wanted.width) < 1
+                          && abs($0.height - wanted.height) < 1
+                          && abs($0.minX) < 1 && abs($0.minY) < 1 } ?? false,
+                      cropped.map(rectString) ?? "no crop")
+                check("and the whole drag is one entry on the stack",
+                      editor.editsForTest.count == before + 1,
+                      "\(before) -> \(editor.editsForTest.count)")
+                editor.undoForTest()
+            } else {
+                check("dragging a corner crops from that corner", false, "no canvas")
+            }
+
+            press("r", on: editor, in: window)
+            window.orderOut(nil)
+            window.contentView = nil
+        }
+
+        // MARK: the list
+        //
+        // The reason any of this is undoable: an edit is an entry, not a write.
+        editor.addEditForTest(.redact(drawn))
+        editor.addEditForTest(.marker(CGPoint(x: 420, y: 300)))
+        check("two gestures make two edits", editor.editsForTest.count == 2,
+              "\(editor.editsForTest.count)")
         check("editor scales the drawn rect the same way",
               editor.pixelRegionsForTest == [expected],
               "\(rectString(editor.pixelRegionsForTest.first ?? .zero))")
+        editor.undoForTest()
+        check("⌘Z takes the last one back", editor.editsForTest == [.redact(drawn)],
+              "\(editor.editsForTest.count) left")
+        editor.redoForTest()
+        check("⇧⌘Z puts it back", editor.editsForTest.count == 2,
+              "\(editor.editsForTest.count)")
+        editor.undoForTest()
+        editor.addEditForTest(.crop(CGRect(x: 50, y: 25, width: 300, height: 200)))
+        editor.redoForTest()
+        // Undo then draw is a new branch, and the redone marker must not come
+        // back from the dead on top of it.
+        check("a new edit discards what was undone",
+              editor.editsForTest.count == 2 && editor.editsForTest.last?.cropRect != nil,
+              "\(editor.editsForTest.count) edits, last is \(editor.editsForTest.last.map { "\($0)" } ?? "none")")
 
         // MARK: the write
 
         let before = rgba(of: original)
-        _ = try await Redaction.apply(regions: [expected], toFileAt: file)
+        let sourceBytes = try Data(contentsOf: file)
+        let exported = ImageEdit.exportURL(besides: file)
+        _ = try await ImageEdit.export(
+            [.redact(drawn)], of: sourceBytes, pointSize: points, to: exported)
 
-        guard let source = CGImageSourceCreateWithURL(file as CFURL, nil),
+        check("the export is named after the capture",
+              exported.lastPathComponent == "edit-sample (edited).png",
+              exported.lastPathComponent)
+        // The whole point of exporting rather than overwriting.
+        check("and the capture itself is untouched",
+              (try? Data(contentsOf: file)) == sourceBytes)
+
+        guard let source = CGImageSourceCreateWithURL(exported as CFURL, nil),
               let written = CGImageSourceCreateImageAtIndex(source, 0, nil),
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
                 as? [CFString: Any]
@@ -2665,7 +3445,7 @@ enum SelfTest {
         let dpi = properties[kCGImagePropertyDPIWidth] as? Double
         check("kept its 144 dpi tag", dpi == 144, "got \(dpi.map { "\($0)" } ?? "none")")
         check("still opens at \(Int(points.width))×\(Int(points.height)) pt",
-              NSImage(contentsOf: file)?.size == points)
+              NSImage(contentsOf: exported)?.size == points)
 
         // MARK: the pixels
 
@@ -2719,6 +3499,180 @@ enum SelfTest {
         let distinct = Set(strip).count
         check("no structure survives across the rect", distinct <= (columns.right - columns.left) / block + 1,
               "\(distinct) distinct values across \(strip.count) px")
+
+        // MARK: the preview is the output
+        //
+        // Not "looks like": the same bytes. The editor shows the picture that
+        // `render` produces and Apply writes the picture that `render` produces,
+        // and this is the only check that can tell the difference between that
+        // being true and being intended.
+        let previewed = ImageEdit.render(
+            original, edits: [.redact(drawn)], pointSize: points, cropping: false)
+        check("the preview render is the written bitmap",
+              previewed.map { rgba(of: $0) == after } ?? false)
+
+        // MARK: the other three tools
+        //
+        // Pure renders against the pristine bitmap: what each one puts on the
+        // picture, and — as much as matters — what it leaves alone.
+        func changedPixels(_ edits: [ImageEdit], in box: CGRect) -> Int {
+            guard let rendered = ImageEdit.render(
+                original, edits: edits, pointSize: points, cropping: false) else { return -1 }
+            let bytes = rgba(of: rendered)
+            var count = 0
+            for row in Int(pixels.height - box.maxY)..<Int(pixels.height - box.minY) {
+                for column in Int(box.minX)..<Int(box.maxX)
+                where sample(before, row, column) != sample(bytes, row, column) {
+                    count += 1
+                }
+            }
+            return count
+        }
+
+        let marker = CGPoint(x: 300, y: 200)
+        let markerBox = CGRect(
+            x: (marker.x - ImageEdit.markerRadius) * 2, y: (marker.y - ImageEdit.markerRadius) * 2,
+            width: ImageEdit.markerRadius * 4, height: ImageEdit.markerRadius * 4)
+        check("a marker draws inside its own circle",
+              changedPixels([.marker(marker)], in: markerBox) > 0)
+        check("and nowhere else",
+              changedPixels([.marker(marker)], in: CGRect(x: 0, y: 0, width: 100, height: 100)) == 0)
+
+        // The anchor is the top of the first line, so the ink hangs *below* it.
+        let textAt = CGPoint(x: 100, y: 300)
+        check("text draws where it was typed",
+              changedPixels([.text(textAt, "SECRET", ImageEdit.textSize)],
+                      in: CGRect(x: textAt.x * 2, y: (textAt.y - 26) * 2,
+                                 width: 300, height: 56)) > 0)
+        check("and nowhere else",
+              changedPixels([.text(textAt, "SECRET", ImageEdit.textSize)],
+                      in: CGRect(x: 0, y: 0, width: 100, height: 100)) == 0)
+
+        // Where the ink actually starts, in pixels, against the point that was
+        // asked for. The model's point is the left end of the baseline and the
+        // text field is placed to match it, so this is the number that says
+        // whether what you type sits where you clicked — and whether ⏎ moves it.
+        if let inked = ImageEdit.render(
+            original, edits: [.text(textAt, "H", ImageEdit.textSize)], pointSize: points, cropping: false) {
+            let bytes = rgba(of: inked)
+            var left = Int.max, bottom = -1
+            for row in 0..<inked.height {
+                for column in 0..<inked.width
+                where sample(before, row, column) != sample(bytes, row, column) {
+                    left = min(left, column)
+                    bottom = max(bottom, row)
+                }
+            }
+            // The bitmap's rows run from the top; this is a row index from the
+            // bottom. The anchor is the top of the line box, so "H" — which has
+            // no descender — puts its baseline one rounded (lineHeight −
+            // descent) below it, and its ink no lower than that plus the shadow.
+            let lowest = CGFloat(inked.height - bottom)
+            let wanted = CGPoint(x: textAt.x * 2, y: textAt.y * 2)
+            let baseline = wanted.y
+                - (ImageEdit.textLineHeight() - 4.22).rounded() * 2
+            let drop = baseline - lowest
+            check("the first line hangs from the point that was clicked",
+                  abs(CGFloat(left) - wanted.x) <= 6 && drop >= -2 && drop <= 10,
+                  String(format: "ink at %d,%.0f px, baseline wanted %.0f (%.0f of shadow)",
+                         left, lowest, baseline, drop))
+        } else {
+            check("the baseline lands on the point that was clicked", false, "no render")
+        }
+
+        let crop = CGRect(x: 50, y: 25, width: 300, height: 200)
+        let cropped = ImageEdit.render(
+            original, edits: [.crop(crop)], pointSize: points, cropping: true)
+        check("a crop cuts the bitmap to the drawn rect at 2×",
+              cropped.map { $0.width == 600 && $0.height == 400 } ?? false,
+              cropped.map { "\($0.width)×\($0.height)" } ?? "nothing")
+        let uncropped = ImageEdit.render(
+            original, edits: [.crop(crop)], pointSize: points, cropping: false)
+        check("and the preview keeps the whole picture",
+              uncropped.map { $0.width == Int(pixels.width) && $0.height == Int(pixels.height) }
+                ?? false,
+              uncropped.map { "\($0.width)×\($0.height)" } ?? "nothing")
+
+        // MARK: the zoom lands on a whole fraction
+        //
+        // A screenshot shown at 0.62 has every pixel resampled into a fraction of
+        // a screen pixel, and the words being typed — drawn live at screen
+        // resolution — end up on a different subpixel phase from the same words
+        // already committed into the picture. One pixel per glyph, about one per
+        // cent over a line, and it reads as the text loosening while you type.
+        check("a fit near a whole fraction snaps to it",
+              abs(ZoomingScrollView.snapped(0.55) - 0.5) < 0.001
+                && abs(ZoomingScrollView.snapped(0.34) - 1.0 / 3) < 0.001,
+              String(format: "0.55 -> %.3f, 0.34 -> %.3f",
+                     ZoomingScrollView.snapped(0.55), ZoomingScrollView.snapped(0.34)))
+        check("and one that is not stays where it is",
+              abs(ZoomingScrollView.snapped(0.9) - 0.9) < 0.001
+                && abs(ZoomingScrollView.snapped(1) - 1) < 0.001,
+              String(format: "0.9 -> %.3f", ZoomingScrollView.snapped(0.9)))
+
+        check("an empty list is not an edit",
+              ImageEdit.render(original, edits: [], pointSize: points, cropping: true) == nil)
+
+        // MARK: applying a crop, through the editor
+        //
+        // The one edit that changes what "the picture" is. Driven through the
+        // view because the resize afterwards — canvas, document, zoom — is the
+        // part no pure render can be wrong about and the window can.
+        let cropFile = directory.appendingPathComponent("edit-crop.png")
+        try ImageEncoder.write(original, to: cropFile, as: .png, scale: 2)
+        // Kept aside so "back to the original" can be checked as bytes rather
+        // than as a size that happens to match.
+        let cropSource = directory.appendingPathComponent("edit-crop-source.png")
+        try? FileManager.default.removeItem(at: cropSource)
+        try FileManager.default.copyItem(at: cropFile, to: cropSource)
+        if let cropImage = NSImage(contentsOf: cropFile),
+           let cropEditor = ImageEditor(
+            url: cropFile, image: cropImage, menu: NSMenu(),
+            frame: CGRect(origin: .zero, size: points)) {
+            cropEditor.addEditForTest(.crop(crop))
+            await cropEditor.flushForTest()
+            check("a crop takes effect without anything being confirmed",
+                  cropEditor.pointSizeForTest == crop.size,
+                  "got \(sizeString(cropEditor.pointSizeForTest))")
+            check("and the capture on disk has not moved",
+                  (try? Data(contentsOf: cropFile)) == (try? Data(contentsOf: cropSource)))
+
+            // Copy is the only thing that writes: a new file beside the capture,
+            // and the same picture on the clipboard.
+            NSPasteboard.general.clearContents()
+            await cropEditor.copyForTest()
+            let copied = ImageEdit.exportURL(besides: cropFile)
+                .deletingLastPathComponent()
+                .appendingPathComponent("edit-crop (edited).png")
+            check("Copy writes the edited picture beside it",
+                  NSImage(contentsOf: copied)?.size == crop.size,
+                  "got \(NSImage(contentsOf: copied).map { sizeString($0.size) } ?? "nothing")")
+            check("and puts it on the clipboard",
+                  NSPasteboard.general.readObjects(forClasses: [NSImage.self])?.isEmpty == false)
+            check("and still has not touched the capture",
+                  (try? Data(contentsOf: cropFile)) == (try? Data(contentsOf: cropSource)))
+
+            cropEditor.undoForTest()
+            await cropEditor.flushForTest()
+            check("⌘Z puts the whole picture back on screen",
+                  cropEditor.pointSizeForTest == points,
+                  "got \(sizeString(cropEditor.pointSizeForTest))")
+        } else {
+            check("a crop takes effect without anything being confirmed", false, "no editor")
+        }
+
+        // MARK: the picture of it
+        //
+        // Numbers cannot say whether a marker is legible or whether the bar has
+        // run off the end of the window, and this editor is four tools now. The
+        // photograph is the only part of this test a person has to look at, so it
+        // is taken through the real window with the real tools open over a real
+        // render.
+        if ScreenPermission.isGranted {
+            try await photographEditor(over: original, pointSize: points, into: directory)
+        } else {
+            print("photo:         skipped — no screen-recording permission")
+        }
 
         print("result:        \(failures == 0 ? "PASS" : "FAIL (\(failures))")")
         return failures == 0 ? 0 : 1
@@ -2860,6 +3814,467 @@ enum SelfTest {
     private static func fileSize(_ url: URL) -> Int {
         (try? FileManager.default.attributesOfItem(atPath: url.path))
             .flatMap { $0[.size] as? Int } ?? 0
+    }
+
+    /// A press and a release on `view`, at a point in window coordinates.
+    ///
+    /// Sent to the view directly rather than through `NSApp.sendEvent`, which
+    /// needs a key window and an event loop the headless tests do not run. The
+    /// part worth testing is the one before this — whatever `hitTest` handed
+    /// back — so what matters is that both halves go to the same view, the way
+    /// AppKit's own mouse-down view does it.
+    private static func click(_ view: NSView?, at point: CGPoint, in window: NSWindow) {
+        guard let view else { return }
+        for phase in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+            guard let event = NSEvent.mouseEvent(
+                with: phase, location: point, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.windowNumber, context: nil,
+                eventNumber: 0, clickCount: 1, pressure: 1)
+            else { continue }
+            if phase == .leftMouseDown { view.mouseDown(with: event) }
+            else { view.mouseUp(with: event) }
+        }
+    }
+
+    /// Opens the editor on a fresh copy of the sample, puts one of every tool on
+    /// it, and photographs the window.
+    ///
+    /// A real screen capture rather than `cacheDisplay(in:to:)`: the toolbar is
+    /// an `NSGlassEffectView`, whose material is composited by the window server
+    /// and comes out of an offscreen redraw as nothing at all.
+    private static func photographEditor(
+        over image: CGImage, pointSize: CGSize, into directory: URL
+    ) async throws {
+        let file = directory.appendingPathComponent("edit-scene.png")
+        try ImageEncoder.write(image, to: file, as: .png, scale: 2)
+        guard let opened = NSImage(contentsOf: file),
+              let editor = ImageEditor(
+                url: file, image: opened, menu: NSMenu(),
+                frame: CGRect(origin: .zero, size: CGSize(
+                    width: pointSize.width,
+                    height: pointSize.height + ImageEditor.chromeHeight)))
+        else {
+            print("photo:         skipped — the editor would not open the copy")
+            return
+        }
+
+        let coordinator = CaptureCoordinator()
+        try await coordinator.engine.refreshContent()
+        let displayID = ScreenIndex.screenUnderMouse().flatMap(ScreenIndex.displayID(of:))
+            ?? CGMainDisplayID()
+        guard let screen = ScreenIndex.screen(for: displayID) ?? NSScreen.main else { return }
+
+        // The picture's size plus the editor's own band, the way the viewer
+        // builds it — a window sized to the picture alone would photograph the
+        // toolbar eating into the capture, which is the thing this band exists
+        // to stop.
+        // Sized so the picture is shown at exactly 1:1 — the same margin the
+        // viewer's own band leaves. Anything smaller displays the capture scaled
+        // down, and a scaled-down picture hides sub-pixel disagreements between
+        // the box and the render behind its own resampling.
+        let margin = ZoomingScrollView.fitPadding * 2
+        let box = CGSize(
+            width: pointSize.width + margin,
+            height: pointSize.height + margin + ImageEditor.chromeHeight)
+        let window = NSWindow(
+            contentRect: CGRect(origin: .zero, size: box),
+            styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "edit-scene.png"
+        window.contentView = editor
+        window.setFrameOrigin(CGPoint(
+            x: (screen.frame.midX - box.width / 2).rounded(),
+            y: (screen.frame.midY - box.height / 2).rounded()))
+        window.orderFrontRegardless()
+        editor.layoutSubtreeIfNeeded()
+        editor.zoomToFit()
+
+        editor.chooseForTest(.crop)
+        editor.addEditForTest(.redact(CGRect(x: 60, y: 250, width: 220, height: 60)))
+        editor.addEditForTest(.marker(CGPoint(x: 330, y: 280)))
+        editor.addEditForTest(.text(CGPoint(x: 60, y: 150), "撒 before it leaves", ImageEdit.textSize))
+
+        // The same words twice, side by side on the same line: once committed
+        // into the picture, once still in the box.
+        //
+        // Photographed rather than measured through the views, and that is the
+        // point. `cacheDisplay` — which every earlier version of this check used
+        // — lays the text view out again into an offscreen context and *changes
+        // its frame while doing it*: a box measured that way came back 1.4
+        // points taller than it is on screen. Every number this check produced
+        // for three rounds was an artefact of taking it. A screen capture is
+        // what the person looking at the window sees.
+        editor.chooseForTest(.text)
+        let reportedText = "啊酒酒水酒酒水 SAAS"
+        let reportedSize: CGFloat = 40
+        editor.addEditForTest(.text(CGPoint(x: 30, y: 300), reportedText, reportedSize))
+        await editor.flushForTest()
+
+        // Each edit is a decode and a render off the main actor; this is the one
+        // place in the test that has to wait for all of them to land.
+        try await Task.sleep(for: .milliseconds(900))
+
+        // MARK: committed, then re-opened, photographed both times
+        //
+        // The state the screen recording caught: click a piece of text to
+        // correct it and the words move. Measured where it happens — on screen —
+        // because measuring it through the views is what hid it: `cacheDisplay`
+        // re-lays the text view out and changes its frame in the process.
+        if let firstShot = try? await coordinator.engine.capture(
+            .area(displayID: displayID, rectInAppKitGlobal: window.frame)),
+           let canvasView = editor.hitTest(CGPoint(x: 200, y: 200)) {
+            let committed = inkRows(of: firstShot.image)
+            let committedCoverage = committed.first.map {
+                inkCoverage(of: firstShot.image, in: $0)
+            }
+            // The press and the release separately: "the moment of clicking" is
+            // two events, and the box appears on the second.
+            let at = CGPoint(x: 50, y: 296)
+            if let down = NSEvent.mouseEvent(
+                with: .leftMouseDown, location: canvasView.convert(at, to: nil),
+                modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.windowNumber, context: nil,
+                eventNumber: 0, clickCount: 1, pressure: 1) {
+                canvasView.mouseDown(with: down)
+            }
+            if let pressed = try? await coordinator.engine.capture(
+                .area(displayID: displayID, rectInAppKitGlobal: window.frame)) {
+                print("  re-open: pressed  \(inkRows(of: pressed.image).map { "\($0.top)…\($0.bottom)@\($0.left)…\($0.right)" })")
+            }
+            if let up = NSEvent.mouseEvent(
+                with: .leftMouseUp, location: canvasView.convert(at, to: nil),
+                modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.windowNumber, context: nil,
+                eventNumber: 0, clickCount: 1, pressure: 1) {
+                canvasView.mouseUp(with: up)
+            }
+            // Frame by frame through the moment itself, not 250ms after it: the
+            // report is about what happens *as* the click lands, and the render
+            // that removes the old copy of the words takes a beat to arrive.
+            var trail: [(
+                description: String,
+                first: (top: Int, bottom: Int, left: Int, right: Int)?,
+                coverage: Double?
+            )] = []
+            for step in 0..<6 {
+                try await Task.sleep(for: .milliseconds(40))
+                guard let frame = try? await coordinator.engine.capture(
+                    .area(displayID: displayID, rectInAppKitGlobal: window.frame)) else { continue }
+                let rows = inkRows(of: frame.image)
+                let coverage = rows.first.map { inkCoverage(of: frame.image, in: $0) }
+                trail.append(("\(step * 40)ms \(rows.map { "\($0.top)…\($0.bottom)@\($0.left)…\($0.right)" })"
+                    + (coverage.map { String(format: " ink %.1f", $0) } ?? ""),
+                    rows.first, coverage))
+            }
+            print("  re-open: committed \(committed.map { "\($0.top)…\($0.bottom)@\($0.left)…\($0.right)" })")
+            for frame in trail { print("           \(frame.description)") }
+            // Every frame of the click, against the frame before it. The
+            // shadow's last row may come and go; the words may not move.
+            let start = committed.first
+            let moved = trail.compactMap(\.first).compactMap { last in
+                start.map {
+                    max(abs($0.top - last.top), abs($0.bottom - last.bottom),
+                        abs($0.left - last.left), abs($0.right - last.right))
+                }
+            }.max() ?? 999
+            let drift = (try? await coordinator.engine.capture(
+                .area(displayID: displayID, rectInAppKitGlobal: window.frame)))
+                .flatMap { inkRows(of: $0.image).first }
+                .map { last in
+                    start.map {
+                        max(abs($0.top - last.top), abs($0.bottom - last.bottom),
+                            abs($0.left - last.left), abs($0.right - last.right))
+                    } ?? 999
+                } ?? 999
+            let coverageDrift = committedCoverage.map { start in
+                trail.compactMap(\.coverage).map { abs($0 / start - 1) }.max() ?? 999
+            } ?? 999
+            print("  re-open: the words moved \(max(moved, drift)) px through the click")
+            print(String(format: "  re-open: ink changed %.2f%% through the click",
+                         coverageDrift * 100))
+        }
+
+        let shot = try? await coordinator.engine.capture(
+            .area(displayID: displayID, rectInAppKitGlobal: window.frame.insetBy(dx: -8, dy: -8)))
+        window.orderOut(nil)
+        window.contentView = nil
+        guard let shot else {
+            print("photo:         capture failed")
+            return
+        }
+        let url = directory.appendingPathComponent("edit-toolbar.png")
+        try? ImageEncoder.write(shot.image, to: url, as: .png, scale: shot.scale)
+        print("wrote:         \(url.lastPathComponent) (four tools, one of each)")
+    }
+
+    /// Opens the text tool's field at a point on the canvas, the way a click
+    /// does, and hands it back.
+    private static func openField(
+        at point: CGPoint, on canvas: NSView, in window: NSWindow
+    ) -> NSTextView? {
+        guard let down = NSEvent.mouseEvent(
+            with: .leftMouseDown, location: canvas.convert(point, to: nil),
+            modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber, context: nil,
+            eventNumber: 0, clickCount: 1, pressure: 1) else { return nil }
+        canvas.mouseDown(with: down)
+        // And the release, which is not a formality any more: a press on
+        // existing text is a click *or* the start of a drag, and it is the
+        // mouse-up that says which. Sending only the press left the canvas
+        // waiting for a drag that never came, and the next test's drag was
+        // interpreted as the tail of this one.
+        if let up = NSEvent.mouseEvent(
+            with: .leftMouseUp, location: canvas.convert(point, to: nil),
+            modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber, context: nil,
+            eventNumber: 0, clickCount: 1, pressure: 1) {
+            canvas.mouseUp(with: up)
+        }
+        return firstTextBox(in: canvas)
+    }
+
+    /// Where a view actually draws, in its own coordinates: the leftmost column
+    /// with ink in it, the lowest row, and how tall the ink is.
+    ///
+    /// Drawn into a bitmap rather than reasoned about from font metrics, for the
+    /// reason `TextFieldInk` gives at length: a text field's insets and its
+    /// vertical centring are not published, and the arithmetic version of this
+    /// was wrong three times.
+    private static func ink(
+        of view: NSView
+    ) -> (left: CGFloat, bottom: CGFloat, height: CGFloat, width: CGFloat) {
+        guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
+            return (0, 0, 0, 0)
+        }
+        view.cacheDisplay(in: view.bounds, to: rep)
+        let scale = CGFloat(rep.pixelsHigh) / max(view.bounds.height, 1)
+        var left = Int.max, right = -1, bottom = -1, top = Int.max
+        // The annotation's own red, not "anything that was drawn" — the box
+        // carries the renderer's shadow now, and counting that as ink measures
+        // the shadow's reach rather than where the letters are. The render side
+        // is filtered the same way, so the two are comparable.
+        func inked(_ column: Int, _ row: Int) -> Bool {
+            guard let colour = rep.colorAt(x: column, y: row)?
+                .usingColorSpace(.sRGB), colour.alphaComponent > 0.35 else { return false }
+            return colour.redComponent - colour.greenComponent > 0.2
+                && colour.redComponent - colour.blueComponent > 0.2
+        }
+        for row in 0..<rep.pixelsHigh {
+            for column in 0..<rep.pixelsWide where inked(column, row) {
+                left = min(left, column)
+                right = max(right, column)
+                bottom = max(bottom, row)
+                top = min(top, row)
+            }
+        }
+        guard left < Int.max else { return (0, 0, 0, 0) }
+        return (CGFloat(left) / scale,
+                CGFloat(rep.pixelsHigh - bottom - 1) / scale,
+                CGFloat(bottom - top + 1) / scale,
+                CGFloat(right - left + 1) / scale)
+    }
+
+    /// The same, for a rendered bitmap.
+    ///
+    /// Only the annotation's own red counts as ink, not every pixel that
+    /// changed: the mark carries a shadow, and a shadow is ink by the "differs
+    /// from the original" test — it would report the letters as several points
+    /// taller and lower than they are, which is the opposite of what a
+    /// measurement is for.
+    private static func ink(
+        of image: CGImage, against original: [UInt8]
+    ) -> (left: CGFloat, bottom: CGFloat, height: CGFloat, width: CGFloat)? {
+        let width = image.width
+        let bytes = rgba(of: image)
+        guard bytes.count == original.count else { return nil }
+        var left = Int.max, right = -1, bottom = -1, top = Int.max
+        for row in 0..<image.height {
+            for column in 0..<width {
+                let index = (row * width + column) * 4
+                guard bytes[index..<index + 4] != original[index..<index + 4] else { continue }
+                let red = Int(bytes[index]), green = Int(bytes[index + 1])
+                let blue = Int(bytes[index + 2])
+                guard red > 140, red - green > 60, red - blue > 60 else { continue }
+                left = min(left, column)
+                right = max(right, column)
+                bottom = max(bottom, row)
+                top = min(top, row)
+            }
+        }
+        guard left < Int.max else { return nil }
+        return (CGFloat(left), CGFloat(bottom), CGFloat(bottom - top + 1),
+                CGFloat(right - left + 1))
+    }
+
+    /// One pixel's alpha, for the checks that are about a shape rather than a
+    /// colour: a window's rounded corner is transparent and its middle is not.
+    private static func alpha(of image: CGImage, atX x: Int, y: Int) -> Int {
+        var pixel: [UInt8] = [0, 0, 0, 0]
+        guard let context = CGContext(
+            data: &pixel, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return -1 }
+        context.draw(image, in: CGRect(x: -x, y: -(image.height - 1 - y),
+                                       width: image.width, height: image.height))
+        return Int(pixel[3])
+    }
+
+    /// How wide the glyphs in a text view actually are.
+    ///
+    /// Not `usedRect(for:)`, which answers with the container's width — and the
+    /// editor's container is ten million points wide so that nothing wraps.
+    private static func inkedWidth(of box: NSTextView) -> CGFloat {
+        guard let layout = box.layoutManager else { return 0 }
+        var width: CGFloat = 0
+        var glyph = 0
+        while glyph < layout.numberOfGlyphs {
+            var effective = NSRange()
+            let used = layout.lineFragmentUsedRect(forGlyphAt: glyph, effectiveRange: &effective)
+            width = max(width, used.maxX)
+            glyph = max(effective.upperBound, glyph + 1)
+        }
+        return width
+    }
+
+    /// ⌘⏎, which is what finishes a piece of typing now that ⏎ is a newline.
+    private static func commitTyping(_ box: NSTextView, in window: NSWindow) {
+        guard let event = NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [.command],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber, context: nil,
+            characters: "\r", charactersIgnoringModifiers: "\r",
+            isARepeat: false, keyCode: 36)
+        else { return }
+        box.keyDown(with: event)
+    }
+
+    /// The first text box anywhere under `view`, which is how a test finds the
+    /// one the editor put on screen without the editor having to hand it out.
+    private static func firstTextBox(in view: NSView) -> NSTextView? {
+        for subview in view.subviews {
+            if let box = subview as? NSTextView { return box }
+            if let found = firstTextBox(in: subview) { return found }
+        }
+        return nil
+    }
+
+    /// The rows of every horizontal run of annotation red in a bitmap.
+    ///
+    /// The measurement that has actually been telling the truth: it reads what
+    /// is on the screen, so it cannot be perturbed by the act of taking it.
+    private static func inkRows(
+        of image: CGImage
+    ) -> [(top: Int, bottom: Int, left: Int, right: Int)] {
+        let bytes = rgba(of: image)
+        let width = image.width
+        func inkSpan(_ row: Int) -> (left: Int, right: Int)? {
+            var span: (left: Int, right: Int)?
+            for column in 0..<width {
+                let index = (row * width + column) * 4
+                let red = Int(bytes[index]), green = Int(bytes[index + 1])
+                let blue = Int(bytes[index + 2])
+                if red > 150, red - green > 55, red - blue > 55 {
+                    if span == nil { span = (column, column) }
+                    span?.right = column
+                }
+            }
+            return span
+        }
+        var bands: [(top: Int, bottom: Int, left: Int, right: Int)] = []
+        var run: (top: Int, bottom: Int, left: Int, right: Int)?
+        for row in 0..<image.height {
+            if let span = inkSpan(row) {
+                if var current = run {
+                    current.bottom = row
+                    current.left = min(current.left, span.left)
+                    current.right = max(current.right, span.right)
+                    run = current
+                } else {
+                    run = (row, row, span.left, span.right)
+                }
+            } else if let current = run {
+                if current.bottom - current.top > 6 { bands.append(current) }
+                run = nil
+            }
+        }
+        if let current = run, current.bottom - current.top > 6 { bands.append(current) }
+        return bands
+    }
+
+    /// Red dominance inside one detected annotation band. Unlike its bounds,
+    /// this changes when identical antialiased glyphs are composited twice.
+    private static func inkCoverage(
+        of image: CGImage,
+        in band: (top: Int, bottom: Int, left: Int, right: Int)
+    ) -> Double {
+        let bytes = rgba(of: image)
+        var coverage: Double = 0
+        for row in band.top...band.bottom {
+            for column in band.left...band.right {
+                let offset = (row * image.width + column) * 4
+                let red = Int(bytes[offset])
+                let green = Int(bytes[offset + 1])
+                let blue = Int(bytes[offset + 2])
+                coverage += Double(max(0, red - max(green, blue))) / 255
+            }
+        }
+        return coverage
+    }
+
+    /// A press, a move and a release on `view`, in that view's own coordinates.
+    ///
+    /// The three halves of a drag, because the interesting gestures in the image
+    /// editor are all drags and the interesting bugs are in what happens between
+    /// the press and the release.
+    private static func drag(
+        _ view: NSView, from: CGPoint, to: CGPoint, in window: NSWindow
+    ) {
+        let phases: [(NSEvent.EventType, CGPoint)] = [
+            (.leftMouseDown, from), (.leftMouseDragged, to), (.leftMouseUp, to),
+        ]
+        for (phase, point) in phases {
+            guard let event = NSEvent.mouseEvent(
+                with: phase, location: view.convert(point, to: nil), modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.windowNumber, context: nil,
+                eventNumber: 0, clickCount: 1, pressure: 1)
+            else { continue }
+            switch phase {
+            case .leftMouseDown: view.mouseDown(with: event)
+            case .leftMouseDragged: view.mouseDragged(with: event)
+            default: view.mouseUp(with: event)
+            }
+        }
+    }
+
+    /// One unmodified keystroke, delivered to a view's `keyDown`.
+    ///
+    /// The characters are all this app's shortcuts look at, and `keyCode` is not
+    /// worth a lookup table for a test: nothing here reads it.
+    private static func press(_ character: String, on view: NSView, in window: NSWindow) {
+        guard let event = NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber, context: nil,
+            characters: character, charactersIgnoringModifiers: character,
+            isARepeat: false, keyCode: 0)
+        else { return }
+        view.keyDown(with: event)
+    }
+
+    /// A flat white bitmap, for the measurements that need a ground with no
+    /// texture of its own to argue with.
+    private static func flatImage(width: Int, height: Int) -> CGImage? {
+        guard let context = CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        context.setFillColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        return context.makeImage()
     }
 
     /// Two-pixel black-and-white vertical stripes: maximum contrast at the

@@ -37,7 +37,7 @@ if let mode = SelfTest.Mode(arguments: arguments) {
           --selftest-preferences
           --selftest-edit-menu
           --selftest-copy-text <dir>
-          --selftest-redact <dir>
+          --selftest-edit <dir>
           --selftest-trim <dir>
           --selftest-share-card <dir>
           --selftest-capture <out.png> [--display N]

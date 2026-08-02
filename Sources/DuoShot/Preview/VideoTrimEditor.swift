@@ -4,7 +4,7 @@ import AppKit
 /// The recording viewer's contents: the player, and the one thing you are
 /// allowed to do to the take before it leaves.
 ///
-/// The still's `RedactionEditor` is the shape this follows — a bar over the
+/// The still's `ImageEditor` is the shape this follows — a bar over the
 /// content, an explicit confirmation, and a destructive write to the staged
 /// file — but almost none of the machinery, because `AVPlayerView` already has
 /// the hard part. `beginTrimming(completionHandler:)` puts the system's own
@@ -36,7 +36,7 @@ final class VideoTrimEditor: NSView {
     /// Handed a fresh poster frame after a successful trim, so a preview card
     /// still on screen stops showing a frame the file may no longer contain.
     /// Injected rather than reached for, for the reason
-    /// `ViewerWindowController.onImageRedacted` gives.
+    /// `ViewerWindowController.onVideoTrimmed` gives.
     var onTrimmed: ((NSImage) -> Void)?
 
     init(url: URL, frame: CGRect) {
@@ -237,14 +237,14 @@ final class VideoTrimEditor: NSView {
 
 /// The strip along the top of the recording viewer.
 ///
-/// One button and no modes, unlike `RedactionBar`: the confirmation this feature
+/// One button and no modes, unlike `EditToolbar`: the confirmation this feature
 /// needs is the system trimming UI's own Trim button, so there is nothing for
 /// this to ask.
 private final class TrimBar: NSView {
     var onTrim: () -> Void = {}
 
     private let content: NSView
-    /// Not red, where `RedactionBar`'s Apply is: this button destroys nothing —
+    /// Not red, where `EditToolbar`'s Apply is: this button destroys nothing —
     /// it opens the handles. The press that cannot be taken back is the system
     /// trimming UI's own Trim, and colouring both as the dangerous one would
     /// spend the warning on the harmless half.

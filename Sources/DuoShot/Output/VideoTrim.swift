@@ -15,7 +15,7 @@ import Linkdrop
 /// gives: it runs at roughly disk speed and cannot change quality. The price is
 /// stated below and is not a bug to be fixed later.
 ///
-/// `@concurrent` for the reason `Redaction.apply` is: this reads and writes the
+/// `@concurrent` for the reason `ImageEdit.apply` is: this reads and writes the
 /// whole file, and none of that belongs on the main thread.
 nonisolated enum VideoTrim {
     enum Failure: LocalizedError {
@@ -42,7 +42,7 @@ nonisolated enum VideoTrim {
 
     /// Trims the staged file **in place**, and deliberately so.
     ///
-    /// Same decision as `Redaction.apply(regions:toFileAt:)` and for the same
+    /// Same decision as `ImageEdit.apply(_:toFileAt:pointSize:)` and for the same
     /// reason: share, copy, drag and the preview card all read this one URL, so
     /// writing "name (trimmed).mp4" beside it would leave the long take a
     /// mis-click away from every one of them. The file that was cut is the file

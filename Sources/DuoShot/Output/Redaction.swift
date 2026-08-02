@@ -1,7 +1,5 @@
 import CoreGraphics
 import Foundation
-import ImageIO
-import UniformTypeIdentifiers
 
 /// Destroying part of a capture before it can leave the machine.
 ///
@@ -24,9 +22,12 @@ import UniformTypeIdentifiers
 ///    to a 5K capture is as unreadable as one applied to a 640-point window
 ///    rather than a fine mosaic that a human eye can still resolve into letters.
 ///
-/// All of it is `nonisolated` and the file half is `@concurrent`, for the reason
-/// `ImageEncoder` gives: a 5K bitmap is tens of megabytes to average and
-/// re-encode, and none of that belongs on the main thread.
+/// This is only the pixel operation. Which rectangles, in what order, and when
+/// any of it reaches the file is `ImageEdit`'s — a redaction is one entry in an
+/// undoable list now, and the list is flattened onto the staged file once.
+///
+/// All of it is `nonisolated`, for the reason `ImageEncoder` gives: a 5K bitmap
+/// is tens of megabytes to average, and none of that belongs on the main thread.
 nonisolated enum Redaction {
     /// One over this many of the image's short side is a block. Chosen against
     /// the thing being hidden rather than against taste: body text in a 2×
@@ -96,30 +97,6 @@ nonisolated enum Redaction {
         return context.makeImage()
     }
 
-    /// Scales rectangles drawn over a picture at its point size into the
-    /// bitmap's own pixels.
-    ///
-    /// Lives here rather than in the view that does the dragging because it is
-    /// the piece a 2× capture can silently get wrong, and a pure function is the
-    /// only shape of it a self-test can hold still: at 144 dpi a rectangle over
-    /// the left half of the picture is over the left half of twice as many
-    /// pixels, and applying the drawn numbers unchanged would redact a quarter
-    /// of the area in the wrong corner.
-    ///
-    /// Both spaces have their origin at the bottom left, so this is a scale and
-    /// never a flip.
-    static func regions(
-        _ rects: [CGRect], atPointSize points: CGSize, inPixels pixels: CGSize
-    ) -> [CGRect] {
-        let scale = CGSize(
-            width: pixels.width / max(points.width, 1),
-            height: pixels.height / max(points.height, 1))
-        return rects.map {
-            CGRect(x: $0.minX * scale.width, y: $0.minY * scale.height,
-                   width: $0.width * scale.width, height: $0.height * scale.height)
-        }
-    }
-
     /// Replaces one block with its own mean colour.
     ///
     /// The alpha channel is averaged along with the rest: a capture with
@@ -161,90 +138,5 @@ nonisolated enum Redaction {
 
     static func blockSize(width: Int, height: Int) -> Int {
         max(minimumBlock, Int((Double(min(width, height)) / shortSideDivisor).rounded()))
-    }
-
-    // MARK: - The file
-
-    enum Failure: LocalizedError {
-        case unreadable(String)
-        case unwritable(String)
-
-        var errorDescription: String? {
-            switch self {
-            case .unreadable(let name): "Could not read \(name) to redact it."
-            case .unwritable(let name): "Could not write the redacted \(name)."
-            }
-        }
-    }
-
-    /// Redacts the staged file **in place**, and deliberately so.
-    ///
-    /// The obvious alternative — write "name (redacted).png" beside the original
-    /// — is the one thing this feature must not do. A redaction exists because
-    /// one of the two files is dangerous, and leaving both on disk under names
-    /// that differ by a parenthesis means the dangerous one is a mis-click away
-    /// from the share button, the drag-out, the Copy, and the OCR. Every one of
-    /// those consumers reads this URL and nothing else, so overwriting it is what
-    /// makes them all agree. It is not undoable, and the caller is expected to
-    /// have said so.
-    ///
-    /// Written to a sibling and swapped with `replaceItemAt` rather than
-    /// truncated in place: a crash halfway through an in-place rewrite would
-    /// leave a half-redacted file, which is the failure that matters here — it
-    /// still holds the original bytes and no longer looks like it does.
-    ///
-    /// Same format and same DPI as it found. The DPI is the load-bearing half:
-    /// it is what stands between a 2× capture and being displayed at double size
-    /// everywhere afterwards — the concern `Reencoder` in `LinkdropGate` exists
-    /// for, and this path re-encodes every capture rather than only the ones in
-    /// an unusual format.
-    @concurrent
-    static func apply(regions: [CGRect], toFileAt url: URL, quality: Double = 0.95)
-        async throws -> sending CGImage
-    {
-        let name = url.lastPathComponent
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let type = CGImageSourceGetType(source),
-              let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
-        else { throw Failure.unreadable(name) }
-
-        guard let redacted = pixelate(image, regions: regions) else {
-            throw Failure.unwritable(name)
-        }
-
-        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
-        let dpi = (properties?[kCGImagePropertyDPIWidth] as? Double).flatMap { $0 > 0 ? $0 : nil }
-            ?? 72
-        var options: [CFString: Any] = [
-            kCGImagePropertyDPIWidth: dpi,
-            kCGImagePropertyDPIHeight: dpi,
-        ]
-        // High rather than the capture default: this is a second trip through a
-        // lossy encoder for the parts of the image nobody asked to change, and
-        // the ringing that buys is the price of the bytes underneath the
-        // rectangle being gone.
-        let contentType = UTType(type as String)
-        if contentType == .jpeg || contentType == .heic {
-            options[kCGImageDestinationLossyCompressionQuality] = quality
-        }
-
-        let temporary = url.deletingLastPathComponent()
-            .appendingPathComponent(".duoshot-redact-\(UUID().uuidString.prefix(8))")
-            .appendingPathExtension(url.pathExtension)
-        guard let destination = CGImageDestinationCreateWithURL(
-            temporary as CFURL, type, 1, nil) else { throw Failure.unwritable(name) }
-        CGImageDestinationAddImage(destination, redacted, options as CFDictionary)
-        guard CGImageDestinationFinalize(destination) else {
-            try? FileManager.default.removeItem(at: temporary)
-            throw Failure.unwritable(name)
-        }
-
-        do {
-            _ = try FileManager.default.replaceItemAt(url, withItemAt: temporary)
-        } catch {
-            try? FileManager.default.removeItem(at: temporary)
-            throw Failure.unwritable(name)
-        }
-        return redacted
     }
 }

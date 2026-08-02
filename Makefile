@@ -233,7 +233,7 @@ test: verify
 	run "selection loupe"        --selftest-loupe $(TEST_OUT); \
 	run "preview stack + scroll" --selftest-preview-stack $(TEST_OUT) --count 14; \
 	run "viewer window"          --selftest-viewer $(TEST_OUT); \
-	run "redaction"              --selftest-redact $(TEST_OUT); \
+	run "image editor"           --selftest-edit $(TEST_OUT); \
 	run "recording trim"         --selftest-trim $(TEST_OUT); \
 	run "recording area"         --selftest-record $(TEST_OUT) --seconds 2 --rect 400,300,640,400; \
 	run "recording fullscreen"   --selftest-record $(TEST_OUT) --seconds 2; \
