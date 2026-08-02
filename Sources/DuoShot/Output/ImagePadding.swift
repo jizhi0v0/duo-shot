@@ -74,12 +74,21 @@ nonisolated enum ImagePadding {
         let canvas = CGRect(x: 0, y: 0, width: width, height: height)
         context.interpolationQuality = .high
 
-        // The outer edge follows the window's own curve at a constant distance:
-        // `radius + inset` is the one value that keeps the two arcs concentric,
-        // so the margin is the same width at the corners as along the sides.
-        // Anything less and the gap pinches at the corners; anything more and it
-        // bulges. A square window gets a square card, which is also right.
-        let outerRadius = cornerRadius(of: image).map { $0 + CGFloat(inset) } ?? 0
+        // Half the inset past the window's own curve.
+        //
+        // `radius + inset` is the concentric answer — the two arcs stay a
+        // constant distance apart, so the margin is exactly as wide at the
+        // corners as along the sides. It is right on paper and it looks wrong:
+        // at a 32-point margin the card ends up more than twice as round as the
+        // window inside it, and the eye reads the two curves as belonging to
+        // different pictures rather than as one card around one window.
+        //
+        // Half of it keeps the card visibly rounder than the window without
+        // running away from it. The corners do pinch slightly — the gap there is
+        // narrower than along the sides — which is the price, and at half an
+        // inset it is not a price anyone has noticed. A square window still gets
+        // a square card.
+        let outerRadius = cornerRadius(of: image).map { $0 + CGFloat(inset) / 2 } ?? 0
         if outerRadius > 0 {
             context.addPath(CGPath(
                 roundedRect: canvas, cornerWidth: outerRadius, cornerHeight: outerRadius,
