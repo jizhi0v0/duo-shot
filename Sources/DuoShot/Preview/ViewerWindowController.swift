@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 
 /// DuoShot's own window for looking at a capture.
 ///
@@ -20,6 +21,7 @@ final class ViewerWindowController {
     /// that has been re-opened after its card timed out finds its own window.
     private var windows: [URL: NSWindow] = [:]
     private var observers: [URL: any NSObjectProtocol] = [:]
+    private var imageLoads: [URL: Task<Void, Never>] = [:]
 
     /// Self-tests set this to false, for the reason `PreferencesWindowController`
     /// gives: `NSApp.activate` takes the keyboard away from whatever the person
@@ -38,18 +40,55 @@ final class ViewerWindowController {
             bringToFront(existing)
             return
         }
-        guard let content = makeContent(for: entry) else {
-            // Nothing to show usually means the file moved or was pruned out from
-            // under the card. Falling back to the system opener would be a worse
-            // failure than saying so: it would either bounce the Dock or open a
-            // second app on an empty file.
-            Log.app.error("""
-                viewer: cannot read \(entry.url.lastPathComponent, privacy: .public)
-                """)
-            NSSound.beep()
-            return
+        switch entry.kind {
+        case .video(let result):
+            guard let content = videoContent(for: entry.url, pointSize: result.pointSize) else {
+                failToOpen(entry.url)
+                return
+            }
+            show(entry, content: content)
+        case .image:
+            guard imageLoads[entry.url] == nil else { return }
+            let url = entry.url
+            imageLoads[url] = Task { [weak self] in
+                guard let self else { return }
+                let loaded = await Self.loadImage(at: url)
+                // Before the table is touched, not after. Cancellation comes
+                // only from `closeAll`, which has already emptied it -- and may
+                // since have been followed by a fresh open for this same URL.
+                // Clearing the slot unconditionally would delete *that* task's
+                // registration, and the next open would start a second
+                // concurrent load of the same file.
+                guard !Task.isCancelled else { return }
+                self.imageLoads[url] = nil
+                // `Data(contentsOf:)` does not observe cancellation, so a load
+                // torn down mid-flight usually still succeeds. Beeping about it
+                // is the teardown's noise, not the user's problem -- which is
+                // why this sits after the check above rather than beside it.
+                guard let loaded else {
+                    self.failToOpen(url)
+                    return
+                }
+                guard self.windows[url] == nil,
+                      let content = self.imageContent(for: url, loaded: loaded)
+                else { return }
+                self.show(entry, content: content)
+            }
         }
+    }
 
+    private func failToOpen(_ url: URL) {
+        // Nothing to show usually means the file moved or was pruned out from
+        // under the card. Falling back to the system opener would be a worse
+        // failure than saying so: it would either bounce the Dock or open a
+        // second app on an empty file.
+        Log.app.error("""
+            viewer: cannot read \(url.lastPathComponent, privacy: .public)
+            """)
+        NSSound.beep()
+    }
+
+    private func show(_ entry: PreviewEntry, content: Content) {
         let window = ViewerWindow(contentRect: CGRect(origin: .zero, size: content.size),
                                   styleMask: [.titled, .closable, .miniaturizable, .resizable],
                                   backing: .buffered, defer: false)
@@ -119,6 +158,8 @@ final class ViewerWindowController {
     /// Closes every viewer. Used by the self-tests, and by nothing else: a user
     /// closes these one at a time like any other window.
     func closeAll() {
+        for task in imageLoads.values { task.cancel() }
+        imageLoads.removeAll()
         for window in windows.values { window.close() }
         windows.removeAll()
         for observer in observers.values { NotificationCenter.default.removeObserver(observer) }
@@ -138,15 +179,6 @@ final class ViewerWindowController {
         /// Run once the window is on screen. Playback starts here rather than at
         /// build time so the first frame is not decoded into an unmapped window.
         var onShown: (() -> Void)?
-    }
-
-    private func makeContent(for entry: PreviewEntry) -> Content? {
-        switch entry.kind {
-        case .video(let result):
-            return videoContent(for: entry.url, pointSize: result.pointSize)
-        case .image:
-            return imageContent(for: entry.url)
-        }
     }
 
     /// `pointSize` comes from the `RecordingResult` rather than from the file.
@@ -178,10 +210,38 @@ final class ViewerWindowController {
             onShown: { editor.play() })
     }
 
-    private func imageContent(for url: URL) -> Content? {
-        guard let image = NSImage(contentsOf: url), image.size.width >= 1,
-              image.size.height >= 1
+    private struct LoadedImage: Sendable {
+        let data: Data
+        let image: CGImage
+        let pointSize: CGSize
+    }
+
+    @concurrent
+    private nonisolated static func loadImage(at url: URL) async -> sending LoadedImage? {
+        guard !Task.isCancelled,
+              let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+              let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
         else { return nil }
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+            as? [CFString: Any]
+        let rawDPIWidth = (properties?[kCGImagePropertyDPIWidth] as? NSNumber)?.doubleValue ?? 72
+        let rawDPIHeight = (properties?[kCGImagePropertyDPIHeight] as? NSNumber)?.doubleValue ?? 72
+        let dpiWidth = rawDPIWidth.isFinite && rawDPIWidth > 0 ? rawDPIWidth : 72
+        let dpiHeight = rawDPIHeight.isFinite && rawDPIHeight > 0 ? rawDPIHeight : 72
+        let pointSize = CGSize(
+            width: CGFloat(image.width) * 72 / max(CGFloat(dpiWidth), 1),
+            height: CGFloat(image.height) * 72 / max(CGFloat(dpiHeight), 1))
+        // The guard the failable `ImageEditor.init` used to carry. It has to
+        // live somewhere: a DPI large enough to put the picture under a point
+        // leaves every zoom-to-fit ratio in the editor dividing by ~0, and the
+        // window that opens is worse than the beep that says the file is bad.
+        guard pointSize.width >= 1, pointSize.height >= 1 else { return nil }
+        return LoadedImage(data: data, image: image, pointSize: pointSize)
+    }
+
+    private func imageContent(for url: URL, loaded: LoadedImage) -> Content? {
+        let image = NSImage(cgImage: loaded.image, size: loaded.pointSize)
 
         // Recognition runs against `url`, not against `image`, so zoom cannot
         // affect it. `ImageEditor` puts the same menu on all three of its
@@ -210,10 +270,9 @@ final class ViewerWindowController {
         let picture = fitted(Self.band(around: image.size), reserving: ImageEditor.chromeHeight)
         let size = CGSize(
             width: picture.width, height: picture.height + ImageEditor.chromeHeight)
-        guard let editor = ImageEditor(
-            url: url, image: image, menu: menu,
+        let editor = ImageEditor(
+            url: url, image: image, originalData: loaded.data, menu: menu,
             frame: CGRect(origin: .zero, size: size))
-        else { return nil }
 
         return Content(view: editor, size: size, onShown: { editor.zoomToFit() })
     }

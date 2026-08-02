@@ -1174,6 +1174,11 @@ enum SelfTest {
             kind: .image(pointSize: CGSize(width: 600, height: 400)),
             thumbnail: NSImage(size: PreviewCardView.cardSize),
             url: sample, sourceDisplayID: CGMainDisplayID()))
+        // Image I/O is intentionally off the main actor now. Wait for the real
+        // window state instead of turning that performance fix into a race.
+        for _ in 0..<40 where ViewerWindowController.shared.windowForTest(sample) == nil {
+            try await Task.sleep(for: .milliseconds(50))
+        }
         let viewerMenu = ViewerWindowController.shared.windowForTest(sample)?.contentView?.menu
         check("viewer offers Copy Text",
               viewerMenu?.items.contains { $0.title == "Copy Text" } == true)
