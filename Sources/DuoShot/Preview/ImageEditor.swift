@@ -48,6 +48,7 @@ final class ImageEditor: NSView {
         case line
         case arrow
         case rectangle
+        case highlight
         case crop
 
         var draws: Bool { self != .pointer }
@@ -633,6 +634,7 @@ final class ImageEditor: NSView {
         case "l": choose(.line)
         case "a": choose(.arrow)
         case "b": choose(.rectangle)
+        case "h": choose(.highlight)
         case "c": choose(.crop)
         default: super.keyDown(with: event)
         }
@@ -911,6 +913,7 @@ private final class EditCanvas: NSView, NSTextViewDelegate, NSLayoutManagerDeleg
     /// does not blink out of existence for the length of a decode.
     func clearPending(revealTyping: Bool = false) {
         marks.pending = nil
+        marks.pendingHighlight = nil
         marks.pendingStroke = nil
         marks.pendingMarker = nil
         draft = nil
@@ -940,9 +943,10 @@ private final class EditCanvas: NSView, NSTextViewDelegate, NSLayoutManagerDeleg
             // pointer is the tool, and passing the click on is what "out of the
             // way" means.
             super.mouseDown(with: event)
-        case .redact:
+        case .redact, .highlight:
             anchor = point
             marks.pending = nil
+            marks.pendingHighlight = nil
             marks.pendingStroke = nil
         case .line, .arrow, .rectangle:
             anchor = point
@@ -1014,6 +1018,8 @@ private final class EditCanvas: NSView, NSTextViewDelegate, NSLayoutManagerDeleg
         switch tool {
         case .redact:
             marks.pending = rect(from: anchor, to: point)
+        case .highlight:
+            marks.pendingHighlight = rect(from: anchor, to: point)
         case .line, .arrow, .rectangle:
             marks.pendingStroke = (tool, anchor, clamped(point))
         default:
@@ -1054,6 +1060,7 @@ private final class EditCanvas: NSView, NSTextViewDelegate, NSLayoutManagerDeleg
         let boxLargeEnough = drawn.width >= Self.minimumSide && drawn.height >= Self.minimumSide
         guard tool == .line || tool == .arrow ? longEnough : boxLargeEnough else {
             marks.pending = nil
+            marks.pendingHighlight = nil
             marks.pendingStroke = nil
             marks.needsDisplay = true
             return
@@ -1072,8 +1079,12 @@ private final class EditCanvas: NSView, NSTextViewDelegate, NSLayoutManagerDeleg
         case .rectangle:
             marks.pendingStroke = (tool, anchor, endpoint)
             edit = .rectangle(drawn)
+        case .highlight:
+            marks.pendingHighlight = drawn
+            edit = .highlight(drawn)
         default:
             marks.pending = nil
+            marks.pendingHighlight = nil
             marks.pendingStroke = nil
             return
         }
@@ -1579,6 +1590,7 @@ private final class EditMarks: NSView {
     /// The rectangle being dragged, or the one just committed and not yet
     /// rendered.
     var pending: CGRect?
+    var pendingHighlight: CGRect?
     var pendingStroke: (tool: ImageEditor.Tool, start: CGPoint, end: CGPoint)?
     var pendingMarker: (centre: CGPoint, number: Int)?
     /// The crop frame, when the crop tool is holding one.
@@ -1616,6 +1628,17 @@ private final class EditMarks: NSView {
             path.fill()
             path.lineWidth = 1
             path.stroke()
+        }
+        if let pendingHighlight {
+            // The same multiply the renderer uses. An alpha wash here would be a
+            // different colour from the one that lands in the file, and the
+            // swap at the end of the render would read as the highlight
+            // shifting shade the moment it was committed.
+            NSGraphicsContext.current?.saveGraphicsState()
+            NSGraphicsContext.current?.compositingOperation = .multiply
+            (NSColor(cgColor: ImageEdit.highlightColor) ?? .systemYellow).setFill()
+            NSBezierPath(rect: pendingHighlight).fill()
+            NSGraphicsContext.current?.restoreGraphicsState()
         }
         if let pendingStroke { drawStroke(pendingStroke) }
         if let pendingMarker { drawMarker(pendingMarker) }
@@ -1824,6 +1847,7 @@ private final class EditToolbar: NSView {
         (.line, "line.diagonal", "Line — draw a straight line (L)"),
         (.arrow, "arrow.up.right", "Arrow — point at something (A)"),
         (.rectangle, "rectangle", "Box — outline a rectangle (B)"),
+        (.highlight, "highlighter", "Highlight — tint without hiding what is under it (H)"),
         (.crop, "crop", "Crop — keep only what you drag around (C)"),
     ]
 

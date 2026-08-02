@@ -2899,7 +2899,7 @@ enum SelfTest {
                   "\(editor.toolForTest)")
 
             // Every pill in the bar, not only the one that was pressed: the bug
-            // was one hidden pill covering one visible one, and there are eight
+            // was one hidden pill covering one visible one, and there are nine
             // of them now.
             var covered = 0
             for x in stride(from: barTop.minX + 2, to: barTop.maxX - 2, by: 3) {
@@ -3481,6 +3481,46 @@ enum SelfTest {
                 check("dragging a corner crops from that corner", false, "no canvas")
             }
 
+            // MARK: the highlighter, from the button to the list
+            //
+            // The render check further down proves the renderer. This proves
+            // there is a road to it. A tool can have a correct flattening path,
+            // a pill in the bar and a key of its own and still be dead — which
+            // is exactly how Redact shipped broken with every geometry
+            // assertion about it green.
+            if let pill = editor.pillFrameForTest(.highlight) {
+                let centre = CGPoint(x: pill.midX, y: pill.midY)
+                click(editor.hitTest(centre), at: editor.convert(centre, to: nil), in: window)
+                check("clicking the highlighter's pill arms it",
+                      editor.toolForTest == .highlight, "\(editor.toolForTest)")
+            } else {
+                check("the bar has a highlighter pill", false, "no pill")
+            }
+            press("v", on: editor, in: window)
+            press("h", on: editor, in: window)
+            check("and H does the same", editor.toolForTest == .highlight,
+                  "\(editor.toolForTest)")
+            if let canvas = editor.hitTest(CGPoint(x: 200, y: 200)) {
+                let before = editor.editsForTest.count
+                drag(canvas, from: CGPoint(x: 100, y: 100),
+                     to: CGPoint(x: 300, y: 180), in: window)
+                if case .highlight(let rect) = editor.editsForTest.last {
+                    check("dragging leaves a highlight over what was dragged over",
+                          abs(rect.minX - 100) < 1 && abs(rect.minY - 100) < 1
+                            && abs(rect.width - 200) < 1 && abs(rect.height - 80) < 1,
+                          rectString(rect))
+                } else {
+                    check("dragging leaves a highlight over what was dragged over", false,
+                          editor.editsForTest.last.map { "\($0)" } ?? "no edit")
+                }
+                check("and the whole drag is one entry on the stack",
+                      editor.editsForTest.count == before + 1,
+                      "\(before) -> \(editor.editsForTest.count)")
+                editor.undoForTest()
+            } else {
+                check("dragging with the highlighter leaves an edit", false, "no canvas")
+            }
+
             press("r", on: editor, in: window)
             window.orderOut(nil)
             window.contentView = nil
@@ -3726,6 +3766,54 @@ enum SelfTest {
                 original, edits: [edit], pointSize: points, cropping: true)
             check("the \(name) tool is flattened into the output",
                   rendered.map { !PixelCompare.compare($0, original).identical } == true)
+        }
+
+        // MARK: the highlighter tints without hiding
+        //
+        // "Changed some pixels" is what the callouts above settle for, and it is
+        // not enough here: a plain filled rectangle would pass it while being
+        // the one thing a highlighter must never be. The property under test is
+        // the physical object's — ink over white leaves colour, ink over black
+        // leaves black — which is what `.multiply` gives and what alpha does
+        // not. Yellow at 0.4 over black lifts it to a muddy olive around 102,
+        // and `darkestStayedDark` is the number that catches it.
+        //
+        // `stripedImage` is 2 px of black every 4, so one rectangle covers
+        // thousands of each kind of pixel and neither sample can be a fluke.
+        let band = CGRect(x: 40, y: 40, width: 300, height: 120)
+        if let lit = ImageEdit.render(
+            original, edits: [.highlight(band)], pointSize: points, cropping: true) {
+            let after = rgba(of: lit)
+            let stride = lit.width * 4
+            var litWhites = 0
+            var survivingInk = 0
+            var muddied: (r: Int, g: Int, b: Int)?
+            // Bitmap rows run from the top; the band is in bottom-left space.
+            for row in (lit.height - Int(band.maxY) * 2)..<(lit.height - Int(band.minY) * 2) {
+                for column in (Int(band.minX) * 2)..<(Int(band.maxX) * 2) {
+                    let i = row * stride + column * 4
+                    let r = Int(after[i]), g = Int(after[i + 1]), b = Int(after[i + 2])
+                    if r > 200 && g > 180 && b < 90 {
+                        litWhites += 1
+                    } else if r < 60 && g < 60 && b < 60 {
+                        survivingInk += 1
+                    } else if muddied == nil {
+                        // Neither the tint nor the ink: the wash has moved a
+                        // pixel that should have been left where it was. Keep
+                        // the first one, so a failure says what it looked like.
+                        muddied = (r, g, b)
+                    }
+                }
+            }
+            check("the highlighter tints the paper", litWhites > 10_000,
+                  "\(litWhites) tinted, \(survivingInk) still ink"
+                  + (muddied.map { ", first muddied pixel \($0.r),\($0.g),\($0.b)" } ?? ""))
+            check("and leaves the ink under it alone",
+                  muddied == nil && survivingInk > 10_000,
+                  muddied.map { "ink came back as \($0.r),\($0.g),\($0.b)" }
+                    ?? "\(survivingInk) ink pixels untouched")
+        } else {
+            check("the highlighter renders", false, "nothing came back")
         }
 
         // MARK: applying a crop, through the editor

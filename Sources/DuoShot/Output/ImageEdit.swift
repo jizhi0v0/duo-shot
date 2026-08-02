@@ -44,6 +44,15 @@ nonisolated enum ImageEdit: Equatable {
     case line(CGPoint, CGPoint)
     case arrow(CGPoint, CGPoint)
     case rectangle(CGRect)
+    /// A wash of colour that leaves what is under it readable — the opposite of
+    /// `redact`, which exists to make sure nothing under it can be read.
+    ///
+    /// Composited with `.multiply`, not with alpha. Alpha lifts black towards
+    /// the tint (yellow at 0.4 over black text gives a muddy olive), which is
+    /// what a highlighter never does; multiplying leaves anything already dark
+    /// exactly where it was and only tints what was light. That is the whole
+    /// behaviour of the physical object, and the self-test asserts it.
+    case highlight(CGRect)
     /// What survives. Applied last and only once — the *last* crop in the list
     /// wins, so cropping twice is a correction rather than a compounding.
     case crop(CGRect)
@@ -77,6 +86,8 @@ nonisolated enum ImageEdit: Equatable {
                 CGPoint(x: end.x + offset.x, y: end.y + offset.y))
         case .rectangle(let rect):
             return .rectangle(rect.offsetBy(dx: offset.x, dy: offset.y))
+        case .highlight(let rect):
+            return .highlight(rect.offsetBy(dx: offset.x, dy: offset.y))
         case .crop(let rect):
             return .crop(rect.offsetBy(dx: offset.x, dy: offset.y))
         }
@@ -153,6 +164,10 @@ nonisolated enum ImageEdit: Equatable {
     /// `setShadow`, not an outline: two rounds of looking at outlined text and a
     /// ringed disc said the same thing both times.
     static let inkColor = CGColor(srgbRed: 1, green: 0.23, blue: 0.19, alpha: 1)
+    /// Opaque, and that is not a mistake: it is multiplied rather than blended,
+    /// so its own alpha would only wash the tint out. White under it becomes
+    /// this colour exactly; black under it stays black.
+    static let highlightColor = CGColor(srgbRed: 1, green: 0.86, blue: 0.2, alpha: 1)
     static let haloColor = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
 }
 
@@ -311,6 +326,12 @@ nonisolated extension ImageEdit {
                 index += 1
             case .rectangle(let rect):
                 drawRectangle(scaled(rect, by: scale), unit: unit, in: context)
+                index += 1
+            case .highlight(let rect):
+                // Not coalesced the way consecutive redactions are. Averaging an
+                // average is wrong, which is why those are gathered up; ink laid
+                // twice over the same words really is darker, on paper and here.
+                drawHighlight(scaled(rect, by: scale), in: context)
                 index += 1
             case .crop:
                 // Last, and outside the loop: a crop half way through the list
@@ -508,6 +529,17 @@ nonisolated extension ImageEdit {
             }
         }
         context.strokePath()
+        context.restoreGState()
+    }
+
+    /// No shadow and no outline, unlike every other mark here. A highlighter
+    /// leaves a flat band of colour; an edge or a drop shadow would make it read
+    /// as a box that happens to be yellow.
+    private static func drawHighlight(_ rect: CGRect, in context: CGContext) {
+        context.saveGState()
+        context.setBlendMode(.multiply)
+        context.setFillColor(highlightColor)
+        context.fill(rect)
         context.restoreGState()
     }
 
