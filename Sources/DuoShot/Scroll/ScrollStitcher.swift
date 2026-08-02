@@ -129,6 +129,10 @@ actor ScrollStitcher {
     private static let segments = 4
     /// R, G and B of each segment; alpha is 255 everywhere and says nothing.
     private static let componentsPerRow = segments * 3
+    /// Full-body comparisons retained after the constant-size anchor pass. A
+    /// repeating page can nominate thousands of plausible rows; pixel-checking
+    /// every one recreates the quadratic scan relocation exists to avoid.
+    private static let relocationCandidateLimit = 64
 
     private let config: Config
     private var pixelWidth = 0
@@ -483,7 +487,59 @@ actor ScrollStitcher {
         // from the canvas by every line that finished arriving, and relocation
         // can only reposition and refresh, never write at the ends.
         let budget = Int((1 - config.revisitMatchRatio) * Double(frameBody))
+        // A frame with almost no structure matches everywhere, so relocating it
+        // means nothing. `pixelConfirmation` refuses it at the end for exactly
+        // this reason; checking the signatures first only reaches that answer
+        // without walking the canvas to get there.
+        let informative = (0..<frameBody).filter {
+            signatureRange(signatures, row: header + $0) > 24
+        }
+        guard informative.count >= config.minInformativeRows else { return nil }
+        let anchorCount = min(48, informative.count)
+        let anchors = (0..<anchorCount).map {
+            informative[informative.count * $0 / anchorCount]
+        }
+
+        // Rank every canvas position with a constant-size sample, then spend the
+        // frame-height comparison and pixel confirmation on only the strongest
+        // candidates. This changes relocation from O(canvas × frame) to
+        // O(canvas × 48 + 64 × frame).
+        //
+        // Ranked, never rejected outright. A mismatch threshold here would not
+        // mean what the one below it means: `budget` is spent across *every*
+        // row, and the blank ones -- most of a page -- match whatever they are
+        // laid against, so they inflate the allowance without ever consuming
+        // it. These anchors are drawn from the informative rows only, so the
+        // same candidate scores far worse here than it does there, and any
+        // fixed threshold would drop frames the full pass accepts. Being
+        // out-ranked by 64 better candidates is safe; being rejected is not.
+        var best: [(mismatches: Int, distance: Int, row: Int)] = []
+        best.reserveCapacity(Self.relocationCandidateLimit + 1)
         for candidate in 0...(bodyRows - frameBody) {
+            // Once the shortlist is full, anything worse than its weakest member
+            // cannot make it -- so stop counting that candidate's mismatches.
+            let ceiling = best.count < Self.relocationCandidateLimit
+                ? anchorCount : best[best.count - 1].mismatches
+            var mismatches = 0
+            for offset in anchors where !rowsMatch(
+                canvasSignatures, header + candidate + offset,
+                signatures, header + offset
+            ) {
+                mismatches += 1
+                if mismatches > ceiling { break }
+            }
+            guard mismatches <= ceiling else { continue }
+            let entry = (mismatches: mismatches, distance: abs(candidate - cursor),
+                         row: candidate)
+            let slot = best.firstIndex {
+                ($0.mismatches, $0.distance, $0.row) > (entry.mismatches, entry.distance, entry.row)
+            } ?? best.count
+            best.insert(entry, at: slot)
+            if best.count > Self.relocationCandidateLimit { best.removeLast() }
+        }
+
+        for entry in best {
+            let candidate = entry.row
             var mismatches = 0
             var i = 0
             while i < frameBody {
@@ -502,6 +558,21 @@ actor ScrollStitcher {
             }
         }
         return nil
+    }
+
+    /// Same notion of information as `pixelConfirmation`: a row whose sampled
+    /// RGB values span a meaningful range. This includes a solid coloured row
+    /// (useful when colour changes vertically) but excludes blank white/grey.
+    private func signatureRange(_ signatures: [Int16], row: Int) -> Int16 {
+        let base = row * Self.componentsPerRow
+        var low = Int16.max
+        var high = Int16.min
+        for component in 0..<Self.componentsPerRow {
+            let value = signatures[base + component]
+            low = min(low, value)
+            high = max(high, value)
+        }
+        return high - low
     }
 
     /// Whether the overlap `d` implies really shows the same pixels twice.

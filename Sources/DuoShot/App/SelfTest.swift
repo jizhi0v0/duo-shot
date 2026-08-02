@@ -6833,6 +6833,93 @@ enum SelfTest {
             check(verdict == .rejected(.mismatchedFrame), "narrow frame -> \(verdict)")
         }
 
+        // MARK: relocation on a mostly-blank page
+        //
+        // Returning to somewhere already stitched on a page that is three
+        // quarters whitespace, after some of its lines finished loading.
+        //
+        // The whole-frame budget is 25 % of *every* row, and 60 changed rows out
+        // of 600 is 10 % — comfortably inside it. But every one of those 60 is a
+        // row that carries information, and a shortlist drawn from the
+        // informative rows alone sees 40 % of its sample disagree. Any absolute
+        // threshold applied to that sample throws this frame away while the
+        // check it is meant to be pre-filtering for would have taken it. The
+        // shortlist must therefore rank, never reject.
+        //
+        // Verified by reverting: with the candidate list gated on
+        // `mismatches <= Int((1 - revisitMatchRatio) * Double(anchorCount))`
+        // this reports rejected(.cannotAlign) and the run goes red.
+        let sparseRows = 2400
+        if let page = sparsePageImage(width: width, height: sparseRows) {
+            func pageFrame(at offset: Int, disturbing: Set<Int> = []) -> CaptureResult? {
+                guard var image = page.cropping(to: CGRect(
+                    x: 0, y: offset, width: width, height: frameRows)) else { return nil }
+                if !disturbing.isEmpty {
+                    guard let touched = disturbingRows(of: image, rows: disturbing)
+                    else { return nil }
+                    image = touched
+                }
+                return CaptureResult(
+                    image: image,
+                    pointSize: CGSize(width: CGFloat(width) / 2, height: CGFloat(frameRows) / 2),
+                    scale: 2, sourceDisplayID: CGMainDisplayID(),
+                    sourceDescription: "sparse page", capturedAt: Date())
+            }
+
+            let sparse = ScrollStitcher(config: config)
+            var at = 0
+            if let seed = pageFrame(at: 0) { _ = await sparse.append(seed) }
+            while at < sparseRows - frameRows {
+                let next = min(at + step, sparseRows - frameRows)
+                guard let capture = pageFrame(at: next) else { return 2 }
+                _ = await sparse.append(capture)
+                at = next
+            }
+
+            // Two out of every five text lines, spread through the frame.
+            let settled = Set((0..<frameRows).filter { $0 % 4 == 0 && ($0 / 4) % 5 < 2 })
+            print("sparse page:   \(settled.count) of \(frameRows) rows changed "
+                + "(\(settled.count * 100 / frameRows)% of all rows, "
+                + "40% of the informative ones)")
+
+            // Every jump below has to be longer than frame-to-frame alignment
+            // can reach — a frame overlapping the cursor by `minOverlapRows` or
+            // more is handled by `shift` and never gets near `relocate`. The
+            // cursor sits at 1800 after the loop, so 400 is 1400 rows away and
+            // relocation is the only road to it. An earlier draft of this test
+            // jumped 400 rows, stayed green with the fix reverted, and proved
+            // nothing at all.
+            if let changed = pageFrame(at: 400, disturbing: settled) {
+                let verdict = await sparse.append(changed)
+                check(verdict == .repositioned(totalRows: sparseRows),
+                      "sparse page, settled lines -> \(verdict), "
+                      + "expected repositioned(totalRows: \(sparseRows))")
+            }
+            // The fixture itself: an untouched frame, equally far away, must
+            // relocate too. If this one fails the check above says nothing about
+            // budgets — it says the page is unmatchable.
+            if let clean = pageFrame(at: 1700) {
+                let verdict = await sparse.append(clean)
+                check(verdict == .repositioned(totalRows: sparseRows),
+                      "sparse page, unchanged frame -> \(verdict), "
+                      + "expected repositioned(totalRows: \(sparseRows))")
+            }
+            // And the other direction: dropping the threshold must not make
+            // relocation take anything at all. Content this canvas has never
+            // seen still has to be refused — the ranking only decides *which*
+            // 64 candidates get the full comparison, never whether one passes.
+            if let alien = uniqueRowImage(width: width, height: frameRows) {
+                let verdict = await sparse.append(CaptureResult(
+                    image: alien,
+                    pointSize: CGSize(width: CGFloat(width) / 2, height: CGFloat(frameRows) / 2),
+                    scale: 2, sourceDisplayID: CGMainDisplayID(),
+                    sourceDescription: "sparse page", capturedAt: Date()))
+                check(verdict == .rejected(.cannotAlign),
+                      "sparse page, content never seen -> \(verdict), "
+                      + "expected rejected(.cannotAlign)")
+            }
+        }
+
         if let result = await stitcher.finalize(
             sourceDisplayID: CGMainDisplayID(), sourceDescription: "Scrolling Capture") {
             print("stitched:      \(result.image.width)×\(result.image.height) px, "
@@ -7173,6 +7260,76 @@ enum SelfTest {
             bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
             provider: provider, decode: nil, shouldInterpolate: false,
             intent: .defaultIntent)
+    }
+
+    /// A page shaped like prose: paper, with one line of "text" every fourth
+    /// row. Three quarters of it carries no information at all.
+    ///
+    /// That ratio is the point. The stitcher's whole-frame budget is a share of
+    /// *every* row, and a blank row matches whatever it is laid against, so
+    /// those rows enlarge the allowance without ever spending it. Any check
+    /// that samples only the rows that mean something is therefore working
+    /// against a much smaller effective budget than the one it was derived
+    /// from. `uniqueRowImage` cannot show this — every row of it is
+    /// informative, so the two budgets agree and the gap never opens.
+    private static func sparsePageImage(width: Int, height: Int) -> CGImage? {
+        let paper: (UInt8, UInt8, UInt8) = (250, 250, 246)
+        var bytes = [UInt8](repeating: 0, count: width * height * 4)
+        for row in 0..<height {
+            for x in 0..<width {
+                let p = (row * width + x) * 4
+                var colour = paper
+                if row % 4 == 0 {
+                    // Ink whose density varies by segment as well as by row, so
+                    // the row is informative under both of the stitcher's
+                    // measures: horizontal contrast for the pixel pass, and a
+                    // spread across the signature's components for the
+                    // signature pass.
+                    let segment = x * 4 / width
+                    let seed = (row &* 2_654_435_761 &+ segment &* 40_503) & 0x7FFF
+                    if (x &+ seed) % (2 + segment) == 0 {
+                        colour = (UInt8(seed & 0x7F), UInt8((seed >> 4) & 0x7F),
+                                  UInt8((seed >> 8) & 0x7F))
+                    }
+                }
+                bytes[p] = colour.0
+                bytes[p + 1] = colour.1
+                bytes[p + 2] = colour.2
+                bytes[p + 3] = 255
+            }
+        }
+        let data = Data(bytes)
+        guard let provider = CGDataProvider(data: data as CFData) else { return nil }
+        return CGImage(
+            width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+            bytesPerRow: width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+            provider: provider, decode: nil, shouldInterpolate: false,
+            intent: .defaultIntent)
+    }
+
+    /// Repaints the given top-down rows — the shape of a page whose lazy
+    /// content finished arriving between two visits to the same place.
+    ///
+    /// Saturated on purpose. These rows have to stay *informative*, or they
+    /// simply drop out of the anchor sample, and the fixture would then be
+    /// applying no pressure at all.
+    private static func disturbingRows(of image: CGImage, rows: Set<Int>) -> CGImage? {
+        guard let context = CGContext(
+            data: nil, width: image.width, height: image.height,
+            bitsPerComponent: 8, bytesPerRow: image.width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        context.setShouldAntialias(false)
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        context.setFillColor(CGColor(srgbRed: 0.92, green: 0.07, blue: 0.07, alpha: 1))
+        for row in rows {
+            context.fill(CGRect(
+                x: 0, y: image.height - 1 - row, width: image.width, height: 1))
+        }
+        return context.makeImage()
     }
 
     /// Rows [from, to) at half brightness — the shape of a streaming chat's
