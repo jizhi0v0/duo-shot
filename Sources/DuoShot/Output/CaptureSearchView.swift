@@ -26,10 +26,17 @@ final class CaptureSearchModel {
     /// list settles on whichever query happened to finish last.
     @ObservationIgnored private var generation = 0
 
+    /// Injected so the self-test can search its own fixtures. Left at `shared`
+    /// everywhere else -- a second index over the same file would fight the
+    /// first for it, which `CaptureIndex.init` spells out.
+    @ObservationIgnored private let index: CaptureIndex
+
+    init(index: CaptureIndex = .shared) { self.index = index }
+
     func refresh() {
         Task {
-            await CaptureIndex.shared.forgetMissingFiles()
-            indexed = await CaptureIndex.shared.count
+            await index.forgetMissingFiles()
+            indexed = await index.count
             run()
         }
     }
@@ -40,7 +47,7 @@ final class CaptureSearchModel {
         let query = query
         task?.cancel()
         task = Task {
-            let found = await CaptureIndex.shared.search(query)
+            let found = await index.search(query)
             guard !Task.isCancelled, token == self.generation else { return }
             self.hits = found
             self.hasSearched = true

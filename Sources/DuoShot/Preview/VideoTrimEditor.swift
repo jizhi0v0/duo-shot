@@ -296,6 +296,10 @@ final class VideoTrimEditor: NSView {
     /// before one. Its width is state-dependent — the busy hint sits inside it —
     /// and only this view's `layout()` ever applies it.
     var barFrameForTest: CGRect { bar.frame }
+
+    /// The GIF button, in this view's coordinates, so a test can click the real
+    /// thing rather than call `exportGIF` and prove only that the method works.
+    var gifPillFrameForTest: CGRect { bar.gifPillFrame(in: self) }
 }
 
 /// The strip along the top of the recording viewer.
@@ -366,6 +370,11 @@ private final class TrimBar: NSView {
         needsLayout = true
         layoutSubtreeIfNeeded()
     }
+
+    /// Straight into `view`'s coordinates. The pill sits inside the glass's
+    /// content view rather than directly in the bar, so converting bar-relative
+    /// would be off by the chrome's insets.
+    func gifPillFrame(in view: NSView) -> CGRect { gif.convert(gif.bounds, to: view) }
 
     override var fittingSize: NSSize {
         var width = HUDMetrics.margin * 2 + trim.frame.width

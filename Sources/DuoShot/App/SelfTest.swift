@@ -1302,6 +1302,58 @@ enum SelfTest {
         check("while the words beside them still are", labels.count >= 2,
               "\(labels.count) of 3 labels survived: \(labels.joined(separator: ","))")
 
+        // MARK: through the menu item, which is the only way a user reaches it
+        //
+        // Fired through its own target and action rather than by calling
+        // `redactSensitive()`. `NSMenuItem.action(_:handler:)` hangs the closure
+        // off a separate `MenuAction` object because the item's target is weak,
+        // and an item whose target has been released is silently *disabled* by
+        // AppKit rather than broken-looking — so "the row exists" and "the row
+        // does something" are genuinely different claims.
+        //
+        // `perform` is safe here for the reason CLAUDE.md's warning implies:
+        // `MenuAction.fire` is @objc on an NSObject. It is the non-@objc case
+        // that crashes.
+        let viewer = ViewerWindowController.shared
+        viewer.activatesOnShow = false
+        defer { viewer.closeAll() }
+        viewer.show(PreviewEntry(
+            kind: .image(pointSize: points),
+            thumbnail: NSImage(size: PreviewCardView.cardSize),
+            url: sample, sourceDisplayID: CGMainDisplayID()))
+        for _ in 0..<40 where viewer.windowForTest(sample) == nil {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        guard let editor = viewer.windowForTest(sample)?.contentView as? ImageEditor,
+              let item = viewer.windowForTest(sample)?.contentView?.menu?.items
+                .first(where: { $0.title == "Redact Sensitive Text" }),
+              let target = item.target, let selector = item.action else {
+            check("the menu item is wired to a live target", false, "no item, target or editor")
+            print("result:        FAIL (\(failures))")
+            return 1
+        }
+        check("the menu item is wired to a live target", true)
+        check("nothing is redacted before it is pressed", editor.editsForTest.isEmpty,
+              "\(editor.editsForTest.count) edits")
+        target.perform(selector)
+        // Vision again, on the main path this time, so poll rather than sleep.
+        for _ in 0..<150 where editor.editsForTest.isEmpty {
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        let placed = editor.editsForTest
+        check("pressing it puts redactions on the picture", placed.count == findings.count,
+              "\(placed.count) edits for \(findings.count) findings")
+        check("and every one of them is a redaction",
+              !placed.isEmpty && placed.allSatisfy { if case .redact = $0 { true } else { false } },
+              placed.map { "\($0)".prefix(8) }.joined(separator: ","))
+        // One entry each, so a scan that got one wrong is one ⌘Z from being
+        // right rather than all-or-nothing. This is the property that makes a
+        // detector which is usually right safe to ship.
+        editor.undoForTest()
+        check("and ⌘Z takes them back one at a time",
+              editor.editsForTest.count == placed.count - 1,
+              "\(placed.count) -> \(editor.editsForTest.count)")
+
         print("result:        \(failures == 0 ? "PASS" : "FAIL (\(failures))")")
         return failures == 0 ? 0 : 1
     }
@@ -1514,6 +1566,29 @@ enum SelfTest {
         check("the window is not open to begin with", !search.isOpen)
         search.show()
         check("and opening it puts one on screen", search.isOpen)
+
+        // The field's binding, driven through the model rather than by typing
+        // into it. Setting `query` is exactly what SwiftUI's `TextField` does to
+        // this object, and the `didSet` that turns it into a search is this
+        // project's code; the `TextField`-to-binding half is Apple's and not
+        // mine to prove. Synthesizing keystrokes into it would also mean
+        // delivering events to an NSTextView, which CLAUDE.md records as hanging
+        // the run for ten minutes.
+        let model = CaptureSearchModel(index: index)
+        model.query = "NullPointer"
+        for _ in 0..<40 where model.hits.isEmpty {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        check("typing in the field narrows the list",
+              model.hits.count == 1 && model.hits.first?.name == "old.png",
+              "\(model.hits.map(\.name))")
+        model.query = "kubernetes NullPointer"
+        for _ in 0..<40 where !model.hits.isEmpty {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        check("and a second word that narrows it to nothing empties it",
+              model.hits.isEmpty, "\(model.hits.map(\.name))")
+
         search.close()
         // Closing has to be observed, or the next open would find a stale window
         // and hand back one that is no longer on screen.
@@ -4470,6 +4545,46 @@ enum SelfTest {
         guard let editor = viewer.trimEditorForTest(recording.url) else {
             print("result:        FAIL — the recording did not open in a trim editor")
             return 1
+        }
+
+        // MARK: the GIF button, pressed
+        //
+        // `--selftest-gif` proves the exporter. This proves there is a button
+        // wired to it: a pill can sit in the bar, hit-test correctly and be
+        // connected to nothing, which is exactly how the Redact button once
+        // shipped dead with every geometry assertion about it green.
+        //
+        // Before the trim, because the trim rewrites this file underneath it.
+        if let window = viewer.windowForTest(recording.url) {
+            editor.layoutSubtreeIfNeeded()
+            let gifFile = GIFExport.url(besides: recording.url)
+            try? FileManager.default.removeItem(at: gifFile)
+            let pill = editor.gifPillFrameForTest
+            let centre = CGPoint(x: pill.midX, y: pill.midY)
+            let hit = editor.hitTest(centre)
+            check("the GIF button hit-tests to a visible pill",
+                  (hit as? HUDPill).map { !$0.isHidden } ?? false,
+                  hit.map { "\(type(of: $0))" } ?? "nothing")
+            click(hit, at: editor.convert(centre, to: nil), in: window)
+            // Polled rather than slept on: the export is off the main actor and
+            // its length depends on the clip, so a fixed wait is either flaky or
+            // slow. Same reasoning as `--selftest-copy-text`'s pasteboard poll.
+            for _ in 0..<150 where !FileManager.default.fileExists(atPath: gifFile.path) {
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            let wrote = FileManager.default.fileExists(atPath: gifFile.path)
+            check("pressing it writes the GIF", wrote,
+                  wrote ? "\(fileSize(gifFile)) bytes" : "nothing appeared at \(gifFile.path)")
+            check("and leaves the recording alone",
+                  FileManager.default.fileExists(atPath: recording.url.path))
+            // Busy is shared with the trim, and the trim below would be exporting
+            // out of a file this one is still reading if it were not released.
+            for _ in 0..<50 where editor.isExportingForTest {
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            check("and gives the bar back when it is done", !editor.isExportingForTest)
+        } else {
+            check("the GIF button writes a GIF", false, "no window")
         }
 
         // MARK: the cut
