@@ -273,6 +273,12 @@ final class ViewerWindowController {
         let editor = ImageEditor(
             url: url, image: image, originalData: loaded.data, menu: menu,
             frame: CGRect(origin: .zero, size: size))
+        // Added after the editor exists rather than beside "Copy Text", because
+        // this one needs it. `NSMenu` is a reference type and `ImageEditor` only
+        // holds it, so the item is in every one of the three views that share it.
+        menu.addItem(.action("Redact Sensitive Text") { [weak editor] in
+            editor?.redactSensitive()
+        })
 
         return Content(view: editor, size: size, onShown: { editor.zoomToFit() })
     }

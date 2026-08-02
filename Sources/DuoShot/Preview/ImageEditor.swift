@@ -84,6 +84,10 @@ final class ImageEditor: NSView {
 
     /// True while an export is in flight, so a second press cannot race it.
     private var isExporting = false
+    /// A scan in flight. Vision takes the better part of a second on a 5K
+    /// capture with no indicator saying so, which makes the second click likely
+    /// rather than hypothetical -- and two scans would cover everything twice.
+    private var isScanning = false
     private var renderTask: Task<Void, Never>?
     private var stack = EditList()
     private var tool: Tool = .pointer
@@ -392,6 +396,48 @@ final class ImageEditor: NSView {
         stack.push(edit.moved(by: offset))
         scheduleRender()
         refreshBar()
+    }
+
+    /// Covers everything in the capture that looks like it was not meant to
+    /// leave the machine. Vision reads the file, `SensitiveText` decides, and
+    /// what comes back becomes ordinary redactions.
+    ///
+    /// One stack entry per finding, not one for the lot. The list is the undo
+    /// history, so a scan that covered four things and got one of them wrong is
+    /// four ⌘Z away from being three things covered correctly -- which is the
+    /// only sane answer to a detector that is right most of the time.
+    ///
+    /// `stack.push` directly rather than `add`, and the difference matters:
+    /// `add` shifts an edit by the current crop's origin because the canvas
+    /// hands it coordinates in the *cropped* picture's space. These come from
+    /// the original file and are already in the list's own space, so shifting
+    /// them would move every finding by the crop.
+    func redactSensitive() {
+        guard !isScanning else { return }
+        isScanning = true
+        let size = originalPointSize
+        Task { [weak self, url] in
+            let findings = await SensitiveText.findings(inFileAt: url, pointSize: size)
+            guard let self else { return }
+            self.isScanning = false
+            guard !findings.isEmpty else {
+                self.notice.show(
+                    message: "Nothing here looked like an address, a key, a number or a card.",
+                    action: nil, symbol: "checkmark.shield")
+                self.showNotice()
+                return
+            }
+            for finding in findings { self.stack.push(.redact(finding.rect)) }
+            self.scheduleRender()
+            self.refreshBar()
+            let kinds = Set(findings.map(\.kind)).count
+            self.notice.show(
+                message: "Covered \(findings.count) thing\(findings.count == 1 ? "" : "s") "
+                    + "in \(kinds) categor\(kinds == 1 ? "y" : "ies"). "
+                    + "⌘Z takes them back one at a time — check them before you share.",
+                action: nil, symbol: "eye.slash")
+            self.showNotice()
+        }
     }
 
     private func undo() {

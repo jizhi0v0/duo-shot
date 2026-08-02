@@ -112,6 +112,7 @@ enum SelfTest {
         /// On-device OCR: whether Vision reads a drawn page back as its words,
         /// in order, onto the clipboard.
         case copyText(directory: URL)
+        case sensitiveText(directory: URL)
         /// The share pipeline against a local `wrangler dev`. Endpoint and token
         /// are arguments, never Settings: a test that read the live
         /// configuration would upload to the real bucket.
@@ -172,6 +173,9 @@ enum SelfTest {
                 self = .editMenu
             case "--selftest-copy-text":
                 self = .copyText(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
+            case "--selftest-sensitive":
+                self = .sensitiveText(
                     directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-share":
                 let configured = rest.contains("--configured")
@@ -356,6 +360,7 @@ enum SelfTest {
             case .shareCompat(let url): return await ShareSelfTest.compatibility(of: url)
             case .editMenu: return await editMenuCheck()
             case .copyText(let d): return try await copyTextCheck(into: d)
+            case .sensitiveText(let d): return try await sensitiveTextCheck(into: d)
             case .shareCard(let d): return try await shareCardStates(into: d)
             case .shareCredentials: return await ShareSelfTest.credentials()
             case .shareFlow: return await ShareFlowSelfTest.run()
@@ -1115,6 +1120,182 @@ enum SelfTest {
     /// observations in an order it does not promise to be geometric, and a
     /// transcript with its paragraphs shuffled looks perfectly plausible — there
     /// is nothing in the pasted text to say it came out wrong.
+    /// `--selftest-sensitive`
+    ///
+    /// Two layers, because they fail for entirely different reasons and lumping
+    /// them together would mean never knowing which one did.
+    ///
+    /// The patterns are pure — a string in, ranges out — so they get an exact
+    /// table, and half of that table is things that must **not** match. That
+    /// half is the important one. A detector that flags everything scores
+    /// perfectly on positives and is worse than useless: it silently destroys
+    /// pixels the user wanted, in the one feature whose promise is that the
+    /// destruction cannot be undone once the window closes.
+    ///
+    /// The end-to-end layer can only be as good as OCR was that day, so it
+    /// reports INCONCLUSIVE when Vision cannot read its own fixture rather than
+    /// blaming the detector for it.
+    private static func sensitiveTextCheck(into directory: URL) async throws -> Int32 {
+        var failures = 0
+        func check(_ label: String, _ passed: Bool, _ detail: String = "") {
+            print("  \(passed ? "PASS" : "FAIL") \(label)\(detail.isEmpty ? "" : " — \(detail)")")
+            if !passed { failures += 1 }
+        }
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+
+        // MARK: the patterns, exactly
+
+        let table: [(line: String, expected: [SensitiveText.Kind])] = [
+            ("write to bobby.li+dev@example.co.uk about it", [.email]),
+            ("the box answers on 192.168.1.14 today", [.ipAddress]),
+            ("OPENAI_API_KEY=sk-abcdefghijklmnop0123456789", [.secret]),
+            ("token ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5", [.secret]),
+            ("AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE", [.secret]),
+            ("Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345", [.secret]),
+            ("cookie eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVP", [.secret]),
+            ("call me on 13800138000 tonight", [.phone]),
+            ("ring +44 20 7946 0958 instead", [.phone]),
+            ("card 4111 1111 1111 1111 expires soon", [.card]),
+            // Two different things on one line, neither swallowing the other.
+            ("4012888888881881 receipts to ops@acme.io", [.card, .email]),
+
+            // The half that matters. Every one of these is a shape that a
+            // careless pattern takes and a careful one leaves alone.
+            ("order 48213 shipped on tuesday", []),
+            // One digit off a real card: same length, same prefix, fails Luhn.
+            ("card 4111 1111 1111 1112 declined", []),
+            ("upgraded to version 1.2.3 this morning", []),
+            ("999.1.1.1 is not an address", []),
+            ("commit a3f9c2b1d4e5f6a7b8c9d0e1f2a3b4c5 landed", []),
+            ("the meeting is at 2024 10 21 09 30", []),
+            ("sk-short", []),
+        ]
+        for row in table {
+            let kinds = SensitiveText.matches(in: row.line).map(\.kind)
+            let wanted = row.expected
+            check(row.expected.isEmpty
+                    ? "leaves alone: \(row.line)"
+                    : "finds \(wanted.map(\.rawValue).joined(separator: "+")): \(row.line)",
+                  Set(kinds) == Set(wanted) && kinds.count == wanted.count,
+                  kinds.isEmpty ? "nothing" : kinds.map(\.rawValue).joined(separator: ","))
+        }
+
+        // Luhn on its own, since it is the whole reason the card pattern is not
+        // "any sixteen digits".
+        check("Luhn accepts a real number", SensitiveText.isCard("4111111111111111"))
+        check("and rejects one digit off", !SensitiveText.isCard("4111111111111112"))
+        check("and rejects a short run", !SensitiveText.isCard("41111111"))
+
+        // MARK: through Vision, onto the pixels
+
+        let secrets = ["Email bobby@example.com", "Host 192.168.1.14", "Card 4111 1111 1111 1111"]
+        let sample = directory.appendingPathComponent("sensitive-sample.png")
+        try ImageEncoder.write(wordsImage(secrets), to: sample)
+
+        // Read back from the file, and take the point size from what is
+        // actually there rather than from what `wordsImage` was asked for.
+        // `lockFocus` renders at the display's backing scale, so the 900×500 it
+        // is handed arrives on disk as 1800×1000 — and a point size of 900×500
+        // against an 1800×1000 bitmap puts the findings and the pixels being
+        // checked in two different coordinate spaces. The first draft of this
+        // check did exactly that and reported every changed pixel as being
+        // outside a finding.
+        guard let source = CGImageSourceCreateWithURL(sample as CFURL, nil),
+              let original = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            print("result:        INCONCLUSIVE — the fixture could not be read back")
+            return 0
+        }
+        // The fixture is written at 72 dpi, so a point here is a pixel and the
+        // rectangles below need no scaling to be compared against the bitmap.
+        let points = CGSize(width: original.width, height: original.height)
+        let findings = await SensitiveText.findings(inFileAt: sample, pointSize: points)
+        print("found:         "
+            + (findings.isEmpty
+                ? "nothing"
+                : findings.map { "\($0.kind.rawValue)\(rectString($0.rect))" }
+                    .joined(separator: " ")))
+        guard !findings.isEmpty else {
+            print("""
+                result:        INCONCLUSIVE — Vision read nothing out of the fixture, so the \
+                image half asserted nothing. The pattern checks above still stand.
+                """)
+            return failures == 0 ? 0 : 1
+        }
+
+        check("every kind planted in the picture came back",
+              Set(findings.map(\.kind)) == Set([.email, .ipAddress, .card]),
+              Set(findings.map(\.kind)).map(\.rawValue).sorted().joined(separator: ","))
+
+        // The rectangles have to land on the ink, not merely exist. Redacting
+        // them must change the pixels *inside* them and leave the rest of the
+        // picture alone — a finding whose rect is off by a line would pass a
+        // "something changed" check while covering the wrong words.
+        let edits = findings.map { ImageEdit.redact($0.rect) }
+        guard let redacted = ImageEdit.render(
+            original, edits: edits, pointSize: points, cropping: false) else {
+            check("the findings redact", false, "render returned nothing")
+            return failures == 0 ? 0 : 1
+        }
+        let before = rgba(of: original)
+        let after = rgba(of: redacted)
+        var changedInside = 0
+        var changedOutside = 0
+        // One mosaic block of slack around each finding. `Redaction` averages on
+        // a grid anchored to the image, so a block straddling a region's edge is
+        // pixelated in full — pixels just outside the rectangle are meant to
+        // change. The slack is one block and no more, so a finding sitting on
+        // the wrong line of text is still caught by the check below.
+        let slack = Redaction.blockSize(width: original.width, height: original.height)
+        var inside = Set<Int>()
+        for finding in findings {
+            // Bitmap rows run from the top; findings are in bottom-left space.
+            let top = max(0, original.height - Int(finding.rect.maxY) - slack)
+            let bottom = min(original.height, original.height - Int(finding.rect.minY) + slack)
+            let left = max(0, Int(finding.rect.minX) - slack)
+            let right = min(original.width, Int(finding.rect.maxX) + slack)
+            guard top < bottom, left < right else { continue }
+            for row in top..<bottom {
+                for column in left..<right {
+                    inside.insert(row * original.width + column)
+                }
+            }
+        }
+        for pixel in 0..<(original.width * original.height)
+        where before[pixel * 4] != after[pixel * 4]
+            || before[pixel * 4 + 1] != after[pixel * 4 + 1]
+            || before[pixel * 4 + 2] != after[pixel * 4 + 2] {
+            if inside.contains(pixel) { changedInside += 1 } else { changedOutside += 1 }
+        }
+        check("the words under a finding are destroyed", changedInside > 500,
+              "\(changedInside) pixels changed inside \(findings.count) findings")
+        check("and nothing outside one is touched", changedOutside == 0,
+              "\(changedOutside) pixels changed outside")
+
+        // The two checks above are self-consistent and cannot catch the failure
+        // that matters: they redact at rect R and then look for change inside
+        // rect R, so a finding covering the wrong words passes both. The only
+        // question worth asking is whether the secret is still readable, so ask
+        // the same machine that read it in the first place.
+        let scrubbed = directory.appendingPathComponent("sensitive-redacted.png")
+        try ImageEncoder.write(redacted, to: scrubbed, scale: 1)
+        let reread = await TextRecognition.text(inFileAt: scrubbed) ?? ""
+        print("re-read:       \(reread.replacingOccurrences(of: "\n", with: " / "))")
+        for secret in ["bobby@example.com", "192.168.1.14", "4111"] {
+            check("\"\(secret)\" cannot be read back out", !reread.contains(secret))
+        }
+        // ...and the control that gives those their meaning. If OCR simply
+        // failed on the redacted image, every check above would pass while
+        // proving nothing. The labels sit on the same lines as the values that
+        // were destroyed, so their survival says the reader still works.
+        let labels = ["Email", "Host", "Card"].filter { reread.contains($0) }
+        check("while the words beside them still are", labels.count >= 2,
+              "\(labels.count) of 3 labels survived: \(labels.joined(separator: ","))")
+
+        print("result:        \(failures == 0 ? "PASS" : "FAIL (\(failures))")")
+        return failures == 0 ? 0 : 1
+    }
+
     private static func copyTextCheck(into directory: URL) async throws -> Int32 {
         var failures = 0
         func check(_ label: String, _ passed: Bool, _ detail: String = "") {
@@ -1182,6 +1363,8 @@ enum SelfTest {
         let viewerMenu = ViewerWindowController.shared.windowForTest(sample)?.contentView?.menu
         check("viewer offers Copy Text",
               viewerMenu?.items.contains { $0.title == "Copy Text" } == true)
+        check("viewer offers Redact Sensitive Text",
+              viewerMenu?.items.contains { $0.title == "Redact Sensitive Text" } == true)
         ViewerWindowController.shared.closeAll()
 
         print("result:        \(failures == 0 ? "PASS" : "FAIL (\(failures))")")
