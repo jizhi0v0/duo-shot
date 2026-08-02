@@ -121,12 +121,22 @@ final class VideoTrimEditor: NSView {
         playerView.beginTrimming { [weak self] result in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                self.bar.isHidden = false
-                self.needsLayout = true
-                guard result == .okButton else { return }
-                self.apply(self.selectedRange())
+                self.leaveTrimmingUI(applying: result == .okButton ? self.selectedRange() : nil)
             }
         }
+    }
+
+    /// Coming back out of the system's trimming UI, whichever button ended it.
+    ///
+    /// One function rather than two lines at the call site because `trimForTest`
+    /// has to arrive at the export by exactly this road: the bar is left with a
+    /// layout pending *and* then put into its busy state, and that ordering is
+    /// what the width bug was made of.
+    private func leaveTrimmingUI(applying range: CMTimeRange?) {
+        bar.isHidden = false
+        needsLayout = true
+        guard let range else { return }
+        apply(range)
     }
 
     /// Where the handles were left.
@@ -230,9 +240,14 @@ final class VideoTrimEditor: NSView {
     /// What `--selftest-trim` drives, because the system's trimming UI cannot be
     /// dragged from a test: the export and the replace are everything this
     /// feature owns, and the handles are AVKit's.
-    func trimForTest(_ range: CMTimeRange) { apply(range) }
+    func trimForTest(_ range: CMTimeRange) { leaveTrimmingUI(applying: range) }
 
     var isExportingForTest: Bool { isExporting }
+
+    /// The bar's frame, for the check that it is the same width after a trim as
+    /// before one. Its width is state-dependent — the busy hint sits inside it —
+    /// and only this view's `layout()` ever applies it.
+    var barFrameForTest: CGRect { bar.frame }
 }
 
 /// The strip along the top of the recording viewer.
@@ -278,6 +293,13 @@ private final class TrimBar: NSView {
         isBusy = busy
         hint.isHidden = !busy
         trim.setLive(!busy, animated: false)
+        // The superview, not just this view: `fittingSize` is the one thing here
+        // that depends on the state, and the only code that ever applies it is
+        // `VideoTrimEditor.layout()`. Marking only this view laid the button out
+        // inside whatever frame the bar was last given — which, because the trim
+        // path enters this state with a layout already pending, was the wide one
+        // the hint needed. The hint went away and the width stayed.
+        superview?.needsLayout = true
         needsLayout = true
         layoutSubtreeIfNeeded()
     }

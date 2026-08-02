@@ -3867,11 +3867,39 @@ enum SelfTest {
         let wanted = CMTimeRange(
             start: CMTime(seconds: 1, preferredTimescale: 600),
             end: CMTime(seconds: 3, preferredTimescale: 600))
+
+        // MARK: the bar's width, across the busy state
+        //
+        // Reported as "trim 后顶部的 trim button 变长了": the strip stays at the
+        // width it needed while it was saying "Rewriting the recording…", with
+        // the button back at its left end and the rest of it empty. The layout
+        // passes below are not the test staging something artificial — the real
+        // path sets `needsLayout` and enters the busy state in that order, and
+        // the window's own display cycle flushes it while the export runs.
+        editor.layoutSubtreeIfNeeded()
+        let restingWidth = editor.barFrameForTest.width
         editor.trimForTest(wanted)
+        editor.layoutSubtreeIfNeeded()
+        let busyWidth = editor.barFrameForTest.width
+        // Without this the width check below cannot fail: a bar that never
+        // widens for the hint has nothing to shrink back from.
+        check("the bar widens for the progress hint", busyWidth > restingWidth + 1,
+              String(format: "%.0fpt resting, %.0fpt busy", restingWidth, busyWidth))
+
         for _ in 0..<200 where editor.isExportingForTest {
             try await Task.sleep(for: .milliseconds(100))
         }
         check("the export finished", !editor.isExportingForTest)
+
+        // A display cycle, which is all the window gets on screen too — and not
+        // a layout the test forces: `layoutSubtreeIfNeeded` lays out only what
+        // has *asked* for it, and the bug is precisely that leaving the busy
+        // state asks nobody. It stays red with the line below in place.
+        try await Task.sleep(for: .milliseconds(200))
+        editor.layoutSubtreeIfNeeded()
+        check("the bar is its old width again", editor.barFrameForTest.width == restingWidth,
+              String(format: "%.0fpt now, %.0fpt before the trim",
+                     editor.barFrameForTest.width, restingWidth))
 
         let after = CMTimeGetSeconds(
             (try? await AVURLAsset(url: recording.url).load(.duration)) ?? .zero)
