@@ -78,6 +78,7 @@ final class PreferencesWindowController {
 
     private var window: NSWindow?
     private var tabController: ResizingTabViewController?
+    private var closeObserver: (any NSObjectProtocol)?
     private var contentSizes: [Tab: NSSize] = [:]
     private let windowTitle = "DuoShot Settings"
 
@@ -151,6 +152,7 @@ final class PreferencesWindowController {
 
         self.window = window
         self.tabController = controller
+        releaseOnClose(window)
         // Force every tab's SwiftUI view to load and lay out once, then take its
         // size from SwiftUI itself. The throwaway measurement in
         // `measuredContentSize` is close but not exact — 8 pt out on the Capture
@@ -295,9 +297,59 @@ final class PreferencesWindowController {
         }
     }
 
+    /// Drops the window and its seven SwiftUI view trees once it closes.
+    ///
+    /// Closing used to keep all of it alive: `isReleasedWhenClosed = false` and
+    /// this controller holding the references means an ordered-out window whose
+    /// hosting controllers are still in a live hierarchy. Every tab is built
+    /// up-front (see `show`), so from the first time Settings is opened, the
+    /// Recording tab's `.onReceive(didBecomeActiveNotification)` keeps firing for
+    /// the life of the app — re-reading the microphone grant and re-enumerating
+    /// audio devices on every activation, for a window nobody has open.
+    ///
+    /// That is also the object graph the segfault of 2026-08-03 16:51 landed in:
+    /// main thread, `-[NSApplication _handleActivatedEvent:]` -> that closure ->
+    /// a bad access inside the runtime's current-executor check. Not reproduced —
+    /// 1200 synthetic activations against an opened-and-closed window survived —
+    /// so this is not filed as the proven fix. It is the change that stops a
+    /// closed window from having a say in what happens on activation at all, and
+    /// `ShortcutRecorderView` already had to work around the same "closed but
+    /// still live" state locally.
+    ///
+    /// Deferred by one runloop turn on purpose. `ShortcutRecorderView` observes
+    /// the *same* notification to release its armed state, the order of two
+    /// observers on one notification is undefined, and freeing the view first
+    /// would leave every global hotkey unregistered for the rest of the session.
+    private func releaseOnClose(_ window: NSWindow) {
+        closeObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification, object: window, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                DispatchQueue.main.async { self?.releaseWindow() }
+            }
+        }
+    }
+
+    private func releaseWindow() {
+        if let closeObserver {
+            NotificationCenter.default.removeObserver(closeObserver)
+            self.closeObserver = nil
+        }
+        // The measured sizes are kept: they describe the tabs, not this window,
+        // and re-measuring them is the 650 ms flinch `resize(to:)` exists to
+        // avoid.
+        window?.contentViewController = nil
+        tabController = nil
+        window = nil
+    }
+
     func close() {
         window?.close()
     }
+
+    /// Whether anything of this window is still alive, for
+    /// `--selftest-settings-activation`.
+    var isLoadedForTest: Bool { window != nil || tabController != nil }
 
     /// For `--selftest-settings-window`.
     var windowNumber: CGWindowID? {

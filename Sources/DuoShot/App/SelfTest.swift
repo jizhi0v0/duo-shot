@@ -76,6 +76,10 @@ enum SelfTest {
         /// Opens the real Settings window and captures it, so the SwiftUI layout
         /// can actually be looked at.
         case settingsWindow(directory: URL)
+        /// The activation notification the settings tabs subscribe to, fired at a
+        /// window that has been opened and closed. Repro attempt for the
+        /// 2026-08-03 16:51 segfault.
+        case settingsActivation(rounds: Int)
         /// Samples the Settings window height while switching tabs in ONE window,
         /// which is the path `settingsWindow` misses — it opens a fresh window per
         /// tab, so it cannot see a resize overshoot.
@@ -323,6 +327,8 @@ enum SelfTest {
                     fps: value(for: "--fps").flatMap(Int.init) ?? 60)
             case "--selftest-settings-resize":
                 self = .settingsResize
+            case "--selftest-settings-activation":
+                self = .settingsActivation(rounds: Int(positional() ?? "") ?? 200)
             case "--selftest-settings-window":
                 self = .settingsWindow(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-window":
@@ -408,6 +414,7 @@ enum SelfTest {
             case .pixelMapping: return pixelMappingCheck()
             case .latchCancel: return await latchCancelCheck()
             case .settingsWindow(let directory): return try await settingsWindow(into: directory)
+            case .settingsActivation(let rounds): return try await settingsActivation(rounds: rounds)
             case .settingsResize: return try await settingsResize()
             case .lifecycle(let iterations): return try await lifecycle(iterations: iterations)
             case .selectionToolbar: return try await selectionToolbar()
@@ -7891,6 +7898,76 @@ enum SelfTest {
     }
 
     // MARK: - Settings window
+
+    /// Fires `didBecomeActiveNotification` at settings views in every state they
+    /// can be in, looking for the crash of 2026-08-03 16:51.
+    ///
+    /// That report is a segfault on the main thread inside `closure #2 in
+    /// RecordingSettingsView.body.getter` — the `.onReceive` that re-reads the
+    /// microphone grant and the input devices — reached from
+    /// `-[NSApplication _handleActivatedEvent:]`. So: open the window, close it,
+    /// and keep posting the notification. Closing does not release anything here
+    /// (`isReleasedWhenClosed = false`, and nothing drops the controller), so the
+    /// subscription outlives every close and this is the state the app spends
+    /// most of its life in.
+    private static func settingsActivation(rounds: Int) async throws -> Int32 {
+        let controller = PreferencesWindowController()
+        controller.activatesOnShow = false
+
+        func post() { NotificationCenter.default.post(
+            name: NSApplication.didBecomeActiveNotification, object: NSApp) }
+
+        print("rounds:        \(rounds)")
+        // 1. Never opened: nothing is subscribed, so this is the control.
+        for _ in 0..<rounds { post() }
+        print("  ok   \(rounds) activations with the window never opened")
+
+        // 2. Open on the Recording tab — the view in the crash — and post.
+        controller.show(tab: .recording)
+        try await Task.sleep(for: .milliseconds(700))
+        for _ in 0..<rounds {
+            post()
+            if Int.random(in: 0..<20) == 0 { try await Task.sleep(for: .milliseconds(1)) }
+        }
+        print("  ok   \(rounds) activations with Recording on screen")
+
+        // 3. Closed again, which is where the crash happened: the window is gone
+        // from the screen and its SwiftUI views are still listening.
+        controller.close()
+        try await Task.sleep(for: .milliseconds(300))
+        // Nothing of the window survives the close, so there is nothing left to
+        // fire the activation closure into. This is the assertion; the survival
+        // of the loops around it is only a smoke test.
+        if controller.isLoadedForTest {
+            print("  FAIL the closed window is still loaded, so its tabs are still listening")
+            print("result:        FAIL")
+            return 1
+        }
+        print("  ok   closing released the window and its tabs")
+        for _ in 0..<rounds {
+            post()
+            if Int.random(in: 0..<20) == 0 { try await Task.sleep(for: .milliseconds(1)) }
+        }
+        print("  ok   \(rounds) activations after closing")
+
+        // 4. Open/close churn with activations threaded through it, so a stale
+        // subscription from a *previous* window has something to fire into.
+        for round in 0..<max(1, rounds / 20) {
+            controller.show(tab: PreferencesWindowController.Tab.allCases[
+                round % PreferencesWindowController.Tab.allCases.count])
+            post()
+            try await Task.sleep(for: .milliseconds(60))
+            post()
+            controller.close()
+            post()
+            try await Task.sleep(for: .milliseconds(40))
+            post()
+        }
+        print("  ok   \(max(1, rounds / 20)) open/close rounds with activations threaded through")
+
+        print("result:        SURVIVED")
+        return 0
+    }
 
     private static func settingsWindow(into directory: URL) async throws -> Int32 {
         guard ScreenPermission.isGranted else { return permissionHint() }

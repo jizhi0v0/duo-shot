@@ -266,6 +266,7 @@ test: verify
 	run "latch cancellation"     --selftest-latch-cancel; \
 	run "settings window"        --selftest-settings-window $(TEST_OUT); \
 	run "settings tab resize"    --selftest-settings-resize; \
+	run "settings activation"    --selftest-settings-activation 200; \
 	run "overlay lifecycle"      --selftest-lifecycle 10; \
 	run "selection toolbar"      --selftest-selection-toolbar; \
 	run "overlay sharing"        --selftest-overlay-sharing; \

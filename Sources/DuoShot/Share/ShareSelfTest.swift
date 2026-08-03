@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Security
 import Linkdrop
 
 /// The share pipeline, end to end, against a local `wrangler dev`.
@@ -220,6 +221,30 @@ nonisolated enum ShareSelfTest {
             check("round trip (synchronizable=\(synchronizable))", wrote && read == secret)
             store.delete()
         }
+
+        // The raw status of an iCloud-synchronizable write, which the round trip
+        // above cannot show: `save` falls back to the local keychain and returns
+        // true either way, so "it worked" says nothing about whether the token
+        // will reach the user's other Mac.
+        //
+        // Measured from the *signed app*, because that is the only place the
+        // answer means anything — entitlements are a property of the signature.
+        let probeQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.boli.duoshot.share",
+            kSecAttrAccount as String: "selftest-sync-probe",
+            kSecAttrSynchronizable as String: kCFBooleanTrue as Any,
+        ]
+        SecItemDelete(probeQuery as CFDictionary)
+        var addRequest = probeQuery
+        addRequest[kSecValueData as String] = Data("probe".utf8)
+        addRequest[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
+        let syncStatus = SecItemAdd(addRequest as CFDictionary, nil)
+        print("  synchronizable SecItemAdd -> \(syncStatus)"
+              + (syncStatus == errSecMissingEntitlement
+                 ? "  (errSecMissingEntitlement: no iCloud Keychain for this signature)"
+                 : syncStatus == errSecSuccess ? "  (iCloud Keychain accepted the item)" : ""))
+        if syncStatus == errSecSuccess { SecItemDelete(probeQuery as CFDictionary) }
 
         // And the real one, read-only.
         let (live, endpointString, configured) = await MainActor.run {
