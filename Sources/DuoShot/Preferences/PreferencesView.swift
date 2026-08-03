@@ -444,11 +444,19 @@ struct CaptureSettingsView: View {
 
             Section {
                 Toggle("Freeze the screen while selecting", isOn: $preferences.freezesScreen)
+                Picker("Delay before capture", selection: $preferences.captureDelaySeconds) {
+                    Text("Off").tag(0.0)
+                    Text("3 seconds").tag(3.0)
+                    Text("5 seconds").tag(5.0)
+                    Text("10 seconds").tag(10.0)
+                }
             } footer: {
                 Text("""
                     On, the screen is photographed the moment the shortcut fires and the area you draw is cut out of that photograph. It is the only way to capture something that disappears when the selection overlay appears — a hover state, an open popover — and it makes the picture exactly what you saw, not what the screen had moved on to by the time you confirmed.
 
                     The cost is about a tenth of a second before the overlay appears, and tens of megabytes per display while it is up. Clicking a window still captures it live, and a frozen capture never includes the pointer.
+
+                    A delay does the opposite, for what freezing cannot reach: the area is chosen first, then nothing of DuoShot's is on screen for a few seconds — long enough to open a menu or hover something that the shortcut itself dismissed — and the shot is taken at the end. Escape or the countdown bar's Cancel calls it off. With both on, the selection is made against a frozen screen and the picture is still taken live when the countdown ends.
                     """)
                     .font(.caption)
                     .foregroundStyle(.secondary)

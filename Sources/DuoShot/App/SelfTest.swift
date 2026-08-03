@@ -63,6 +63,9 @@ enum SelfTest {
         /// Freeze mode end to end: the crop's geometry, and the hover state it
         /// exists to preserve, with the unfrozen path as the control.
         case freeze(directory: URL)
+        /// The delayed capture: that it lands late, cancels, and keeps its own
+        /// countdown bar out of the picture.
+        case delay(directory: URL)
         /// Pointer position -> pixel in a backdrop frame, including the offsets a
         /// second display introduces. Headless, and the only way to test them on
         /// a one-screen machine.
@@ -214,6 +217,9 @@ enum SelfTest {
                 self = .badgePlacement
             case "--selftest-hover-freeze":
                 self = .hoverFreeze
+            case "--selftest-delay":
+                self = .delay(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-freeze":
                 // The last phase photographs the overlay itself, which ships
                 // invisible to ScreenCaptureKit; without this it would come back
@@ -398,6 +404,7 @@ enum SelfTest {
             case .badgePlacement: return try await badgePlacementCheck()
             case .hoverFreeze: return try await hoverFreezeCheck()
             case .freeze(let d): return try await freezeCheck(into: d)
+            case .delay(let d): return try await delayCheck(into: d)
             case .pixelMapping: return pixelMappingCheck()
             case .latchCancel: return await latchCancelCheck()
             case .settingsWindow(let directory): return try await settingsWindow(into: directory)
@@ -5900,6 +5907,189 @@ enum SelfTest {
         return failures.isEmpty ? 0 : 1
     }
 
+    // MARK: - Delayed capture
+
+    /// The delay, end to end: that the picture is taken at the *end* of the
+    /// countdown, that it can be called off, and that the countdown bar never
+    /// reaches the image.
+    ///
+    /// The first is the whole feature and the only one worth a test that can
+    /// fail: a window changes colour while the countdown runs, and the saved
+    /// image has to hold the new colour. The same capture with the delay off is
+    /// the control — it must hold the old one, or "the delay worked" would be
+    /// indistinguishable from "nothing was timed at all".
+    ///
+    /// The third is the subtle one. The bar is taken off screen before the
+    /// shutter *without* its usual fade, because a bar dissolving over the next
+    /// tenth of a second is a bar that can still be photographed. So the test
+    /// selects the rect the bar occupies, over a known colour, and demands that
+    /// colour back.
+    private static func delayCheck(into directory: URL) async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+        if let hint = LoginSession.noDisplaysHint {
+            FileHandle.standardError.write(Data("error: \(hint)\n".utf8))
+            return 2
+        }
+        guard let screen = NSScreen.main else { throw CaptureError.noDisplays }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        var failures: [String] = []
+        func check(_ condition: Bool, _ description: String) {
+            print("  \(condition ? "ok  " : "FAIL") \(description)")
+            if !condition { failures.append(description) }
+        }
+
+        let coordinator = CaptureCoordinator()
+        let overlay = coordinator.overlay
+        let previousDelay = Preferences.shared.captureDelaySeconds
+        let previousFreeze = Preferences.shared.freezesScreen
+        defer {
+            Preferences.shared.captureDelaySeconds = previousDelay
+            Preferences.shared.freezesScreen = previousFreeze
+        }
+        // Freezing decides the pixels early and the delay decides them late;
+        // mixing them here would test the interaction rather than the delay.
+        Preferences.shared.freezesScreen = false
+
+        let red = NSColor(srgbRed: 1, green: 0, blue: 0, alpha: 1)
+        let blue = NSColor(srgbRed: 0, green: 0, blue: 1, alpha: 1)
+
+        /// Runs the shipping path for `rect`, calling `duringCountdown` once the
+        /// bar is up — which is the only moment the thing under test exists.
+        func captureViaOverlay(
+            _ rect: CGRect, duringCountdown: @MainActor () async -> Void = {}
+        ) async -> CaptureResult? {
+            let box = CaptureBox()
+            let done = CompletionFlag()
+            Task {
+                box.result = await coordinator.captureInteractive()
+                done.markDone()
+            }
+            var waited = 0
+            while !overlay.isPresenting, waited < 5000 {
+                try? await Task.sleep(for: .milliseconds(25))
+                waited += 25
+            }
+            guard overlay.isPresenting else { return nil }
+            overlay.forceSelection(rect, on: screen)
+            try? await Task.sleep(for: .milliseconds(80))
+            overlay.confirmForTest()
+
+            if Preferences.shared.captureDelaySeconds > 0 {
+                waited = 0
+                while !coordinator.countdown.isVisible, waited < 3000 {
+                    try? await Task.sleep(for: .milliseconds(20))
+                    waited += 20
+                }
+                check(coordinator.countdown.isVisible, "the countdown bar is on screen")
+                // Awaited, not fired off: a probe that photographs the bar has to
+                // finish while the bar is still there, and a detached Task
+                // routinely lost that race — it reported the bar absent from a
+                // rect the bar was standing in, which is a green light for
+                // nothing at all.
+                await duringCountdown()
+            }
+            _ = await done.wait(upTo: .seconds(20))
+            return box.result
+        }
+
+        func colourName(_ result: CaptureResult?) -> String {
+            guard let result, let mean = PixelCompare.meanColour(result.image)
+            else { return "no capture" }
+            if mean.r > 128, mean.b < 128 { return "red" }
+            if mean.b > 128, mean.r < 128 { return "blue" }
+            return "neither (r\(Int(mean.r)) g\(Int(mean.g)) b\(Int(mean.b)))"
+        }
+
+        let stageFrame = CGRect(
+            x: (screen.frame.midX - 150).rounded(), y: (screen.frame.midY - 100).rounded(),
+            width: 300, height: 200)
+        let sampled = stageFrame.insetBy(dx: 30, dy: 30)
+
+        // --- the shot lands at the end of the countdown -----------------------
+        var stage = plainWindow(colour: red, frame: stageFrame)
+        try await Task.sleep(for: .milliseconds(300))
+        Preferences.shared.captureDelaySeconds = 1.0
+        let delayed = await captureViaOverlay(sampled) {
+            stage.backgroundColor = blue
+            stage.displayIfNeeded()
+        }
+        check(colourName(delayed) == "blue",
+              "the delayed shot holds what happened during the countdown — got \(colourName(delayed))")
+        if let delayed {
+            try? ImageEncoder.write(
+                delayed.image, to: directory.appendingPathComponent("delay-after.png"),
+                as: .png, scale: delayed.scale)
+        }
+        stage.orderOut(nil)
+
+        // --- the control: no delay, no chance to change anything --------------
+        stage = plainWindow(colour: red, frame: stageFrame)
+        try await Task.sleep(for: .milliseconds(300))
+        Preferences.shared.captureDelaySeconds = 0
+        let immediate = await captureViaOverlay(sampled) {
+            stage.backgroundColor = blue
+            stage.displayIfNeeded()
+        }
+        check(colourName(immediate) == "red",
+              "with the delay off the same flow holds the old colour, so the test above can fail "
+                + "— got \(colourName(immediate))")
+        stage.orderOut(nil)
+
+        // --- cancelling ------------------------------------------------------
+        Preferences.shared.captureDelaySeconds = 3.0
+        let cancelBox = CaptureBox()
+        let cancelDone = CompletionFlag()
+        Task {
+            cancelBox.result = await coordinator.captureInteractive()
+            cancelDone.markDone()
+        }
+        var waited = 0
+        while !overlay.isPresenting, waited < 5000 {
+            try await Task.sleep(for: .milliseconds(25))
+            waited += 25
+        }
+        overlay.forceSelection(sampled, on: screen)
+        try await Task.sleep(for: .milliseconds(80))
+        overlay.confirmForTest()
+        waited = 0
+        while !coordinator.countdown.isVisible, waited < 3000 {
+            try await Task.sleep(for: .milliseconds(20))
+            waited += 20
+        }
+        coordinator.countdown.cancel()
+        let finished = await cancelDone.wait(upTo: .seconds(5))
+        check(finished, "cancelling ends the capture instead of leaving it counting")
+        check(cancelBox.result == nil, "and hands back nothing")
+        check(!coordinator.countdown.isVisible, "and takes its bar off screen")
+
+        // --- the bar is kept out of the picture -------------------------------
+        //
+        // Asserted through the two mechanisms rather than through pixels. A
+        // pixel version was written first and thrown away: a capture taken while
+        // the countdown is up does not reliably reflect what is composited —
+        // over repeated runs the same rect came back as the bar, as the window
+        // behind it, and as a frame from a second earlier — so it could report
+        // either answer regardless of the code. What is deterministic is what
+        // the bar tells ScreenCaptureKit, and what the capture excluded.
+        Preferences.shared.captureDelaySeconds = 1.0
+        let sharingBox = SharingBox()
+        let excluded = await captureViaOverlay(stageFrame.insetBy(dx: 40, dy: 40)) {
+            sharingBox.type = coordinator.countdown.sharingTypeForTest
+            sharingBox.ids = coordinator.countdown.windowIDs
+        }
+        check(sharingBox.type == NSWindow.SharingType.none,
+              "the countdown bar ships invisible to ScreenCaptureKit "
+                + "(sharingType \(sharingBox.type.map { "\($0.rawValue)" } ?? "none read"))")
+        check(!sharingBox.ids.isEmpty
+                && sharingBox.ids.isSubset(of: coordinator.lastExcludedWindowIDsForTest),
+              "and its window ID is named in the shot's exclusion list as well")
+        check(excluded != nil, "the capture after the countdown produced an image")
+
+        print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.count) of the above")")
+        return failures.isEmpty ? 0 : 1
+    }
+
     // MARK: - Freeze mode
 
     /// Freeze mode, end to end, through the shipping path.
@@ -6190,6 +6380,11 @@ enum SelfTest {
 
     private final class CaptureBox {
         var result: CaptureResult?
+    }
+
+    private final class SharingBox {
+        var type: NSWindow.SharingType?
+        var ids: Set<CGWindowID> = []
     }
 
     // MARK: - Hover survival (the freeze experiment)

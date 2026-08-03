@@ -33,6 +33,7 @@ final class Preferences {
         static let previewCorner = "previewCorner"
         static let showsCursor = "showsCursor"
         static let freezesScreen = "freezesScreen"
+        static let captureDelaySeconds = "captureDelaySeconds"
         static let includeMenuBar = "includeMenuBar"
         static let includeChildWindows = "includeChildWindows"
         static let windowPadding = "windowPadding"
@@ -106,6 +107,21 @@ final class Preferences {
     /// only fix available.
     var freezesScreen: Bool {
         didSet { defaults.set(freezesScreen, forKey: Key.freezesScreen) }
+    }
+    /// Seconds between the trigger and the shot. 0 is off.
+    ///
+    /// The companion to `freezesScreen`, for the case freezing cannot reach.
+    /// Freezing rescues anything the *overlay* destroys by appearing; it cannot
+    /// rescue anything already gone before the photograph is taken, and a hotkey's
+    /// own modifier keydown is enough to make some apps drop a tooltip or close a
+    /// popover. A delay inverts the order: the selection is chosen first, then
+    /// nothing of ours is on screen for a few seconds while the user arranges
+    /// whatever they wanted photographed, and the shot is taken live at the end.
+    ///
+    /// Screenshots only. A recording has its own start moment and a delay before
+    /// it would be a different feature with a different bar.
+    var captureDelaySeconds: Double {
+        didSet { defaults.set(captureDelaySeconds, forKey: Key.captureDelaySeconds) }
     }
     var includeMenuBar: Bool {
         didSet { defaults.set(includeMenuBar, forKey: Key.includeMenuBar) }
@@ -242,6 +258,7 @@ final class Preferences {
             Key.previewCorner: PreviewCorner.bottomRight.rawValue,
             Key.showsCursor: false,
             Key.freezesScreen: false,
+            Key.captureDelaySeconds: 0.0,
             Key.includeMenuBar: true,
             Key.includeChildWindows: false,
             Key.windowPadding: 32.0,
@@ -273,6 +290,7 @@ final class Preferences {
             .flatMap(PreviewCorner.init(rawValue:)) ?? .bottomRight
         showsCursor = defaults.bool(forKey: Key.showsCursor)
         freezesScreen = defaults.bool(forKey: Key.freezesScreen)
+        captureDelaySeconds = defaults.double(forKey: Key.captureDelaySeconds)
         includeMenuBar = defaults.bool(forKey: Key.includeMenuBar)
         includeChildWindows = defaults.bool(forKey: Key.includeChildWindows)
         windowPadding = defaults.double(forKey: Key.windowPadding)

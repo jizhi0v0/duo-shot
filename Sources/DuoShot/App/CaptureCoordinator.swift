@@ -8,6 +8,7 @@ import AppKit
 final class CaptureCoordinator {
     let engine = CaptureEngine()
     let overlay = OverlayController()
+    let countdown = CaptureCountdown()
 
     /// `async` because the output pipeline is: the encode leg leaves the main
     /// thread and the caller has to be able to wait for it.
@@ -43,6 +44,11 @@ final class CaptureCoordinator {
     }
 
     private var isCapturing = false
+    /// The exclusion list the last capture actually went out with, for
+    /// `--selftest-delay`. Reading the options back is the only way to assert
+    /// that the countdown bar was named in them without depending on whether the
+    /// window server had finished retiring the window.
+    private(set) var lastExcludedWindowIDsForTest: Set<CGWindowID> = []
     /// Remembered for "Capture Previous Area", which repeats the last region
     /// without showing the overlay at all.
     private var lastArea: (displayID: CGDirectDisplayID, rect: CGRect)?
@@ -75,11 +81,37 @@ final class CaptureCoordinator {
 
         let outcome = await overlay.present(
             windows: engine.shareableContent.windows, frozen: frozen)
+        let delay = Preferences.shared.captureDelaySeconds
 
         switch outcome {
         case .cancelled:
             overlay.tearDown()
             return nil
+
+        // The delay and the freeze pull in opposite directions and that is the
+        // point of having both: freezing decides which *pixels* by taking them
+        // early, delaying decides which *moment* by taking them late. When both
+        // are on the selection is still made against the frozen picture — that is
+        // what the user aimed with — and the shot itself is live, because the
+        // whole reason to wait is that the interesting frame has not happened yet.
+        case .area(let displayID, let rect) where delay > 0:
+            lastArea = (displayID, rect)
+            overlay.tearDown()
+            guard await countdown.wait(seconds: delay, on: Self.screen(for: displayID))
+            else { return nil }
+            var options = Preferences.shared.captureOptions
+            options.excludedWindowIDs = countdown.lastWindowIDs
+                .union(additionalExcludedWindowIDs())
+            return await perform(
+                .area(displayID: displayID, rectInAppKitGlobal: rect), options: options)
+
+        case .window(let windowID) where delay > 0:
+            overlay.tearDown()
+            guard await countdown.wait(seconds: delay, on: NSScreen.main) else { return nil }
+            var options = Preferences.shared.captureOptions
+            options.excludedWindowIDs = countdown.lastWindowIDs
+                .union(additionalExcludedWindowIDs())
+            return await perform(.window(windowID), options: options)
 
         case .area(let displayID, let rect) where frozen[displayID] != nil:
             lastArea = (displayID, rect)
@@ -159,8 +191,13 @@ final class CaptureCoordinator {
             Log.capture.error("could not refresh shareable content: \(error, privacy: .public)")
             return nil
         }
+        guard await countdown.wait(
+            seconds: Preferences.shared.captureDelaySeconds,
+            on: Self.screen(for: lastArea.displayID))
+        else { return nil }
         var options = Preferences.shared.captureOptions
-        options.excludedWindowIDs = additionalExcludedWindowIDs()
+        options.excludedWindowIDs = countdown.lastWindowIDs
+            .union(additionalExcludedWindowIDs())
         return await perform(
             .area(displayID: lastArea.displayID, rectInAppKitGlobal: lastArea.rect),
             options: options)
@@ -229,9 +266,19 @@ final class CaptureCoordinator {
             instant window capture: \(target.displayName, privacy: .public)
             """)
 
+        guard await countdown.wait(
+            seconds: Preferences.shared.captureDelaySeconds, on: NSScreen.main)
+        else { return nil }
         var options = Preferences.shared.captureOptions
-        options.excludedWindowIDs = additionalExcludedWindowIDs()
+        options.excludedWindowIDs = countdown.lastWindowIDs
+            .union(additionalExcludedWindowIDs())
         return await perform(.window(target.id), options: options)
+    }
+
+    /// Which `NSScreen` a display ID belongs to, for placing the countdown bar
+    /// where the user is already looking.
+    private static func screen(for displayID: CGDirectDisplayID) -> NSScreen? {
+        NSScreen.screens.first { ScreenIndex.displayID(of: $0) == displayID } ?? NSScreen.main
     }
 
     /// One whole-screen photograph per display, taken with nothing of ours on
@@ -324,6 +371,7 @@ final class CaptureCoordinator {
         _ request: CaptureRequest, options: CaptureOptions, isRetry: Bool = false,
         afterCapture: () -> Void = {}
     ) async -> CaptureResult? {
+        lastExcludedWindowIDsForTest = options.excludedWindowIDs
         do {
             let result = try await engine.capture(request, options: options)
             afterCapture()
@@ -369,8 +417,12 @@ final class CaptureCoordinator {
             let target = displayID
                 ?? ScreenIndex.screenUnderMouse().flatMap(ScreenIndex.displayID(of:))
                 ?? CGMainDisplayID()
+            guard await countdown.wait(
+                seconds: Preferences.shared.captureDelaySeconds, on: Self.screen(for: target))
+            else { return nil }
             var options = Preferences.shared.captureOptions
-            options.excludedWindowIDs = additionalExcludedWindowIDs()
+            options.excludedWindowIDs = countdown.lastWindowIDs
+                .union(additionalExcludedWindowIDs())
             let result = try await engine.capture(.display(target), options: options)
             await onResult?(result)
             return result
