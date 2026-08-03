@@ -57,6 +57,9 @@ enum SelfTest {
         /// Where the size readout lands, and that the loupe never covers it.
         /// Geometry headless, then the same question asked of a live drag.
         case badgePlacement
+        /// Whether a hover state survives a capture starting, and whether a
+        /// freeze at hotkey time would preserve it. A measurement, not a rule.
+        case hoverFreeze
         /// Pointer position -> pixel in a backdrop frame, including the offsets a
         /// second display introduces. Headless, and the only way to test them on
         /// a one-screen machine.
@@ -206,6 +209,8 @@ enum SelfTest {
                 self = .selectionZones
             case "--selftest-badge-placement":
                 self = .badgePlacement
+            case "--selftest-hover-freeze":
+                self = .hoverFreeze
             case "--selftest-pixel-mapping":
                 self = .pixelMapping
             case "--selftest-latch-cancel":
@@ -381,6 +386,7 @@ enum SelfTest {
             case .shareFlow: return await ShareFlowSelfTest.run()
             case .selectionZones: return selectionZonesCheck()
             case .badgePlacement: return try await badgePlacementCheck()
+            case .hoverFreeze: return try await hoverFreezeCheck()
             case .pixelMapping: return pixelMappingCheck()
             case .latchCancel: return await latchCancelCheck()
             case .settingsWindow(let directory): return try await settingsWindow(into: directory)
@@ -5881,6 +5887,207 @@ enum SelfTest {
 
         print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.count) of the above")")
         return failures.isEmpty ? 0 : 1
+    }
+
+    // MARK: - Hover survival (the freeze experiment)
+
+    /// A window that shows, in colour, whether the pointer is over it.
+    ///
+    /// Green when hovered, blue when not — far enough apart that a mean over the
+    /// captured region cannot be talked into the wrong answer. `.activeAlways`
+    /// because the whole question is what happens to hover tracking when some
+    /// *other* window takes over the screen.
+    private final class HoverProbeView: NSView {
+        private(set) var isHovered = false
+        private var area: NSTrackingArea?
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let area { removeTrackingArea(area) }
+            let fresh = NSTrackingArea(
+                rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                owner: self)
+            addTrackingArea(fresh)
+            area = fresh
+        }
+
+        override func mouseEntered(with event: NSEvent) {
+            isHovered = true
+            needsDisplay = true
+            displayIfNeeded()
+        }
+
+        override func mouseExited(with event: NSEvent) {
+            isHovered = false
+            needsDisplay = true
+            displayIfNeeded()
+        }
+
+        override func draw(_ dirtyRect: NSRect) {
+            (isHovered
+                ? NSColor(srgbRed: 0, green: 1, blue: 0, alpha: 1)
+                : NSColor(srgbRed: 0, green: 0, blue: 1, alpha: 1)).setFill()
+            bounds.fill()
+        }
+    }
+
+    /// Does a hover state survive long enough to be photographed — and would
+    /// freezing the screen at hotkey time rescue it?
+    ///
+    /// Not an invariant. This is the measurement that decides whether a freeze
+    /// mode is worth building, run before building it, because the answer is a
+    /// property of macOS and not of this app. Three things could be killing the
+    /// hover under the pointer when a capture starts, and they happen at
+    /// different moments:
+    ///
+    /// 1. a window covering the pointer, so the app underneath sees it leave;
+    /// 2. that app losing activation;
+    /// 3. the hotkey's own modifier keydown, before anything of ours exists.
+    ///
+    /// A freeze taken at hotkey time is *upstream* of 1 and 2 and downstream of
+    /// 3, so which of them is responsible is exactly the difference between
+    /// "freeze fixes it" and "freeze cannot fix it". Each is applied separately
+    /// here — a click-through cover, a plain cover, then the real overlay — and
+    /// the probe is asked, after each, whether it still thinks it is hovered.
+    ///
+    /// The pixels are checked too, not just the flag: a view that believes it is
+    /// hovered but has not redrawn photographs the same as one that is not.
+    private static func hoverFreezeCheck() async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+        if let hint = LoginSession.noDisplaysHint {
+            FileHandle.standardError.write(Data("error: \(hint)\n".utf8))
+            return 2
+        }
+        guard let screen = NSScreen.main, let displayID = ScreenIndex.displayID(of: screen)
+        else { throw CaptureError.noDisplays }
+
+        let coordinator = CaptureCoordinator()
+        let overlay = coordinator.overlay
+        try await coordinator.engine.refreshContent()
+
+        let restore = NSEvent.mouseLocation
+        defer { CGWarpMouseCursorPosition(DisplayGeometry.flipped(restore)) }
+
+        let probeFrame = CGRect(
+            x: (screen.frame.midX - 150).rounded(), y: (screen.frame.midY - 100).rounded(),
+            width: 300, height: 200)
+        let probe = HoverProbeView(frame: CGRect(origin: .zero, size: probeFrame.size))
+        let window = NSWindow(
+            contentRect: probeFrame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = probe
+        window.isOpaque = true
+        window.hasShadow = false
+        window.level = .floating
+        window.orderFrontRegardless()
+        defer { window.orderOut(nil) }
+
+        let centre = CGPoint(x: probeFrame.midX, y: probeFrame.midY)
+        CGWarpMouseCursorPosition(DisplayGeometry.flipped(centre))
+        try await Task.sleep(for: .milliseconds(400))
+
+        /// What the region actually looks like right now, named as the probe's
+        /// two colours. The cursor is left out — an arrow sitting in the middle
+        /// of the sample is not part of the question.
+        func photograph(excluding excluded: Set<CGWindowID> = []) async -> String {
+            var options = CaptureOptions.default
+            options.showsCursor = false
+            options.excludedWindowIDs = excluded
+            guard let shot = try? await coordinator.engine.capture(
+                .area(displayID: displayID, rectInAppKitGlobal: probeFrame.insetBy(dx: 20, dy: 20)),
+                options: options),
+                let mean = PixelCompare.meanColour(shot.image)
+            else { return "no capture" }
+            if mean.g > 128, mean.b < 128 { return "hovered (green)" }
+            if mean.b > 128, mean.g < 128 { return "not hovered (blue)" }
+            return "neither (r\(Int(mean.r)) g\(Int(mean.g)) b\(Int(mean.b)))"
+        }
+
+        guard probe.isHovered else {
+            print("  the probe never registered the pointer — nothing was measured")
+            print("result:        INCONCLUSIVE")
+            return 1
+        }
+        print("  baseline (nothing covering it)")
+        print("    flag:  hovered")
+        print("    frozen frame taken now: \(await photograph())")
+
+        /// Puts the pointer back and waits for the probe to notice, so each
+        /// mechanism below is applied to a hover that is genuinely established.
+        func rehover() async throws {
+            CGWarpMouseCursorPosition(DisplayGeometry.flipped(CGPoint(x: centre.x + 3, y: centre.y)))
+            try await Task.sleep(for: .milliseconds(120))
+            CGWarpMouseCursorPosition(DisplayGeometry.flipped(centre))
+            try await Task.sleep(for: .milliseconds(250))
+        }
+
+        // --- 1. a cover over the pointer, click-through and not ---------------
+        let coverFrame = CGRect(x: centre.x - 100, y: centre.y - 100, width: 200, height: 200)
+        for clickThrough in [true, false] {
+            try await rehover()
+            guard probe.isHovered else {
+                print("  could not re-establish hover before the cover test — skipped")
+                continue
+            }
+            let cover = NSWindow(
+                contentRect: coverFrame, styleMask: [.borderless], backing: .buffered, defer: false)
+            cover.backgroundColor = NSColor(srgbRed: 0.1, green: 0.1, blue: 0.1, alpha: 1)
+            cover.isOpaque = true
+            cover.hasShadow = false
+            cover.level = .floating
+            cover.ignoresMouseEvents = clickThrough
+            cover.orderFrontRegardless()
+            try await Task.sleep(for: .milliseconds(350))
+            let flag = probe.isHovered
+            let pixels = await photograph(excluding: [CGWindowID(cover.windowNumber)])
+            cover.orderOut(nil)
+            print("  covered by a \(clickThrough ? "click-through" : "plain") window")
+            print("    flag:  \(flag ? "still hovered" : "hover LOST")")
+            print("    live capture with the cover excluded: \(pixels)")
+        }
+
+        // --- 2. the real overlay, which is what a capture actually does -------
+        try await rehover()
+        guard probe.isHovered else {
+            print("  could not re-establish hover before the overlay test")
+            print("result:        INCONCLUSIVE")
+            return 1
+        }
+        let frozenBefore = await photograph()
+        let presented = CompletionFlag()
+        Task {
+            _ = await overlay.present(windows: [], suggestsWindows: false)
+            presented.markDone()
+        }
+        try await Task.sleep(for: .milliseconds(500))
+        let flagUnderOverlay = probe.isHovered
+        let liveUnderOverlay = await photograph(excluding: overlay.panelWindowIDs)
+        overlay.tearDown()
+        _ = await presented.wait(upTo: .seconds(2))
+        try await Task.sleep(for: .milliseconds(300))
+
+        print("  the selection overlay up (the real capture path)")
+        print("    frozen at hotkey time: \(frozenBefore)")
+        print("    flag:  \(flagUnderOverlay ? "still hovered" : "hover LOST")")
+        print("    live capture, the confirm path's pixels: \(liveUnderOverlay)")
+
+        let frozenKept = frozenBefore.hasPrefix("hovered")
+        let liveKept = liveUnderOverlay.hasPrefix("hovered")
+        let verdict = switch (frozenKept, liveKept) {
+        case (true, false):
+            "freeze WOULD rescue this — the hover is in the frozen frame and gone from the live one"
+        case (true, true):
+            "nothing to rescue here — the hover survives the overlay on this machine"
+        case (false, _):
+            "the hover was already gone before the overlay — a freeze at hotkey time cannot help"
+        }
+        print("  verdict: \(verdict)")
+        print("""
+              note:    mechanism 3 (the hotkey's own modifier keydown) is not \
+              measured here — it is per-app, and needs the real hotkey pressed \
+              over the real UI.
+              """)
+        print("result:        MEASURED")
+        return 0
     }
 
     // MARK: - Size readout placement
