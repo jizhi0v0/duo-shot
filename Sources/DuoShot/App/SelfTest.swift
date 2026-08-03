@@ -5298,6 +5298,38 @@ enum SelfTest {
         print("configured:    \(ShareService.shared.isConfigured)")
         print("card frame:    \(Int(frame.minX)),\(Int(frame.minY)) \(Int(frame.width))x\(Int(frame.height))")
 
+        // The bar is the width of the buttons in it, not of the buttons there
+        // could have been.
+        //
+        // With sharing unconfigured the share button is hidden, and the bar used
+        // to keep its slot anyway — a three-button pill with two buttons in it
+        // and a permanent empty socket on the right. This is the assertion the
+        // rest of this test could never make: everything else here is a
+        // screenshot for a human to look at, and a human looked straight past
+        // that gap for weeks.
+        let expectedButtons = ShareService.shared.isConfigured ? 3 : 2
+        if let layout = previews.actionBarLayoutForTest {
+            print("action bar:    \(rectString(layout.frame)) "
+                  + "\(layout.visibleButtons) buttons, configured=\(ShareService.shared.isConfigured)")
+            var failed = false
+            if layout.visibleButtons != expectedButtons {
+                print("result:        FAIL — \(layout.visibleButtons) buttons visible, "
+                      + "expected \(expectedButtons)")
+                failed = true
+            }
+            // 30 pt per button plus 3 pt of padding each side.
+            let expectedWidth = CGFloat(expectedButtons) * 30 + 6
+            if abs(layout.frame.width - expectedWidth) > 0.5 {
+                print("result:        FAIL — bar is \(Int(layout.frame.width))pt wide, "
+                      + "expected \(Int(expectedWidth))pt for \(expectedButtons) buttons")
+                failed = true
+            }
+            if failed { return 1 }
+        } else {
+            print("result:        FAIL — no action bar to measure")
+            return 1
+        }
+
         // As constructed, before anything touches its share state.
         previews.setHoverForTest(true)
         try await Task.sleep(for: .milliseconds(300))

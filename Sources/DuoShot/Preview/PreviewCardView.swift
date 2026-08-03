@@ -64,6 +64,10 @@ final class PreviewCardView: NSView {
     private var trackingAreaRef: NSTrackingArea?
 
     private var actionBar: NSVisualEffectView!
+    /// Every button in the bar, in the order they were built. The bar is laid
+    /// out from whichever of them are visible — see `layoutActionBar`.
+    private var barButtons: [NSButton] = []
+    private static let barButtonWidth: CGFloat = 30
     private var shareButton: NSButton?
     private var buttonRing: ButtonRingView?
     private var centerRing: ButtonRingView?
@@ -195,7 +199,7 @@ final class PreviewCardView: NSView {
             ("folder", "Show in Finder", #selector(revealTapped)),
             ("square.and.arrow.up", "Upload and copy link", #selector(shareTapped)),
         ]
-        let buttonWidth: CGFloat = 30
+        let buttonWidth = Self.barButtonWidth
         let barWidth = CGFloat(specs.count) * buttonWidth + 6
         let bar = NSVisualEffectView(frame: CGRect(
             x: ((bounds.width - barWidth) / 2).rounded(),
@@ -226,6 +230,7 @@ final class PreviewCardView: NSView {
             button.target = self
             button.action = spec.action
             bar.addSubview(button)
+            barButtons.append(button)
             if spec.symbol == "square.and.arrow.up" { shareButton = button }
         }
         // One source of truth for how this button looks.
@@ -411,6 +416,36 @@ final class PreviewCardView: NSView {
         thumbnailView?.image = image
     }
 
+    /// Sizes the bar to the buttons that are actually in it.
+    ///
+    /// The share button is hidden until sharing is configured, and the bar used
+    /// to keep its slot regardless: a pill wide enough for three buttons with
+    /// two in it, so an unconfigured install got a permanent empty socket where
+    /// the upload icon would have been. Reported as "the preview still shows the
+    /// icon placeholder, but there is no upload icon".
+    ///
+    /// Re-run from `setShareState` rather than only at construction, because the
+    /// answer changes under a card that is already on screen — configuring the
+    /// endpoint mid-session is exactly when someone is looking at one.
+    private func layoutActionBar() {
+        guard let actionBar else { return }
+        let visible = barButtons.filter { !$0.isHidden }
+        let width = CGFloat(visible.count) * Self.barButtonWidth + 6
+        actionBar.frame = CGRect(
+            x: ((bounds.width - width) / 2).rounded(), y: Self.barInset,
+            width: width, height: Self.barHeight)
+        for (index, button) in visible.enumerated() {
+            button.setFrameOrigin(
+                CGPoint(x: 3 + CGFloat(index) * Self.barButtonWidth, y: 0))
+        }
+    }
+
+    /// The bar's frame and how many buttons are standing in it, for
+    /// `--selftest-share-card`.
+    var actionBarLayoutForTest: (frame: CGRect, visibleButtons: Int) {
+        (actionBar?.frame ?? .zero, barButtons.filter { !$0.isHidden }.count)
+    }
+
     func setShareState(_ state: ShareService.State?) {
         shareState = state
 
@@ -474,6 +509,11 @@ final class PreviewCardView: NSView {
             shareButton?.image = Self.symbol(
                 "square.and.arrow.up", pointSize: 12, description: "Upload")
         }
+
+        // Last, and for every state: each branch above decides whether the share
+        // button is on screen, and the bar has to be the width of what it ends up
+        // holding.
+        layoutActionBar()
     }
 
     /// Where the progress is shown depends on whether the pointer is here.

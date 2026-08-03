@@ -700,6 +700,11 @@ final class PreviewStackController {
         dismiss(oldest)
     }
 
+    /// The front card's action-bar geometry, for `--selftest-share-card`.
+    var actionBarLayoutForTest: (frame: CGRect, visibleButtons: Int)? {
+        items.first?.card.actionBarLayoutForTest
+    }
+
     func setHoverForTest(_ hovering: Bool) {
         for item in items { item.card.setHoverForTest(hovering) }
     }
