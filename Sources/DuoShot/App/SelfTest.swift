@@ -54,6 +54,9 @@ enum SelfTest {
         /// Pure geometry of the armed selection's grab zones. Headless: no screen,
         /// no capture, so it runs where the interactive tests cannot.
         case selectionZones
+        /// Where the size readout lands, and that the loupe never covers it.
+        /// Geometry headless, then the same question asked of a live drag.
+        case badgePlacement
         /// Pointer position -> pixel in a backdrop frame, including the offsets a
         /// second display introduces. Headless, and the only way to test them on
         /// a one-screen machine.
@@ -201,6 +204,8 @@ enum SelfTest {
                 self = .preferences
             case "--selftest-selection-zones":
                 self = .selectionZones
+            case "--selftest-badge-placement":
+                self = .badgePlacement
             case "--selftest-pixel-mapping":
                 self = .pixelMapping
             case "--selftest-latch-cancel":
@@ -375,6 +380,7 @@ enum SelfTest {
             case .shareCredentials: return await ShareSelfTest.credentials()
             case .shareFlow: return await ShareFlowSelfTest.run()
             case .selectionZones: return selectionZonesCheck()
+            case .badgePlacement: return try await badgePlacementCheck()
             case .pixelMapping: return pixelMappingCheck()
             case .latchCancel: return await latchCancelCheck()
             case .settingsWindow(let directory): return try await settingsWindow(into: directory)
@@ -5872,6 +5878,155 @@ enum SelfTest {
         let tiny = SelectionZones(rect: CGRect(x: 0, y: 0, width: 21, height: 21))
         check(tiny.grab < 8 && !tiny.interior.isEmpty,
               "a 21pt selection shrinks its grab band instead of becoming all handles")
+
+        print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.count) of the above")")
+        return failures.isEmpty ? 0 : 1
+    }
+
+    // MARK: - Size readout placement
+
+    /// Whether the size readout stays readable — which means staying out from
+    /// under the loupe.
+    ///
+    /// The loupe is a subview and the readout is painted by `draw`, so wherever
+    /// the two overlap the glass wins and the digits are simply gone. They
+    /// overlapped by default: the readout sits under the rect's bottom edge and
+    /// the loupe sits 18 pt below-right of the pointer, and on any drag whose
+    /// moving corner is the bottom-left one those are the same place. Reported
+    /// as "the preview block covers the size".
+    ///
+    /// Geometry first, because it can enumerate the corner cases a live drag
+    /// cannot reach, then one real drag — the placement is only worth anything
+    /// if the frames it computes are the frames on screen.
+    private static func badgePlacementCheck() async throws -> Int32 {
+        var failures: [String] = []
+        func check(_ condition: Bool, _ description: String) {
+            print("  \(condition ? "ok  " : "FAIL") \(description)")
+            if !condition { failures.append(description) }
+        }
+
+        let bounds = CGRect(x: 0, y: 0, width: 1600, height: 1000)
+        let box = CGSize(width: 70, height: 23)
+        let loupeSize = SelectionLoupeView.size
+
+        /// The loupe where `placeLoupe` would put it for a pointer at `pointer`,
+        /// with the same 18 pt gap and the same two flips. Duplicated on purpose:
+        /// a test that asked the view for the answer would agree with a wrong
+        /// answer.
+        func loupe(at pointer: CGPoint, flippedX: Bool = false, flippedY: Bool = false) -> CGRect {
+            let gap: CGFloat = 18
+            let x = flippedX ? pointer.x - gap - loupeSize.width : pointer.x + gap
+            let y = flippedY ? pointer.y + gap : pointer.y - gap - loupeSize.height
+            return CGRect(origin: CGPoint(x: x, y: y), size: loupeSize)
+        }
+
+        func frame(_ highlight: CGRect, _ glass: CGRect?) -> CGRect {
+            OverlayView.badgeFrame(
+                boxSize: box, near: highlight, in: bounds, avoiding: glass)
+        }
+
+        // Nothing to dodge: below the rect, centred on it. The fallback must not
+        // have become the normal case.
+        let plain = frame(CGRect(x: 400, y: 300, width: 300, height: 200), nil)
+        check(plain.midX == 550 && plain.maxY == 294,
+              "with no loupe the readout is centred under the rect (\(rectString(plain)))")
+
+        // The reported bug, at the size it was reported: dragged down and to the
+        // left, so the pointer — and the loupe — is on the bottom-left corner.
+        let downLeft = CGRect(x: 400, y: 300, width: 200, height: 200)
+        let glassDownLeft = loupe(at: CGPoint(x: downLeft.minX, y: downLeft.minY))
+        let dodged = frame(downLeft, glassDownLeft)
+        check(!dodged.intersects(glassDownLeft),
+              "a down-left drag puts the readout clear of the loupe (\(rectString(dodged)))")
+        check(dodged.minY >= downLeft.maxY,
+              "and clear means above the rect, where it can stay for the whole drag")
+
+        // Same collision from the other side: near the right screen edge the
+        // loupe flips left, onto the rect it is measuring.
+        let nearRight = CGRect(x: 1300, y: 300, width: 200, height: 200)
+        let glassFlipped = loupe(at: CGPoint(x: nearRight.maxX, y: nearRight.minY), flippedX: true)
+        let dodgedRight = frame(nearRight, glassFlipped)
+        check(!dodgedRight.intersects(glassFlipped),
+              "a loupe flipped to the left of the pointer is dodged too (\(rectString(dodgedRight)))")
+
+        // No room below: the pre-existing flip still happens, loupe or no loupe.
+        let atBottom = CGRect(x: 400, y: 10, width: 300, height: 200)
+        check(frame(atBottom, nil).minY >= atBottom.maxY,
+              "a rect against the bottom of the screen puts its readout above")
+
+        // Both bands under the glass. A short rect against the screen bottom:
+        // below does not fit at all, and the loupe — flipped upwards, because
+        // the pointer is near the bottom — covers what is left.
+        let short = CGRect(x: 400, y: 30, width: 300, height: 10)
+        let glassShort = loupe(at: CGPoint(x: short.minX, y: short.minY), flippedY: true)
+        let pushed = frame(short, glassShort)
+        check(!pushed.intersects(glassShort),
+              "with both bands blocked the readout slides sideways (\(rectString(pushed)))")
+
+        // Whatever it dodges, it stays on the screen. A readout pushed off the
+        // edge is worse than one behind glass: at least the glass moves.
+        let everywhere: [(CGRect, CGRect?)] = [
+            (CGRect(x: 400, y: 300, width: 300, height: 200), nil),
+            (downLeft, glassDownLeft), (nearRight, glassFlipped), (short, glassShort),
+            (CGRect(x: 0, y: 0, width: 40, height: 40),
+             loupe(at: .zero, flippedY: true)),
+            (CGRect(x: 1560, y: 960, width: 40, height: 40),
+             loupe(at: CGPoint(x: 1600, y: 1000), flippedX: true)),
+        ]
+        let escaped = everywhere.map { frame($0.0, $0.1) }.filter { !bounds.contains($0) }
+        check(escaped.isEmpty,
+              "every placement stays on screen\(escaped.isEmpty ? "" : " — \(escaped.map(rectString).joined(separator: " "))")")
+
+        // --- and now the same question, asked of a live drag ------------------
+        guard ScreenPermission.isGranted, LoginSession.noDisplaysHint == nil,
+              let screen = NSScreen.main
+        else {
+            print("  skip live drag (no screen permission or no displays)")
+            print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.count) of the above")")
+            return failures.isEmpty ? 0 : 1
+        }
+
+        let coordinator = CaptureCoordinator()
+        let overlay = coordinator.overlay
+        let flag = CompletionFlag()
+        Task {
+            _ = await overlay.present(windows: [], suggestsWindows: false)
+            flag.markDone()
+        }
+        try await Task.sleep(for: .milliseconds(200))
+
+        // Down and to the left, the direction that collides. The pointer is
+        // seeded first because the loupe only appears once the backdrop it
+        // magnifies has arrived.
+        let from = CGPoint(x: screen.frame.midX + 120, y: screen.frame.midY + 120)
+        let to = CGPoint(x: screen.frame.midX - 80, y: screen.frame.midY - 80)
+        overlay.forcePointerForTest(at: from)
+        var waited = 0
+        while !overlay.hasBackdropForTest, waited < 2000 {
+            try await Task.sleep(for: .milliseconds(50))
+            waited += 50
+        }
+        check(overlay.hasBackdropForTest, "the backdrop arrived (in \(waited)ms)")
+        // Read straight back, with no sleep in between. The overlay polls the
+        // real mouse every 120 ms and a poll overwrites the forced pointer, which
+        // moves the loupe to wherever the mouse happens to be sitting — measured,
+        // and it made the check below pass for the wrong reason.
+        overlay.forceDragForTest(from: from, to: to, on: screen)
+
+        if let pair = overlay.loupeAndBadgeForTest {
+            print("  loupe: \(rectString(pair.loupe))  readout: \(rectString(pair.badge))")
+            check(abs(pair.loupe.minX - to.x) < 60 && abs(pair.loupe.maxY - to.y) < 60,
+                  "the loupe is beside the corner being dragged, so these frames are this gesture's")
+            check(!pair.loupe.intersects(pair.badge),
+                  "mid-drag, the loupe and the readout do not overlap on screen")
+            check(screen.frame.contains(pair.badge), "and the readout is on the screen")
+        } else {
+            check(false, "the loupe and the readout both have frames mid-drag")
+        }
+
+        overlay.cancelSelectionForTest()
+        overlay.tearDown()
+        _ = await flag.wait(upTo: .seconds(2))
 
         print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.count) of the above")")
         return failures.isEmpty ? 0 : 1

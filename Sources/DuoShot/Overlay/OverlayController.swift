@@ -658,6 +658,21 @@ final class OverlayController {
         return nil
     }
 
+    /// The loupe and the size readout together, in AppKit global points, read off
+    /// the *same* screen's view. Separate accessors could hand back frames from
+    /// two different displays, and "they do not overlap" would then be an
+    /// assertion about nothing.
+    var loupeAndBadgeForTest: (loupe: CGRect, badge: CGRect)? {
+        for (panel, view) in zip(panels, views) {
+            guard let loupe = view.loupeFrameForTest, let badge = view.badgeFrameForTest
+            else { continue }
+            let offset = panel.frame.origin
+            return (loupe.offsetBy(dx: offset.x, dy: offset.y),
+                    badge.offsetBy(dx: offset.x, dy: offset.y))
+        }
+        return nil
+    }
+
     var hasBackdropForTest: Bool {
         views.contains { $0.backdrop != nil }
     }

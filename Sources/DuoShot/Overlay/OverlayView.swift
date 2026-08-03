@@ -676,33 +676,110 @@ final class OverlayView: NSView {
             at: CGPoint(x: box.minX + 10, y: box.minY + 5), withAttributes: attributes)
     }
 
-    private func drawBadge(_ text: String, near highlight: CGRect) {
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
-            .foregroundColor: NSColor.white,
-        ]
+    private static let badgeAttributes: [NSAttributedString.Key: Any] = [
+        .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
+        .foregroundColor: NSColor.white,
+    ]
+    private static let badgePadding = CGSize(width: 8, height: 4)
+
+    /// The text as it will actually be drawn, and the box it goes in. Shared with
+    /// `badgeFrameForTest` so the test cannot assert about a box the draw does
+    /// not use.
+    private func badgeLayout(_ text: String, near highlight: CGRect) -> (text: String, box: CGRect) {
         var truncated = text
-        while (truncated as NSString).size(withAttributes: attributes).width > bounds.width - 80,
+        while (truncated as NSString).size(withAttributes: Self.badgeAttributes).width
+                > bounds.width - 80,
               truncated.count > 4 {
             truncated = String(truncated.dropLast(2)) + "…"
         }
+        let size = (truncated as NSString).size(withAttributes: Self.badgeAttributes)
+        let boxSize = CGSize(width: size.width + Self.badgePadding.width * 2,
+                             height: size.height + Self.badgePadding.height * 2)
+        return (truncated, Self.badgeFrame(
+            boxSize: boxSize, near: highlight, in: bounds,
+            avoiding: loupe.isHidden ? nil : loupe.frame))
+    }
 
-        let size = (truncated as NSString).size(withAttributes: attributes)
-        let padding = CGSize(width: 8, height: 4)
-        let boxSize = CGSize(width: size.width + padding.width * 2,
-                             height: size.height + padding.height * 2)
-
-        // Below the highlight by default; above it when there is no room.
-        var origin = CGPoint(x: highlight.midX - boxSize.width / 2,
-                             y: highlight.minY - boxSize.height - 6)
-        if origin.y < bounds.minY + 4 { origin.y = highlight.maxY + 6 }
-        origin.x = min(max(origin.x, bounds.minX + 4), bounds.maxX - boxSize.width - 4)
-
-        let box = CGRect(origin: origin, size: boxSize)
+    private func drawBadge(_ text: String, near highlight: CGRect) {
+        let (truncated, box) = badgeLayout(text, near: highlight)
         NSColor(white: 0, alpha: 0.72).setFill()
         NSBezierPath(roundedRect: box, xRadius: 5, yRadius: 5).fill()
         (truncated as NSString).draw(
-            at: CGPoint(x: box.minX + padding.width, y: box.minY + padding.height),
-            withAttributes: attributes)
+            at: CGPoint(x: box.minX + Self.badgePadding.width,
+                        y: box.minY + Self.badgePadding.height),
+            withAttributes: Self.badgeAttributes)
+    }
+
+    /// Where the readout goes: under the rect, over it, or pushed sideways —
+    /// but never underneath the loupe.
+    ///
+    /// The loupe is a *subview*, so it composites on top of everything `draw`
+    /// paints. The readout is painted, and its default place is directly under
+    /// the rect's bottom edge; the loupe's default place is 18 pt below-right of
+    /// the pointer. During any drag whose moving corner is a bottom one — which
+    /// is most of them — those two are the same strip of screen, and the glass
+    /// ate the bottom half of the digits. Reported as "the preview block covers
+    /// the size".
+    ///
+    /// Vertical flips are tried before sideways ones on purpose. The loupe hugs
+    /// the pointer and the pointer is the moving corner, so during a downward
+    /// drag *every* position under the rect is contested for the whole gesture:
+    /// flipping above the rect settles once and then holds still, where nudging
+    /// along the bottom edge would have the readout skate about under the
+    /// cursor for as long as the drag lasts.
+    static func badgeFrame(
+        boxSize: CGSize, near highlight: CGRect, in bounds: CGRect, avoiding loupe: CGRect?
+    ) -> CGRect {
+        let gap: CGFloat = 6
+        let margin: CGFloat = 4
+        func clampedX(_ x: CGFloat) -> CGFloat {
+            // max() last: on a box wider than the space it has, the low clamp is
+            // the one that must survive, or it leaves the screen on the left.
+            max(min(x, bounds.maxX - boxSize.width - margin), bounds.minX + margin)
+        }
+        func at(x: CGFloat, y: CGFloat) -> CGRect {
+            CGRect(origin: CGPoint(x: clampedX(x), y: y), size: boxSize)
+        }
+        func isClear(_ candidate: CGRect) -> Bool {
+            loupe.map { !$0.intersects(candidate) } ?? true
+        }
+
+        let centred = highlight.midX - boxSize.width / 2
+        let below = at(x: centred, y: highlight.minY - boxSize.height - gap)
+        let above = at(x: centred, y: highlight.maxY + gap)
+        let belowFits = below.minY >= bounds.minY + margin
+        let aboveFits = above.maxY <= bounds.maxY - margin
+
+        // Below unless there is no room for it, exactly as before the loupe was
+        // ever consulted: the fallback must not become the common case.
+        let preferred = belowFits ? below : above
+        let alternate = belowFits ? above : below
+        let alternateFits = belowFits ? aboveFits : belowFits
+        if isClear(preferred) { return preferred }
+        if alternateFits, isClear(alternate) { return alternate }
+
+        // Both bands are under the glass — a rect short enough that the loupe
+        // spans it. Slide along the preferred band instead, starting with
+        // whichever side of the loupe has more screen to offer.
+        guard let loupe else { return preferred }
+        let left = at(x: loupe.minX - gap - boxSize.width, y: preferred.minY)
+        let right = at(x: loupe.maxX + gap, y: preferred.minY)
+        let leftFirst = (loupe.minX - bounds.minX) >= (bounds.maxX - loupe.maxX)
+        for candidate in leftFirst ? [left, right] : [right, left] where isClear(candidate) {
+            return candidate
+        }
+        return preferred
+    }
+
+    /// The readout's frame in this view's coordinates, or nil when nothing is
+    /// highlighted. Same code path the draw takes, one step short of the ink.
+    var badgeFrameForTest: CGRect? {
+        if let highlight = highlightRect, highlight.width >= 1, highlight.height >= 1 {
+            return badgeLayout("\(Int(highlight.width)) × \(Int(highlight.height))",
+                               near: highlight).box
+        }
+        guard let suggestion = suggestionRect, let name = suggestedWindow?.displayName
+        else { return nil }
+        return badgeLayout(name, near: suggestion).box
     }
 }
