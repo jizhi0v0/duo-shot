@@ -32,6 +32,7 @@ final class Preferences {
         static let previewTimeout = "previewTimeout"
         static let previewCorner = "previewCorner"
         static let showsCursor = "showsCursor"
+        static let freezesScreen = "freezesScreen"
         static let includeMenuBar = "includeMenuBar"
         static let includeChildWindows = "includeChildWindows"
         static let windowPadding = "windowPadding"
@@ -81,6 +82,30 @@ final class Preferences {
     }
     var showsCursor: Bool {
         didSet { defaults.set(showsCursor, forKey: Key.showsCursor) }
+    }
+    /// Photograph the screen at the instant the hotkey fires, select against
+    /// that photograph, and cut the final image out of it.
+    ///
+    /// Off by default, and the default is the interesting half: the overlay
+    /// takes measurably longer to appear, and the frames cost tens of megabytes
+    /// per display while the selection is up. Measured with `--selftest-freeze`
+    /// on a 3456x2234 Retina display: the overlay lands ~116 ms after the
+    /// trigger frozen against ~35 ms live, so the freeze itself is ~80 ms, and
+    /// it scales with how many displays there are and how big they are.
+    ///
+    /// What it buys is everything that only exists while nothing is covering the
+    /// pointer — a hover state, an open popover — plus what-you-see-is-what-you-get,
+    /// since the pixels are decided before the user starts choosing rather than
+    /// after.
+    ///
+    /// Measured with `--selftest-hover-freeze`: a window that accepts mouse
+    /// events, ordered over the pointer, makes the app underneath drop its hover
+    /// immediately, and the selection overlay is necessarily such a window. So
+    /// the hover the user is trying to photograph is already gone by the time
+    /// they can draw a rect around it, and taking the picture earlier is the
+    /// only fix available.
+    var freezesScreen: Bool {
+        didSet { defaults.set(freezesScreen, forKey: Key.freezesScreen) }
     }
     var includeMenuBar: Bool {
         didSet { defaults.set(includeMenuBar, forKey: Key.includeMenuBar) }
@@ -216,6 +241,7 @@ final class Preferences {
             Key.previewTimeout: 6.0,
             Key.previewCorner: PreviewCorner.bottomRight.rawValue,
             Key.showsCursor: false,
+            Key.freezesScreen: false,
             Key.includeMenuBar: true,
             Key.includeChildWindows: false,
             Key.windowPadding: 32.0,
@@ -246,6 +272,7 @@ final class Preferences {
         previewCorner = defaults.string(forKey: Key.previewCorner)
             .flatMap(PreviewCorner.init(rawValue:)) ?? .bottomRight
         showsCursor = defaults.bool(forKey: Key.showsCursor)
+        freezesScreen = defaults.bool(forKey: Key.freezesScreen)
         includeMenuBar = defaults.bool(forKey: Key.includeMenuBar)
         includeChildWindows = defaults.bool(forKey: Key.includeChildWindows)
         windowPadding = defaults.double(forKey: Key.windowPadding)

@@ -443,6 +443,18 @@ struct CaptureSettingsView: View {
             }
 
             Section {
+                Toggle("Freeze the screen while selecting", isOn: $preferences.freezesScreen)
+            } footer: {
+                Text("""
+                    On, the screen is photographed the moment the shortcut fires and the area you draw is cut out of that photograph. It is the only way to capture something that disappears when the selection overlay appears — a hover state, an open popover — and it makes the picture exactly what you saw, not what the screen had moved on to by the time you confirmed.
+
+                    The cost is about a tenth of a second before the overlay appears, and tens of megabytes per display while it is up. Clicking a window still captures it live, and a frozen capture never includes the pointer.
+                    """)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
                 Toggle("Include attached sheets and panels",
                        isOn: $preferences.includeChildWindows)
                 LabeledContent("Padding") {

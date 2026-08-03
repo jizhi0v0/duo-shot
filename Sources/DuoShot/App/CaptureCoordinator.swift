@@ -68,12 +68,44 @@ final class CaptureCoordinator {
             return nil
         }
 
-        let outcome = await overlay.present(windows: engine.shareableContent.windows)
+        // Before the overlay, or there is no point. Everything freeze mode is for
+        // — a hover state, an open popover, a screen that is still moving — is
+        // gone the instant a window that accepts mouse events covers the pointer.
+        let frozen = Preferences.shared.freezesScreen ? await freezeEveryDisplay() : [:]
+
+        let outcome = await overlay.present(
+            windows: engine.shareableContent.windows, frozen: frozen)
 
         switch outcome {
         case .cancelled:
             overlay.tearDown()
             return nil
+
+        case .area(let displayID, let rect) where frozen[displayID] != nil:
+            lastArea = (displayID, rect)
+            defer { overlay.tearDown() }
+            guard let frame = frozen[displayID],
+                  let result = Self.crop(frame, to: rect, on: displayID)
+            else {
+                // The photograph is there and the crop still failed — a rect off
+                // the edge of its own display, which the model should not be able
+                // to produce. Fall through to a live capture rather than handing
+                // back nothing: a screenshot without the hover beats no
+                // screenshot at all.
+                Log.capture.error("frozen crop failed; falling back to a live capture")
+                var options = Preferences.shared.captureOptions
+                options.excludedWindowIDs = overlay.panelWindowIDs
+                    .union(additionalExcludedWindowIDs())
+                return await perform(
+                    .area(displayID: displayID, rectInAppKitGlobal: rect), options: options,
+                    afterCapture: { [overlay] in overlay.tearDown() })
+            }
+            // The overlay comes down before the output pipeline encodes, exactly
+            // as `perform` does it — the panels are not holding an exclusion list
+            // open here, so there is nothing to wait for.
+            overlay.tearDown()
+            await onResult?(result)
+            return result
 
         case .area(let displayID, let rect):
             // The panels are still on screen at this point, on purpose: their
@@ -200,6 +232,83 @@ final class CaptureCoordinator {
         var options = Preferences.shared.captureOptions
         options.excludedWindowIDs = additionalExcludedWindowIDs()
         return await perform(.window(target.id), options: options)
+    }
+
+    /// One whole-screen photograph per display, taken with nothing of ours on
+    /// screen.
+    ///
+    /// Sequential rather than concurrent: these are tens of megabytes each, and a
+    /// three-display machine kicking off three full-resolution SCK captures at
+    /// once is a spike in exactly the moment the user is waiting on.
+    ///
+    /// Cursorless, always, whatever the preference says. The live pointer keeps
+    /// moving over a frozen screen, so a photographed one would put two arrows on
+    /// screen at once — and the selection is drawn against this picture, so the
+    /// second arrow would be baked into the saved image wherever the pointer
+    /// happened to be at hotkey time.
+    private func freezeEveryDisplay() async -> [CGDirectDisplayID: BackdropCache.Frame] {
+        // `.default`, not `Preferences.captureOptions`, and the difference that
+        // matters is `includeMenuBar`. That preference is about what a *fullscreen*
+        // capture contains; these frames are only ever cropped for area
+        // selections, where the menu bar is simply part of the screen and comes
+        // out whenever the rect covers it. Inheriting the preference here would
+        // punch a hole in the frozen picture where the menu bar was.
+        var options = CaptureOptions.default
+        options.showsCursor = false
+        // The floating preview cards are ours and are on screen right now. The
+        // live path keeps them out of the shot the same way; a frozen frame that
+        // baked one in would carry it into every crop taken from it.
+        options.excludedWindowIDs = additionalExcludedWindowIDs()
+
+        var frames: [CGDirectDisplayID: BackdropCache.Frame] = [:]
+        for screen in NSScreen.screens {
+            guard let displayID = ScreenIndex.displayID(of: screen) else { continue }
+            do {
+                let shot = try await engine.capture(.display(displayID), options: options)
+                frames[displayID] = BackdropCache.Frame(
+                    image: shot.image, scale: shot.scale, covers: screen.frame)
+            } catch {
+                // One display failing is not a reason to lose the others: a
+                // display with no frozen frame simply takes the live path.
+                Log.capture.error("""
+                    could not freeze display \(displayID, privacy: .public): \
+                    \(error.localizedDescription, privacy: .public)
+                    """)
+            }
+        }
+        return frames
+    }
+
+    /// Cuts a selection out of a frozen frame.
+    ///
+    /// `nonisolated` and static so it is a pure function of its arguments — this
+    /// is the step where a y-flip or a scale can go wrong silently, producing a
+    /// picture of the wrong part of the screen that looks entirely plausible, so
+    /// it is worth being testable on its own.
+    nonisolated static func crop(
+        _ frame: BackdropCache.Frame, to rectInAppKitGlobal: CGRect,
+        on displayID: CGDirectDisplayID
+    ) -> CaptureResult? {
+        let pixels = DisplayGeometry.pixelRect(
+            ofAppKitGlobal: rectInAppKitGlobal, in: frame.covers, scale: frame.scale)
+        let bounds = CGRect(x: 0, y: 0, width: frame.image.width, height: frame.image.height)
+        let clamped = pixels.intersection(bounds)
+        guard clamped.width >= 1, clamped.height >= 1,
+              let cropped = frame.image.cropping(to: clamped)
+        else { return nil }
+        return CaptureResult(
+            image: cropped,
+            // From the crop that actually happened, not from the rect that was
+            // asked for: a selection running off the edge of the screen is
+            // clamped above, and a point size that disagreed with the pixels
+            // would put the wrong scale on the saved file.
+            pointSize: CGSize(width: clamped.width / frame.scale,
+                              height: clamped.height / frame.scale),
+            scale: frame.scale,
+            sourceDisplayID: displayID,
+            sourceDescription: "Area",
+            capturedAt: .now
+        )
     }
 
     /// `afterCapture` runs the moment the image is in hand and before anything is

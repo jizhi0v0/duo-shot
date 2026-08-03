@@ -272,6 +272,7 @@ test: verify
 	run "hud appearance"         --selftest-hud-appearance $(TEST_OUT); \
 	run "recording border"       --selftest-region-outline $(TEST_OUT); \
 	run "selection loupe"        --selftest-loupe $(TEST_OUT); \
+	run "freeze mode"            --selftest-freeze $(TEST_OUT); \
 	run "preview stack + scroll" --selftest-preview-stack $(TEST_OUT) --count 14; \
 	run "viewer window"          --selftest-viewer $(TEST_OUT); \
 	run "image editor"           --selftest-edit $(TEST_OUT); \

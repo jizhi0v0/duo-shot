@@ -73,7 +73,7 @@ enum DisplayGeometry {
     /// display, so the usual global pivot would be wrong by the offset between
     /// the two — invisible on a single-display machine and wildly wrong on a
     /// second screen above or below the first.
-    static func pixel(
+    nonisolated static func pixel(
         ofAppKitGlobal point: CGPoint, in covered: CGRect, scale: CGFloat
     ) -> CGPoint {
         CGPoint(
@@ -81,12 +81,37 @@ enum DisplayGeometry {
             y: (covered.maxY - point.y) * scale)
     }
 
+    /// AppKit global points -> the pixel rect to crop out of an image covering
+    /// `covered`.
+    ///
+    /// What freeze mode saves. It has to agree with `sourceRect` to the pixel —
+    /// the same selection must produce the same image whether it was cut out of
+    /// a photograph or captured live — so it snaps the rect the same way, before
+    /// the flip, and derives its size through the same `pixelSize`.
+    ///
+    /// The origin is the rect's **top-left**, because image rows run downwards
+    /// while AppKit's y runs up. Using minY here is the same off-by-its-own-height
+    /// mistake `flipped` warns about, and it survives every test written on a
+    /// square selection.
+    nonisolated static func pixelRect(
+        ofAppKitGlobal rect: CGRect, in covered: CGRect, scale: CGFloat
+    ) -> CGRect {
+        let snapped = rect.integral
+        let topLeft = pixel(
+            ofAppKitGlobal: CGPoint(x: snapped.minX, y: snapped.maxY),
+            in: covered, scale: scale)
+        let size = pixelSize(of: snapped, scale: scale)
+        return CGRect(
+            x: topLeft.x.rounded(), y: topLeft.y.rounded(),
+            width: CGFloat(size.width), height: CGFloat(size.height))
+    }
+
     /// Pixel dimensions for a points rect at a given scale.
     ///
     /// The scale must come from `SCContentFilter.pointPixelScale`, not
     /// `NSScreen.backingScaleFactor`: the former is what SCK will actually
     /// render at, and it is correct per-display on mixed-DPI setups.
-    static func pixelSize(of rect: CGRect, scale: CGFloat) -> (width: Int, height: Int) {
+    nonisolated static func pixelSize(of rect: CGRect, scale: CGFloat) -> (width: Int, height: Int) {
         (Int((rect.width * scale).rounded()), Int((rect.height * scale).rounded()))
     }
 }

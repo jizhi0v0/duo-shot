@@ -102,6 +102,8 @@ final class OverlayController {
         for (displayID, view) in zip(panelDisplayIDs, views) {
             guard let displayID else { continue }
             view.backdrop = backdrop.frame(for: displayID, showing: pointer)
+            // Nil unless frozen, so the live overlay stays transparent.
+            view.frozen = backdrop.isFrozen ? backdrop.baseFrame(for: displayID) : nil
         }
     }
 
@@ -191,9 +193,19 @@ final class OverlayController {
         Set(panels.map { CGWindowID($0.windowNumber) }).union(toolbar.windowIDs)
     }
 
+    /// Presents the selection UI.
+    ///
+    /// `frozen` is freeze mode: one whole-screen photograph per display, taken
+    /// *before* this was called and before anything of ours was on screen, which
+    /// is the entire point — a window that accepts mouse events kills the hover
+    /// state underneath it the moment it appears (measured, see
+    /// `--selftest-hover-freeze`), so a picture taken after this method runs can
+    /// never contain one. The views paint it under the dim and the caller cuts
+    /// the final image out of the same frames.
     func present(
         windows: [WindowInfo], suggestsWindows: Bool = true, requiresConfirmation: Bool = false,
-        toolbarStyle: SelectionToolbarView.Style = .record
+        toolbarStyle: SelectionToolbarView.Style = .record,
+        frozen: [CGDirectDisplayID: BackdropCache.Frame] = [:]
     ) async -> Outcome {
         if isPresenting { tearDown() }
         // A bar handed over by a previous presentation and never claimed would be
@@ -222,6 +234,10 @@ final class OverlayController {
             views.forEach { $0.refresh() }
             if isArmed { repositionToolbar() }
         }
+        // Before the panels exist, so the first paint already has the picture:
+        // seeding after they were on screen showed one live frame of the screen
+        // through the dim.
+        for (displayID, frame) in frozen { backdrop.seed(frame, for: displayID) }
         backdrop.onArrival = { [weak self] in self?.publishBackdrops() }
         model.onChange = refresh
         picker.onChange = refresh
@@ -580,6 +596,7 @@ final class OverlayController {
         // Tens of megabytes per display, and worthless to the next selection.
         backdrop.clear()
         views.forEach { $0.backdrop = nil }
+        views.forEach { $0.frozen = nil }
         for view in views { view.detachFromDisplayCycle() }
         for panel in panels { panel.orderOut(nil) }
         // Held one turn past the tear-down, the same way PreviewStackController

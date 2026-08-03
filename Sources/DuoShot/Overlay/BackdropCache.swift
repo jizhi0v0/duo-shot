@@ -94,6 +94,33 @@ final class BackdropCache {
     }
 
 
+    /// The whole-screen frame for a display, never a patch.
+    ///
+    /// What freeze mode shows and cuts from: a patch covers 160 pt around the
+    /// pointer, so handing one to either would paint — or save — a postage stamp.
+    func baseFrame(for displayID: CGDirectDisplayID) -> Frame? { frames[displayID] }
+
+    /// Installs frames captured before the overlay existed, for freeze mode.
+    ///
+    /// The same storage the loupe reads, deliberately: in freeze mode the loupe
+    /// must magnify the photograph the user is selecting against and not the live
+    /// screen behind it, or it would be answering a different question from every
+    /// other pixel on screen. Seeding also means `warm` finds the display already
+    /// filled and never re-takes it, which is what keeps the frozen picture
+    /// frozen.
+    func seed(_ frame: Frame, for displayID: CGDirectDisplayID) {
+        frames[displayID] = frame
+        isFrozen = true
+    }
+
+    /// Whether these frames were seeded rather than fetched — freeze mode.
+    ///
+    /// It turns off both refresh paths. A patch re-taken during a frozen
+    /// selection would put live pixels under the loupe while the rest of the
+    /// screen holds still, and the loupe is the one part of the UI whose job is
+    /// to tell you exactly what you are about to save.
+    private(set) var isFrozen = false
+
     /// Starts fetching `screen`'s frame if it is not already here or on its way.
     ///
     /// `capture` is injected rather than reached for: the overlay layer owns no
@@ -104,7 +131,8 @@ final class BackdropCache {
         using capture: @escaping Capture,
         excluding excludedWindowIDs: Set<CGWindowID>
     ) {
-        guard let displayID = ScreenIndex.displayID(of: screen),
+        guard !isFrozen,
+              let displayID = ScreenIndex.displayID(of: screen),
               frames[displayID] == nil,
               !inFlight.contains(displayID)
         else { return }
@@ -132,7 +160,8 @@ final class BackdropCache {
         around point: CGPoint, on screen: NSScreen,
         using capture: @escaping Capture, excluding excludedWindowIDs: Set<CGWindowID>
     ) {
-        guard !patchInFlight, let displayID = ScreenIndex.displayID(of: screen) else { return }
+        guard !isFrozen, !patchInFlight, let displayID = ScreenIndex.displayID(of: screen)
+        else { return }
         let side = Self.patchSide
         let wanted = CGRect(
             x: (point.x - side / 2).rounded(), y: (point.y - side / 2).rounded(),
@@ -161,5 +190,6 @@ final class BackdropCache {
         inFlight.removeAll()
         patch = nil
         patchInFlight = false
+        isFrozen = false
     }
 }

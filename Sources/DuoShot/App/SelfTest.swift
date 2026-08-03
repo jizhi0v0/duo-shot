@@ -60,6 +60,9 @@ enum SelfTest {
         /// Whether a hover state survives a capture starting, and whether a
         /// freeze at hotkey time would preserve it. A measurement, not a rule.
         case hoverFreeze
+        /// Freeze mode end to end: the crop's geometry, and the hover state it
+        /// exists to preserve, with the unfrozen path as the control.
+        case freeze(directory: URL)
         /// Pointer position -> pixel in a backdrop frame, including the offsets a
         /// second display introduces. Headless, and the only way to test them on
         /// a one-screen machine.
@@ -211,6 +214,13 @@ enum SelfTest {
                 self = .badgePlacement
             case "--selftest-hover-freeze":
                 self = .hoverFreeze
+            case "--selftest-freeze":
+                // The last phase photographs the overlay itself, which ships
+                // invisible to ScreenCaptureKit; without this it would come back
+                // showing the desktop and prove nothing.
+                OverlayPanel.usesSharingTypeNone = false
+                self = .freeze(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-pixel-mapping":
                 self = .pixelMapping
             case "--selftest-latch-cancel":
@@ -387,6 +397,7 @@ enum SelfTest {
             case .selectionZones: return selectionZonesCheck()
             case .badgePlacement: return try await badgePlacementCheck()
             case .hoverFreeze: return try await hoverFreezeCheck()
+            case .freeze(let d): return try await freezeCheck(into: d)
             case .pixelMapping: return pixelMappingCheck()
             case .latchCancel: return await latchCancelCheck()
             case .settingsWindow(let directory): return try await settingsWindow(into: directory)
@@ -5887,6 +5898,298 @@ enum SelfTest {
 
         print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.count) of the above")")
         return failures.isEmpty ? 0 : 1
+    }
+
+    // MARK: - Freeze mode
+
+    /// Freeze mode, end to end, through the shipping path.
+    ///
+    /// Two questions, and the second is the one the mode exists to answer.
+    ///
+    /// **Geometry.** A crop out of a photograph is a place where a y-flip or a
+    /// scale can be wrong and still produce a picture — of the wrong part of the
+    /// screen, at a plausible size. So four known colours are put in the four
+    /// quadrants of the selected rect and the saved image is asked which colour
+    /// is in which corner. A flip swaps two of them; an offset moves all four.
+    ///
+    /// **The hover.** The probe from `--selftest-hover-freeze` is hovered and
+    /// then captured through `captureInteractive()` — the real one, hotkey path
+    /// and all. Frozen, it has to come back green. The same capture with the
+    /// preference off is run as the negative control, because "green" only means
+    /// anything if the unfrozen path is measurably blue: if both were green the
+    /// test would be passing on a hover that never died in the first place.
+    private static func freezeCheck(into directory: URL) async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+        if let hint = LoginSession.noDisplaysHint {
+            FileHandle.standardError.write(Data("error: \(hint)\n".utf8))
+            return 2
+        }
+        guard let screen = NSScreen.main else { throw CaptureError.noDisplays }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        var failures: [String] = []
+        func check(_ condition: Bool, _ description: String) {
+            print("  \(condition ? "ok  " : "FAIL") \(description)")
+            if !condition { failures.append(description) }
+        }
+
+        let coordinator = CaptureCoordinator()
+        let overlay = coordinator.overlay
+        let previous = Preferences.shared.freezesScreen
+        defer { Preferences.shared.freezesScreen = previous }
+
+        /// The whole shipping path for one rect: freeze (or not), overlay, a
+        /// selection, a confirm. Deliberately not a call into the crop function —
+        /// a test that skipped `captureInteractive` would not notice the day the
+        /// preference stops being read.
+        func captureViaOverlay(_ rect: CGRect) async -> CaptureResult? {
+            let box = CaptureBox()
+            let done = CompletionFlag()
+            Task {
+                box.result = await coordinator.captureInteractive()
+                done.markDone()
+            }
+            // The freeze itself is a full-screen capture, so this waits for the
+            // overlay rather than assuming a fixed delay.
+            var waited = 0
+            while !overlay.isPresenting, waited < 5000 {
+                try? await Task.sleep(for: .milliseconds(50))
+                waited += 50
+            }
+            guard overlay.isPresenting else { return nil }
+            overlay.forceSelection(rect, on: screen)
+            try? await Task.sleep(for: .milliseconds(80))
+            overlay.confirmForTest()
+            _ = await done.wait(upTo: .seconds(10))
+            return box.result
+        }
+
+        // --- geometry ---------------------------------------------------------
+        let target = CGRect(
+            x: (screen.frame.midX - 160).rounded(), y: (screen.frame.midY - 160).rounded(),
+            width: 320, height: 320)
+        let corners: [(name: String, colour: NSColor, rect: CGRect)] = [
+            ("top-left", NSColor(srgbRed: 1, green: 0, blue: 0, alpha: 1),
+             CGRect(x: target.minX, y: target.midY, width: 160, height: 160)),
+            ("top-right", NSColor(srgbRed: 0, green: 1, blue: 0, alpha: 1),
+             CGRect(x: target.midX, y: target.midY, width: 160, height: 160)),
+            ("bottom-left", NSColor(srgbRed: 0, green: 0, blue: 1, alpha: 1),
+             CGRect(x: target.minX, y: target.minY, width: 160, height: 160)),
+            ("bottom-right", NSColor(srgbRed: 1, green: 1, blue: 0, alpha: 1),
+             CGRect(x: target.midX, y: target.minY, width: 160, height: 160)),
+        ]
+        var patches = corners.map { plainWindow(colour: $0.colour, frame: $0.rect) }
+        try await Task.sleep(for: .milliseconds(400))
+
+        Preferences.shared.freezesScreen = true
+        let frozen = await captureViaOverlay(target)
+        patches.forEach { $0.orderOut(nil) }
+        patches = []
+
+        if let frozen {
+            let scale = frozen.scale
+            check(abs(CGFloat(frozen.image.width) - target.width * scale) <= 1
+                    && abs(CGFloat(frozen.image.height) - target.height * scale) <= 1,
+                  "the crop is the selected rect's size: \(frozen.image.width)x\(frozen.image.height) px "
+                    + "for \(Int(target.width))x\(Int(target.height))pt at \(Int(scale))x")
+            // Image rows run downwards, so the image's top half is AppKit's
+            // higher y. Sampling well inside each quadrant, since the selection
+            // edge lands on the patch edge.
+            let half = CGFloat(frozen.image.width) / 2
+            let vHalf = CGFloat(frozen.image.height) / 2
+            let probes: [(String, CGRect)] = [
+                ("top-left", CGRect(x: half * 0.3, y: vHalf * 0.3, width: 20, height: 20)),
+                ("top-right", CGRect(x: half * 1.7, y: vHalf * 0.3, width: 20, height: 20)),
+                ("bottom-left", CGRect(x: half * 0.3, y: vHalf * 1.7, width: 20, height: 20)),
+                ("bottom-right", CGRect(x: half * 1.7, y: vHalf * 1.7, width: 20, height: 20)),
+            ]
+            for (name, region) in probes {
+                guard let mean = PixelCompare.meanColour(frozen.image, in: region) else {
+                    check(false, "\(name) could be sampled")
+                    continue
+                }
+                let nearest = corners.min {
+                    func distance(_ colour: NSColor) -> Double {
+                        guard let srgb = colour.usingColorSpace(.sRGB) else { return .infinity }
+                        let dr = mean.r - srgb.redComponent * 255
+                        let dg = mean.g - srgb.greenComponent * 255
+                        let db = mean.b - srgb.blueComponent * 255
+                        return dr * dr + dg * dg + db * db
+                    }
+                    return distance($0.colour) < distance($1.colour)
+                }
+                check(nearest?.name == name,
+                      "\(name) of the crop holds the \(name) colour"
+                        + (nearest?.name == name ? "" : " — got \(nearest?.name ?? "nothing")"))
+            }
+            try? ImageEncoder.write(
+                frozen.image, to: directory.appendingPathComponent("freeze-quadrants.png"),
+                as: .png, scale: frozen.scale)
+        } else {
+            check(false, "the frozen path produced an image")
+        }
+
+        // --- the hover, frozen and live --------------------------------------
+        let probeFrame = CGRect(
+            x: (screen.frame.midX - 150).rounded(), y: (screen.frame.midY - 100).rounded(),
+            width: 300, height: 200)
+        let probe = HoverProbeView(frame: CGRect(origin: .zero, size: probeFrame.size))
+        let window = NSWindow(
+            contentRect: probeFrame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = probe
+        window.isOpaque = true
+        window.hasShadow = false
+        window.level = .floating
+        window.orderFrontRegardless()
+        defer { window.orderOut(nil) }
+
+        let restore = NSEvent.mouseLocation
+        defer { CGWarpMouseCursorPosition(DisplayGeometry.flipped(restore)) }
+        let centre = CGPoint(x: probeFrame.midX, y: probeFrame.midY)
+
+        /// Re-establishes the hover and reports what a capture of the probe
+        /// contains, frozen or live.
+        func hoverThenCapture(freezing: Bool) async -> String {
+            Preferences.shared.freezesScreen = freezing
+            CGWarpMouseCursorPosition(DisplayGeometry.flipped(CGPoint(x: centre.x + 3, y: centre.y)))
+            try? await Task.sleep(for: .milliseconds(120))
+            CGWarpMouseCursorPosition(DisplayGeometry.flipped(centre))
+            try? await Task.sleep(for: .milliseconds(300))
+            guard probe.isHovered else { return "hover was never established" }
+            guard let shot = await captureViaOverlay(probeFrame.insetBy(dx: 20, dy: 20)),
+                  let mean = PixelCompare.meanColour(shot.image)
+            else { return "no capture" }
+            try? ImageEncoder.write(
+                shot.image,
+                to: directory.appendingPathComponent(
+                    freezing ? "freeze-hover-frozen.png" : "freeze-hover-live.png"),
+                as: .png, scale: shot.scale)
+            if mean.g > 128, mean.b < 128 { return "hovered (green)" }
+            if mean.b > 128, mean.g < 128 { return "not hovered (blue)" }
+            return "neither (r\(Int(mean.r)) g\(Int(mean.g)) b\(Int(mean.b)))"
+        }
+
+        let frozenHover = await hoverThenCapture(freezing: true)
+        check(frozenHover == "hovered (green)",
+              "frozen, the capture still holds the hover state — \(frozenHover)")
+        let liveHover = await hoverThenCapture(freezing: false)
+        check(liveHover == "not hovered (blue)",
+              "and unfrozen it does not, so the test above can fail — \(liveHover)")
+        window.orderOut(nil)
+
+        // --- what is on screen while choosing --------------------------------
+        //
+        // The crop being frozen is only half of it. If the overlay showed the
+        // live screen while cutting from a photograph, the user would be aiming
+        // at one picture and saving another — the exact failure the mode is
+        // supposed to remove. So: freeze, then *change* the screen underneath,
+        // then photograph the overlay itself. What it shows must be the old
+        // colour.
+        //
+        // This needs the panels visible to ScreenCaptureKit, which the argument
+        // parser arranges; they ship `.none` and a capture of them would come
+        // back showing the desktop.
+        let stageFrame = CGRect(
+            x: (screen.frame.midX - 120).rounded(), y: (screen.frame.midY - 120).rounded(),
+            width: 240, height: 240)
+        let stage = plainWindow(colour: NSColor(srgbRed: 1, green: 0, blue: 0, alpha: 1),
+                                frame: stageFrame)
+        defer { stage.orderOut(nil) }
+        try await Task.sleep(for: .milliseconds(400))
+
+        Preferences.shared.freezesScreen = true
+        let liveBox = CaptureBox()
+        let liveDone = CompletionFlag()
+        Task {
+            liveBox.result = await coordinator.captureInteractive()
+            liveDone.markDone()
+        }
+        // Timed at 5 ms granularity: the whole cost of this mode to the user is
+        // how long they stare at an unchanged screen after pressing the key, and
+        // the preference text quotes a number for it.
+        var frozenAppearance = ProcessInfo.processInfo.systemUptime
+        var waited = 0
+        while !overlay.isPresenting, waited < 5000 {
+            try await Task.sleep(for: .milliseconds(5))
+            waited += 5
+        }
+        frozenAppearance = (ProcessInfo.processInfo.systemUptime - frozenAppearance) * 1000
+        check(overlay.isPresenting, "the overlay came up over the frozen screen")
+
+        stage.backgroundColor = NSColor(srgbRed: 0, green: 0, blue: 1, alpha: 1)
+        stage.displayIfNeeded()
+        try await Task.sleep(for: .milliseconds(500))
+
+        var options = CaptureOptions.default
+        options.showsCursor = false
+        let onScreen = try? await coordinator.engine.capture(
+            .area(displayID: ScreenIndex.displayID(of: screen) ?? CGMainDisplayID(),
+                  rectInAppKitGlobal: stageFrame.insetBy(dx: 40, dy: 40)),
+            options: options)
+        if let onScreen, let mean = PixelCompare.meanColour(onScreen.image) {
+            let holdsOldColour = mean.r > mean.b
+            check(holdsOldColour,
+                  "the overlay is still showing the frozen screen, not the live one "
+                    + "(r\(Int(mean.r)) g\(Int(mean.g)) b\(Int(mean.b)); red was frozen, "
+                    + "blue is what the screen changed to)")
+            try? ImageEncoder.write(
+                onScreen.image, to: directory.appendingPathComponent("freeze-on-screen.png"),
+                as: .png, scale: onScreen.scale)
+        } else {
+            check(false, "the overlay could be photographed")
+        }
+
+        // What a pointer move costs while a whole screen of photograph is being
+        // repainted under the dim. Printed rather than asserted at a tight
+        // threshold — it is a property of this machine's display — but a frame
+        // budget blown by an order of magnitude is a bug, not a slow Mac.
+        func msPerPointerMove() -> Double {
+            let moves = 30
+            let start = ProcessInfo.processInfo.systemUptime
+            for step in 0..<moves {
+                overlay.forcePointerForTest(
+                    at: CGPoint(x: stageFrame.midX + CGFloat(step % 10) * 4,
+                                y: stageFrame.midY + CGFloat(step % 3)))
+            }
+            return (ProcessInfo.processInfo.systemUptime - start) / Double(moves) * 1000
+        }
+        let frozenCost = msPerPointerMove()
+        overlay.tearDown()
+        _ = await liveDone.wait(upTo: .seconds(5))
+
+        // The same loop over a live overlay. Without it the number above is
+        // uninterpretable: it would be impossible to tell a cheap image blit from
+        // a redraw that never happened.
+        Preferences.shared.freezesScreen = false
+        let baselineDone = CompletionFlag()
+        Task {
+            _ = await coordinator.captureInteractive()
+            baselineDone.markDone()
+        }
+        var liveAppearance = ProcessInfo.processInfo.systemUptime
+        waited = 0
+        while !overlay.isPresenting, waited < 5000 {
+            try await Task.sleep(for: .milliseconds(5))
+            waited += 5
+        }
+        liveAppearance = (ProcessInfo.processInfo.systemUptime - liveAppearance) * 1000
+        let liveCost = overlay.isPresenting ? msPerPointerMove() : .nan
+        overlay.tearDown()
+        _ = await baselineDone.wait(upTo: .seconds(5))
+
+        print(String(format: "  overlay appears after: %.0f ms frozen vs %.0f ms live",
+                     frozenAppearance, liveAppearance))
+        print(String(format: "  redraw per pointer move: %.2f ms frozen vs %.2f ms live",
+                     frozenCost, liveCost))
+        check(frozenCost < 33,
+              String(format: "a frozen redraw stays inside two frames (%.2f ms)", frozenCost))
+
+        print("result:        \(failures.isEmpty ? "PASS" : "FAIL — \(failures.count) of the above")")
+        return failures.isEmpty ? 0 : 1
+    }
+
+    private final class CaptureBox {
+        var result: CaptureResult?
     }
 
     // MARK: - Hover survival (the freeze experiment)

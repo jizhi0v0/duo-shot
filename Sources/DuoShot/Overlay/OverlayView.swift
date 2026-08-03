@@ -66,6 +66,24 @@ final class OverlayView: NSView {
         }
     }
 
+    /// The whole-screen photograph freeze mode selects against, or nil for the
+    /// live overlay.
+    ///
+    /// Painted first, under everything, so the dim and the rubber band land on a
+    /// picture that cannot change while the user is choosing. It is only ever the
+    /// *base* frame for this screen — a patch covers 160 pt and would paint a
+    /// postage stamp in the middle of a dimmed screen.
+    ///
+    /// Drawn rather than put in a sublayer or a subview: both of those composite
+    /// *above* a view's own drawing, which is the wrong order — the dim has to go
+    /// on top of the photograph, not under it.
+    var frozen: BackdropCache.Frame? {
+        didSet {
+            guard frozen != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
     /// The loupe's frame in this view's coordinates, or nil when it is hidden.
     var loupeFrameForTest: CGRect? { loupe.isHidden ? nil : loupe.frame }
 
@@ -508,6 +526,7 @@ final class OverlayView: NSView {
         // Only ever one of the two, and the rect wins — see `drawSuggestion`.
         let suggestion = hasHighlight ? nil : suggestionRect
 
+        drawFrozen(dirtyRect)
         NSColor(white: 0, alpha: 0.28).setFill()
         let path = NSBezierPath(rect: bounds)
         // Both holes are cut the same way, and the difference between "what you
@@ -674,6 +693,28 @@ final class OverlayView: NSView {
         NSBezierPath(roundedRect: box, xRadius: 7, yRadius: 7).fill()
         (text as NSString).draw(
             at: CGPoint(x: box.minX + 10, y: box.minY + 5), withAttributes: attributes)
+    }
+
+    /// The frozen screen, filling this view, under everything else.
+    ///
+    /// Only the dirty part is painted. The view marks its whole bounds dirty on
+    /// most refreshes, but AppKit does not always ask for all of it, and a
+    /// 5K-worth image draw is not something to do speculatively — clipping costs
+    /// one line and cannot be wrong.
+    ///
+    /// The image is drawn to `bounds` rather than to its pixel size: the frame
+    /// covers exactly this screen, so points are the right unit, and this is what
+    /// makes a 2x photograph land on a 2x screen at 1:1 instead of double size.
+    private func drawFrozen(_ dirtyRect: NSRect) {
+        guard let frozen, let context = NSGraphicsContext.current?.cgContext else { return }
+        context.saveGState()
+        context.clip(to: dirtyRect)
+        // No smoothing: at 1:1 there is nothing to interpolate, and asking for
+        // interpolation anyway is how a "frozen" screen ends up looking softer
+        // than the live one it replaced.
+        context.interpolationQuality = .none
+        context.draw(frozen.image, in: bounds)
+        context.restoreGState()
     }
 
     private static let badgeAttributes: [NSAttributedString.Key: Any] = [
