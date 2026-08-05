@@ -220,6 +220,34 @@ check-26:
 		&& echo "  OK -- builds against the older SDK" \
 		|| { echo "  FAILED -- see the errors above"; exit 1; }
 
+# Run the whole regression suite on the other machine, so it does not take over
+# the screen here.
+#
+# Three things have to be true and none of them is automatic:
+#   1. the bundle is signed *here* -- see test-only for why;
+#   2. it arrives with its signature intact, hence ditto and a zip rather than
+#      rsync, which does not preserve the bundle's extended attributes;
+#   3. whatever runs it over ssh holds Screen Recording. TCC attributes a
+#      shell-spawned process to its responsible ancestor, so the grant has to be
+#      on /usr/libexec/sshd-keygen-wrapper. Without it every capture test fails
+#      with `screen-capture-access: denied` and nothing else explains why.
+.PHONY: test-mini
+test-mini: verify
+	@echo "syncing to $(CHECK_HOST):$(CHECK_DIR)"
+	@rsync -az --delete \
+		--exclude '.build' --exclude 'build' --exclude '.git' --exclude 'dist' \
+		--exclude 'Worker/node_modules' --exclude 'Worker/.wrangler' \
+		./ "$(CHECK_HOST):$(CHECK_DIR)/"
+	@rm -f build/DuoShot.zip
+	@ditto -c -k --keepParent "$(APP)" build/DuoShot.zip
+	@ssh -o BatchMode=yes "$(CHECK_HOST)" 'mkdir -p $(CHECK_DIR)/build'
+	@scp -q build/DuoShot.zip "$(CHECK_HOST):$(CHECK_DIR)/build/"
+	@ssh -o BatchMode=yes "$(CHECK_HOST)" \
+		'cd $(CHECK_DIR)/build && rm -rf DuoShot.app && ditto -x -k DuoShot.zip . \
+		 && codesign --verify --strict DuoShot.app'
+	@echo "signature intact on $(CHECK_HOST); running the suite there"
+	@ssh -o BatchMode=yes "$(CHECK_HOST)" 'cd $(CHECK_DIR) && make test-only'
+
 selftest: verify
 	@"$(EXEC)" --selftest-permission || true
 	@"$(EXEC)" --selftest-capture build/selftest-fullscreen.png
@@ -239,7 +267,17 @@ selftest: verify
 # assertions cannot fail, so a "pass" would prove nothing.
 TEST_OUT := build/selftest-output
 .PHONY: test
-test: verify
+test: verify test-only
+
+# The same suite against a bundle that is already built and signed.
+#
+# Exists for the second machine. Signing cannot happen there: a non-interactive
+# ssh session cannot reach the keychain, so `verify` dies with
+# errSecInternalComponent -- and running the suite on the machine the developer
+# is working at takes over their screen for two minutes. So: sign here, ship the
+# bundle with `make test-mini`, and run this on the other end.
+.PHONY: test-only
+test-only:
 	@mkdir -p $(TEST_OUT)
 	@set -e; \
 	fail=0; incon=0; \
