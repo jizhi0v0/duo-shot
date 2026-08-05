@@ -192,6 +192,143 @@ enum PixelCompare {
         return (sum.r / count, sum.g / count, sum.b / count)
     }
 
+    /// Whether an image came back with nothing in it at all — every pixel
+    /// transparent and black.
+    ///
+    /// The one thing a window capture can reliably say about itself without
+    /// knowing what it was supposed to contain. A screenshot of a window that
+    /// is on screen is never legitimately empty, whatever produced the emptiness,
+    /// so this is a sound trigger for "try the other way round" — see
+    /// `CaptureEngine.captureIsolated`.
+    ///
+    /// Answered from a 64×64 downscale rather than the real bitmap: the source
+    /// can be a 5K window, and this runs on every window capture. Averaging is
+    /// deliberate — content anywhere in the frame lifts *some* output pixel off
+    /// zero, where point-sampling a grid could fall between the glyphs. The
+    /// failure it can have is calling a nearly-empty image blank, which costs
+    /// one extra capture and nothing else.
+    nonisolated static func isBlank(_ image: CGImage) -> Bool {
+        let side = 64
+        var pixels = [UInt8](repeating: 0, count: side * side * 4)
+        let drawn = pixels.withUnsafeMutableBytes { raw -> Bool in
+            guard let context = CGContext(
+                data: raw.baseAddress,
+                width: side, height: side,
+                bitsPerComponent: 8, bytesPerRow: side * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return false }
+            context.interpolationQuality = .medium
+            context.draw(image, in: CGRect(x: 0, y: 0, width: side, height: side))
+            return true
+        }
+        // Could not rasterise: say "not blank", so a failure here can never
+        // trigger the retry path on an image nobody has actually looked at.
+        guard drawn else { return false }
+        return pixels.allSatisfy { $0 == 0 }
+    }
+
+    /// Mean alpha of the pixels that are more than half opaque, 0–255, and how
+    /// many there are.
+    ///
+    /// Instrumentation, not a rule. "Is the window translucent" was asked three
+    /// times about this popup and answered three different ways from outside the
+    /// app — every capture taken by a probe came back solid while the saved file
+    /// showed the wallpaper through the panel. Guessing at the difference had
+    /// run out of road, so the number is taken on the real path instead, from
+    /// the image the compositor is actually handed.
+    ///
+    /// Measured on the same 64×64 downscale as `isBlank`, so it costs the same
+    /// nothing and, being an average, it cannot report a solid panel as
+    /// translucent by landing between glyphs.
+    nonisolated static func bodyOpacity(_ image: CGImage) -> (pixels: Int, meanAlpha: Int) {
+        let side = 64
+        var pixels = [UInt8](repeating: 0, count: side * side * 4)
+        let drawn = pixels.withUnsafeMutableBytes { raw -> Bool in
+            guard let context = CGContext(
+                data: raw.baseAddress, width: side, height: side,
+                bitsPerComponent: 8, bytesPerRow: side * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return false }
+            context.interpolationQuality = .medium
+            context.draw(image, in: CGRect(x: 0, y: 0, width: side, height: side))
+            return true
+        }
+        guard drawn else { return (0, -1) }
+        var count = 0, sum = 0
+        for index in stride(from: 0, to: pixels.count, by: 4) where pixels[index + 3] > 128 {
+            count += 1
+            sum += Int(pixels[index + 3])
+        }
+        return (count, count > 0 ? sum / count : 0)
+    }
+
+    /// The part of an image that was actually drawn, in image pixels, or nil
+    /// when that is the whole image (or none of it).
+    ///
+    /// A window's frame is not the same thing as what the window puts on screen.
+    /// Measured 2026-08-04 on DuoUpdater's popup: the window is 360×217 pt and
+    /// the panel inside it is 258×173, leaving 80 pt of nothing down the right
+    /// edge — which a screenshot then framed, and DuoShot's own padding framed
+    /// again. An ordinary window has no such border: every Finder window
+    /// measured came back drawn edge to edge, which is why this can be applied
+    /// unconditionally.
+    ///
+    /// Alpha zero exactly, not "nearly transparent": the rule is *never drawn*,
+    /// so the faintest edge of a shadow or an antialiased corner keeps its
+    /// column. Anything looser would start cropping picture.
+    ///
+    /// Measured on a downscale, and rounded **outward** — a capture can be 15
+    /// megapixels and this runs on the main thread. The error is therefore
+    /// always a few leftover transparent pixels, never a cropped glyph.
+    nonisolated static func opaqueBounds(_ image: CGImage) -> CGRect? {
+        let long = max(image.width, image.height)
+        guard long > 0 else { return nil }
+        let divisor = max(1, Int((Double(long) / 256).rounded(.up)))
+        let width = max(1, image.width / divisor)
+        let height = max(1, image.height / divisor)
+
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let drawn = pixels.withUnsafeMutableBytes { raw -> Bool in
+            guard let context = CGContext(
+                data: raw.baseAddress,
+                width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return false }
+            context.interpolationQuality = .medium
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard drawn else { return nil }
+
+        var minX = width, maxX = -1, minY = height, maxY = -1
+        for y in 0..<height {
+            for x in 0..<width where pixels[(y * width + x) * 4 + 3] > 0 {
+                minX = min(minX, x); maxX = max(maxX, x)
+                minY = min(minY, y); maxY = max(maxY, y)
+            }
+        }
+        guard maxX >= 0 else { return nil }
+
+        // One cell of slack on every side, then back to image pixels. The
+        // context is bottom-up, so the y range flips on the way out.
+        let scaleX = Double(image.width) / Double(width)
+        let scaleY = Double(image.height) / Double(height)
+        let left = max(0, Int((Double(minX) - 1) * scaleX))
+        let right = min(image.width, Int((Double(maxX) + 2) * scaleX.rounded(.up)))
+        let bottom = max(0, Int((Double(minY) - 1) * scaleY))
+        let top = min(image.height, Int((Double(maxY) + 2) * scaleY.rounded(.up)))
+        let rect = CGRect(x: left, y: image.height - top,
+                          width: right - left, height: top - bottom)
+        guard rect.width >= 1, rect.height >= 1,
+              rect != CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        else { return nil }
+        return rect
+    }
+
     /// Alpha at one pixel, 0–255, with the origin at the **top** left.
     ///
     /// `normalized` draws into a bottom-up context, so its first row is the

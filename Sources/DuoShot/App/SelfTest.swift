@@ -2348,11 +2348,17 @@ enum SelfTest {
 
         let furnitureOK = try await systemFurnitureIsPickable(coordinator, all)
         let opacityOK = try await invisibleWindowsAreNotPickable(coordinator)
+        let popupOK = try await popupPanelsArePickable(coordinator)
         let (clickAdoptsOK, dragOverridesOK) = try await mergedGestures(coordinator, all)
         let instantOK = try await instantWindowCapture(coordinator)
         try await photographSuggestion(coordinator, all, into: directory)
 
         let childOK = try await childWindowIsolation()
+        let emptyParentOK = try await emptyParentCapturesItsChild()
+        let trimOK = try await transparentBorderIsTrimmed()
+        let popupSurvivalOK = try await overlayDoesNotDismissPopups(coordinator, all)
+        let frozenPickerOK = try await frozenPickerIgnoresLateWindows(coordinator)
+        let shadowHostOK = try await shadowHostsAreNotOffered(coordinator)
 
         // Geometry: capture the largest window and check the pixel size against
         // its frame. Also compare ignoreShadows on/off, which is the setting
@@ -2421,11 +2427,12 @@ enum SelfTest {
         // the capture: the backdrop is aspect-filled, so a tall one keeps the
         // wallpaper's top edge and a wide one crops it away. That is what made
         // it look intermittent, and it is exactly what a pixel test would miss.
-        let backdropFilter = coordinator.engine.shareableContent
-            .wallpaperFilter(for: padded.sourceDisplayID)
-        let menuBarOK = backdropFilter?.includeMenuBar == false
+        let backdropFilter = await DesktopWallpaper.filterForTest(for: padded.sourceDisplayID)
+        var menuBarOK = backdropFilter?.includeMenuBar == false
         print("backdrop:      menu bar excluded=\(menuBarOK) "
             + "\(backdropFilter == nil ? "(no filter — cannot tell)" : "")")
+        let wallpaperOK = await backdropIsTheWallpaper(coordinator, padded.sourceDisplayID)
+        menuBarOK = menuBarOK && wallpaperOK
 
         let shadowOK = paddingCastsAShadow()
         let cardOK = paddingFollowsTheWindowCurve()
@@ -2445,7 +2452,12 @@ enum SelfTest {
         let pass = selfLeaked == 0 && hits == tested && tested > 0 && geometryOK && suppressionOK
             && clickAdoptsOK && dragOverridesOK && instantOK
             && inversions.isEmpty && frontmostOK && recoveredOK && appearedOK && paddingOK
-            && childOK && shadowOK && ownWindowOK && cardOK && menuBarOK && furnitureOK && opacityOK
+            && childOK && emptyParentOK && trimOK && popupSurvivalOK && frozenPickerOK && shadowHostOK
+            && shadowOK && ownWindowOK
+            && cardOK
+            && menuBarOK
+            && furnitureOK && opacityOK
+            && popupOK
         print("result:        \(pass ? "PASS" : "FAIL")")
         return pass ? 0 : 1
     }
@@ -2539,6 +2551,72 @@ enum SelfTest {
         return ok
     }
 
+    /// A menu-bar app's popup panel is pickable; the layer above it still is not.
+    ///
+    /// `MenuBarExtra`'s window style, and `NSPopover` anchored to a status item,
+    /// put their panel at `.popUpMenu` (101) — measured 2026-08-04 on DuoUpdater:
+    /// layer 101, alpha 1.00, 510×367. The picker's allowlist stopped at the
+    /// modal-panel layer (8) plus the Dock and the menu bar, so every one of
+    /// those popups was dropped with "layer 101" and the hover fell through to
+    /// the maximized window behind it. Reported as "window screenshot does not
+    /// work on this kind of menu popup".
+    ///
+    /// Not a one-sided assertion: this is an allowlist, and widening it is only
+    /// correct if it stays one. The control is a second panel one level up, at
+    /// `.overlay` (102) — same size, same opacity, same instant — which must
+    /// still be refused. Without it, deleting `isPickable(layer:)` outright
+    /// would pass.
+    private static func popupPanelsArePickable(
+        _ coordinator: CaptureCoordinator
+    ) async throws -> Bool {
+        func panel(level: NSWindow.Level, x: CGFloat) -> NSWindow {
+            let window = NSWindow(
+                contentRect: CGRect(x: x, y: 300, width: 300, height: 300),
+                styleMask: [.borderless], backing: .buffered, defer: false)
+            window.backgroundColor = .magenta
+            window.level = level
+            window.orderFrontRegardless()
+            return window
+        }
+        let popup = panel(level: .popUpMenu, x: 120)
+        let above = panel(level: .init(rawValue: NSWindow.Level.popUpMenu.rawValue + 1), x: 520)
+        defer {
+            popup.orderOut(nil)
+            above.orderOut(nil)
+        }
+
+        try await Task.sleep(for: .milliseconds(500))
+        try await coordinator.engine.refreshContent()
+        let windows = coordinator.engine.shareableContent.windows
+
+        let presentation = Task {
+            await coordinator.overlay.present(windows: windows)
+        }
+        try await Task.sleep(for: .milliseconds(400))
+        let pickable = coordinator.overlay.pickableWindowIDs
+        coordinator.overlay.tearDown()
+        presentation.cancel()
+        try await Task.sleep(for: .milliseconds(200))
+
+        // A panel this test put up itself and cannot find in the enumeration
+        // makes the run say nothing rather than pass: the assertion below would
+        // be trivially satisfied by an empty `pickable` set.
+        let enumerated = Set(windows.map(\.id))
+        guard enumerated.contains(CGWindowID(popup.windowNumber)),
+              enumerated.contains(CGWindowID(above.windowNumber))
+        else {
+            print("popup panels:  not enumerated — cannot tell")
+            return true
+        }
+
+        let popupOffered = pickable.contains(CGWindowID(popup.windowNumber))
+        let aboveOffered = pickable.contains(CGWindowID(above.windowNumber))
+        let ok = popupOffered && !aboveOffered
+        print("popup panels:  popUpMenu(101) pickable=\(popupOffered), "
+            + "one level above pickable=\(aboveOffered) -> \(ok ? "OK" : "FAIL")")
+        return ok
+    }
+
     /// The menu bar and the Dock are pickable, and the Dock is cut down to size.
     ///
     /// Both are ordinary screenshot targets that the picker used to refuse. The
@@ -2568,7 +2646,16 @@ enum SelfTest {
         }
         // Well inside the screen, so the 120×80 drag below has room and the
         // point is over whatever is stacked in the middle of the display.
-        let anchor = CGPoint(x: screen.frame.midX - 60, y: screen.frame.midY - 40)
+        //
+        // Rounded, because `SelectionModel` snaps the selection to whole points
+        // (`.integral`) and a half-point anchor makes an exact size unreachable:
+        // on a 1117-tall display `midY - 40` is 518.5, so a drag of exactly 80
+        // covers 518…599 — 81 points, off by exactly the tolerance below, and
+        // this test was permanently red on odd-height screens for a rounding the
+        // app is right to do. Snapping is the correct behaviour; asking for it
+        // from a fractional origin is not a question with a clean answer.
+        let anchor = CGPoint(x: (screen.frame.midX - 60).rounded(),
+                             y: (screen.frame.midY - 40).rounded())
 
         // MARK: click
         let clickBox = OutcomeBox()
@@ -2922,6 +3009,389 @@ enum SelfTest {
                 roundedRect: bounds.insetBy(dx: 24, dy: 24), xRadius: 12, yRadius: 12
             ).fill()
         }
+    }
+
+    /// The padding backdrop is the wallpaper — not black, and not the desktop.
+    ///
+    /// `DesktopWallpaper` used to get it by excluding every running application,
+    /// on the premise that the wallpaper is what remains. It is not: the
+    /// wallpaper is drawn by an application too, so the grab came back
+    /// completely black, every time, and the padding had always been a flat
+    /// fill. The same filter had a second failure mode — an enumeration that
+    /// momentarily reported no applications excluded nothing, and the padding
+    /// became a shrunken photograph of the whole desktop, windows and all.
+    /// Reported 2026-08-05 as "the wallpaper has never worked, and the padding
+    /// is inconsistent".
+    ///
+    /// Both failures are caught here, and they need different assertions:
+    ///
+    /// - *black* — mean luminance. The one blind spot is a wallpaper that
+    ///   really is black, which would read as the bug; it is called out in the
+    ///   printout rather than silently tolerated, because a rule that cannot
+    ///   fail is worth nothing and this one at least fails loudly.
+    /// - *the desktop* — a window of a colour nothing else on screen has. If it
+    ///   is in the backdrop, the filter let windows through.
+    private static func backdropIsTheWallpaper(
+        _ coordinator: CaptureCoordinator, _ displayID: CGDirectDisplayID
+    ) async -> Bool {
+        let marker = NSWindow(
+            contentRect: CGRect(x: 150, y: 150, width: 500, height: 400),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        marker.backgroundColor = .magenta
+        marker.level = .floating
+        marker.orderFrontRegardless()
+        defer { marker.orderOut(nil) }
+        try? await Task.sleep(for: .milliseconds(300))
+
+        // The cache holds an image for 30 s, and an earlier test in this run has
+        // very likely already filled it.
+        coordinator.engine.invalidateWallpaper()
+        guard let backdrop = await coordinator.engine.wallpaperBackdrop(for: displayID) else {
+            print("backdrop:      no wallpaper image — cannot tell")
+            return true
+        }
+
+        let magenta = PixelCompare.count(backdrop, matching: PixelCompare.isDebugMagenta)
+        let luma = PixelCompare.meanLuminance(backdrop) ?? -1
+        let notBlack = luma >= 1
+        let noWindows = magenta == 0
+        let ok = notBlack && noWindows
+        print("backdrop:      mean luma \(String(format: "%.1f", luma)), "
+            + "\(magenta) px of a floating window -> \(ok ? "OK" : "FAIL")"
+            + (notBlack ? "" : " (all black — or the wallpaper really is black)"))
+        return ok
+    }
+
+    /// A shadow host is not offered; a window that merely overlaps still is.
+    ///
+    /// `MenuBarExtra` puts a popup on screen as two windows, the outer one the
+    /// inner one grown by the same margin on all four sides. Both were offered,
+    /// so which one a click landed on was luck — and the outer one frames the
+    /// panel in a wide dark surround. Measured 2026-08-05 on DuoUpdater: inner
+    /// 360×217 with 214×129 of solid content, outer 510×367 with 361×217, and
+    /// margins of exactly 75 points on every side.
+    ///
+    /// Three windows here, not two, because the rule has to be shown to be
+    /// narrow: the uniform wrapper must go, and a lopsided one — same app, same
+    /// layer, also enclosing — must stay. A rule that dropped both would make
+    /// ordinary windows unpickable for containing a palette.
+    private static func shadowHostsAreNotOffered(
+        _ coordinator: CaptureCoordinator
+    ) async throws -> Bool {
+        func panel(_ rect: CGRect, _ colour: NSColor) -> NSWindow {
+            let window = NSWindow(
+                contentRect: rect, styleMask: [.borderless],
+                backing: .buffered, defer: false)
+            window.backgroundColor = colour
+            window.level = .popUpMenu
+            window.orderFrontRegardless()
+            return window
+        }
+        let inner = CGRect(x: 400, y: 400, width: 200, height: 150)
+        let panelInner = panel(inner, .systemPink)
+        // Same margin on all four sides: a shadow host.
+        let uniform = panel(inner.insetBy(dx: -60, dy: -60), .systemBlue)
+        // Encloses it too, but lopsidedly — must survive.
+        let lopsided = panel(
+            CGRect(x: inner.minX - 20, y: inner.minY - 90,
+                   width: inner.width + 200, height: inner.height + 140), .systemGreen)
+        defer { [panelInner, uniform, lopsided].forEach { $0.orderOut(nil) } }
+
+        try await Task.sleep(for: .milliseconds(500))
+        try await coordinator.engine.refreshContent()
+        let windows = coordinator.engine.shareableContent.windows
+
+        let presentation = Task { await coordinator.overlay.present(windows: windows) }
+        try await Task.sleep(for: .milliseconds(400))
+        let pickable = coordinator.overlay.pickableWindowIDs
+        coordinator.overlay.tearDown()
+        presentation.cancel()
+        try await Task.sleep(for: .milliseconds(200))
+
+        let enumerated = Set(windows.map(\.id))
+        let ids = [panelInner, uniform, lopsided].map { CGWindowID($0.windowNumber) }
+        guard ids.allSatisfy(enumerated.contains) else {
+            print("shadow host:   not all three enumerated — cannot tell")
+            return true
+        }
+
+        let innerOffered = pickable.contains(ids[0])
+        let uniformOffered = pickable.contains(ids[1])
+        let lopsidedOffered = pickable.contains(ids[2])
+        let ok = innerOffered && !uniformOffered && lopsidedOffered
+        print("shadow host:   inner=\(innerOffered) uniform wrapper=\(uniformOffered) "
+            + "lopsided=\(lopsidedOffered) -> \(ok ? "OK" : "FAIL")")
+        return ok
+    }
+
+    /// Under freeze mode the picker must not offer a window the photograph does
+    /// not contain.
+    ///
+    /// The overlay re-enumerates every ~0.5 s so that a dialog opened while the
+    /// picker is up can still be picked. That is right for a live overlay and
+    /// wrong for a frozen one: the user is looking at a still image taken before
+    /// any of it happened, so a window that appeared afterwards is a highlight
+    /// over blank screen, and a capture of something never seen.
+    ///
+    /// Reported 2026-08-05 against Surge's menu — hovering opened a submenu
+    /// behind the frozen picture, and its outline was offered. Reachable only
+    /// once the overlay stopped taking key status; before that the menu was
+    /// dead before it could open anything.
+    ///
+    /// The control is the same window in the same place with freeze **off**,
+    /// which must still be offered: the fix is "stop following a screen that is
+    /// not moving", not "stop following the screen".
+    private static func frozenPickerIgnoresLateWindows(
+        _ coordinator: CaptureCoordinator
+    ) async throws -> Bool {
+        func offeredWhenAppearingLate(frozen: Bool) async throws -> Bool {
+            try await coordinator.engine.refreshContent()
+            let windows = coordinator.engine.shareableContent.windows
+            var frames: [CGDirectDisplayID: BackdropCache.Frame] = [:]
+            if frozen, let screen = NSScreen.main,
+               let displayID = ScreenIndex.displayID(of: screen),
+               let result = try? await coordinator.engine.capture(.display(displayID)) {
+                frames[displayID] = BackdropCache.Frame(
+                    image: result.image, scale: result.scale, covers: screen.frame)
+            }
+
+            let presentation = Task {
+                await coordinator.overlay.present(windows: windows, frozen: frames)
+            }
+            try await Task.sleep(for: .milliseconds(300))
+
+            // Only now — after the photograph and after the overlay is up.
+            let late = NSWindow(
+                contentRect: CGRect(x: 200, y: 500, width: 320, height: 240),
+                styleMask: [.borderless], backing: .buffered, defer: false)
+            late.backgroundColor = .systemTeal
+            late.level = .popUpMenu
+            late.orderFrontRegardless()
+
+            // Long enough for the re-enumeration, which runs at a quarter of the
+            // 120 ms poll: a shorter wait would report "not offered" for every
+            // run and pass whatever the code did.
+            try await Task.sleep(for: .milliseconds(1200))
+            let offered = coordinator.overlay.pickableWindowIDs.contains(
+                CGWindowID(late.windowNumber))
+
+            coordinator.overlay.tearDown()
+            presentation.cancel()
+            late.orderOut(nil)
+            try await Task.sleep(for: .milliseconds(200))
+            return offered
+        }
+
+        let liveOffered = try await offeredWhenAppearingLate(frozen: false)
+        let frozenOffered = try await offeredWhenAppearingLate(frozen: true)
+
+        // A run where the live control never picked it up says nothing about the
+        // frozen one — the re-enumeration simply did not land.
+        guard liveOffered else {
+            print("frozen picker: live control never offered the late window — cannot tell")
+            return true
+        }
+        let ok = !frozenOffered
+        print("frozen picker: late window offered live=\(liveOffered) frozen=\(frozenOffered) "
+            + "-> \(ok ? "OK" : "FAIL")")
+        return ok
+    }
+
+    /// Raising the overlay must not close a window that dismisses on losing key.
+    ///
+    /// Which is every menu-bar popup: `MenuBarExtra`'s window style and an
+    /// `NSPopover` on a status item both close when they resign key, and those
+    /// are exactly what a window screenshot of a popup has to survive.
+    ///
+    /// Measured 2026-08-05 with `Scripts/popup-key-probe.swift` — the overlay's
+    /// panel recipe, raised over a real popup, differing only in `canBecomeKey`:
+    ///
+    ///     canBecomeKey = false -> survived 1500 ms, 3 of 3
+    ///     canBecomeKey = true  -> died in 0-50 ms,  3 of 3
+    ///
+    /// Reported as "sometimes the window under the pointer can be picked and
+    /// sometimes not": the picker offered the popup, and one poll tick later it
+    /// was gone from the window server and the hover fell through to the
+    /// maximized window behind it.
+    ///
+    /// The stand-in closes itself on `windowDidResignKey`, so it fails for the
+    /// reported reason rather than for any reason at all — a window that merely
+    /// vanished would pass a test that only asked "is it still there".
+    private static func overlayDoesNotDismissPopups(
+        _ coordinator: CaptureCoordinator, _ windows: [WindowInfo]
+    ) async throws -> Bool {
+        final class DismissingPanel: NSPanel, NSWindowDelegate {
+            var resignedKey = false
+            // Borderless windows answer `false` by default — which is exactly
+            // why `OverlayPanel` has to override it, and why the stand-in has to
+            // as well or it never becomes key and the test measures nothing.
+            override var canBecomeKey: Bool { true }
+            func windowDidResignKey(_ notification: Notification) {
+                resignedKey = true
+                orderOut(nil)
+            }
+        }
+
+        let popup = DismissingPanel(
+            contentRect: CGRect(x: 300, y: 300, width: 320, height: 240),
+            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        popup.delegate = popup
+        popup.backgroundColor = .magenta
+        // The same two flags `OverlayPanel` sets, and they are what make a
+        // non-activating panel able to hold key status while the application
+        // itself is in the background — which is the state a menu-bar popup is
+        // in, and without them the stand-in never becomes key at all.
+        popup.isFloatingPanel = true
+        popup.becomesKeyOnlyIfNeeded = false
+        popup.level = .popUpMenu
+        popup.hidesOnDeactivate = false
+        // The stand-in has to *hold* key status, or losing it proves nothing —
+        // and a `.accessory` application's panel does not become key while the
+        // application is in the background.
+        NSApp.activate(ignoringOtherApps: true)
+        popup.orderFrontRegardless()
+        popup.makeKeyAndOrderFront(nil)
+        defer { popup.orderOut(nil) }
+
+        try await Task.sleep(for: .milliseconds(300))
+        guard popup.isVisible, popup.isKeyWindow else {
+            print("popup survival: stand-in is visible=\(popup.isVisible) "
+                + "key=\(popup.isKeyWindow) before the overlay — cannot tell")
+            return true
+        }
+
+        let presentation = Task { await coordinator.overlay.present(windows: windows) }
+        try await Task.sleep(for: .milliseconds(600))
+        let survived = popup.isVisible && !popup.resignedKey
+        coordinator.overlay.tearDown()
+        presentation.cancel()
+        try await Task.sleep(for: .milliseconds(200))
+
+        print("popup survival: still open=\(popup.isVisible) resignedKey=\(popup.resignedKey) "
+            + "-> \(survived ? "OK" : "FAIL")")
+        return survived
+    }
+
+    /// A window capture must not frame a border the window never drew.
+    ///
+    /// Measured 2026-08-04 on DuoUpdater's popup: a 360×217 pt window with a
+    /// 258×173 pt panel inside it, 80 pt of nothing down the right edge — then
+    /// the padding preference framed that again. Reported as "the window
+    /// screenshot keeps the big padding".
+    ///
+    /// The window here draws a known rect inside a larger frame, so the check is
+    /// on the *size* of the result and not on "it got smaller": trimming to the
+    /// wrong box is a different bug with the same direction of travel. The
+    /// tolerance is a few points because `opaqueBounds` deliberately rounds
+    /// outward — see its note on why erring that way is the safe error.
+    private static func transparentBorderIsTrimmed() async throws -> Bool {
+        let engine = CaptureEngine()
+        let frame = CGSize(width: 400, height: 300)
+        let ink = CGSize(width: 180, height: 120)
+
+        final class InkView: NSView {
+            let ink: CGSize
+            init(frame: CGRect, ink: CGSize) {
+                self.ink = ink
+                super.init(frame: frame)
+            }
+            required init?(coder: NSCoder) { fatalError() }
+            override func draw(_ dirtyRect: NSRect) {
+                NSColor.systemOrange.setFill()
+                CGRect(x: 40, y: 60, width: ink.width, height: ink.height).fill()
+            }
+        }
+
+        let window = NSWindow(
+            contentRect: CGRect(origin: CGPoint(x: 700, y: 600), size: frame),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        window.backgroundColor = .clear
+        window.isOpaque = false
+        window.hasShadow = false
+        window.contentView = InkView(
+            frame: CGRect(origin: .zero, size: frame), ink: ink)
+        window.level = .floating
+        window.orderFrontRegardless()
+        defer { window.orderOut(nil) }
+
+        try await Task.sleep(for: .milliseconds(400))
+        try await engine.refreshContent()
+
+        let result = try await engine.capture(
+            .window(CGWindowID(window.windowNumber)), options: .default)
+        let off = max(abs(result.pointSize.width - ink.width),
+                      abs(result.pointSize.height - ink.height))
+        let ok = off <= 6
+        print("trimmed border: \(Int(frame.width))x\(Int(frame.height)) pt window, "
+            + "\(Int(ink.width))x\(Int(ink.height)) pt drawn -> "
+            + "\(Int(result.pointSize.width))x\(Int(result.pointSize.height)) pt "
+            + "\(ok ? "OK" : "MISMATCH")")
+        return ok
+    }
+
+    /// The mirror case: a window whose own surface is empty and whose content is
+    /// all in a child must not capture as a blank rectangle.
+    ///
+    /// `childWindowIsolation` below pins down why `includeChildWindows` is off.
+    /// This pins down what that costs, because the two windows are the same two
+    /// windows seen from opposite ends: picking the *child* must not drag the
+    /// parent in, and picking the *parent* must not throw the child away.
+    ///
+    /// Not a hypothetical shape. Measured 2026-08-04 on DuoUpdater's menu-bar
+    /// popup and reproduced on ClaudeUsageMenuBar's: with children excluded the
+    /// file was 0.0% non-black — a pure black rectangle where a panel full of
+    /// text, app icons and buttons should have been.
+    ///
+    /// Asserts on the child's colour, not on "the image is not blank": a capture
+    /// that came back as some *other* window's pixels would also be non-blank,
+    /// and that is not a pass.
+    private static func emptyParentCapturesItsChild() async throws -> Bool {
+        let engine = CaptureEngine()
+
+        // No background and nothing drawn: the window server has an empty
+        // surface for this one, which is the whole point.
+        let parent = NSWindow(
+            contentRect: CGRect(x: 700, y: 200, width: 400, height: 300),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        parent.backgroundColor = .clear
+        parent.isOpaque = false
+        parent.hasShadow = false
+        parent.level = .popUpMenu
+        parent.orderFrontRegardless()
+
+        let child = NSWindow(
+            contentRect: CGRect(x: 750, y: 250, width: 300, height: 200),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        child.backgroundColor = .green
+        child.level = .popUpMenu
+        parent.addChildWindow(child, ordered: .above)
+
+        defer {
+            parent.removeChildWindow(child)
+            child.orderOut(nil)
+            parent.orderOut(nil)
+        }
+
+        try await Task.sleep(for: .milliseconds(400))
+        try await engine.refreshContent()
+
+        let parentID = CGWindowID(parent.windowNumber)
+        let result = try await engine.capture(.window(parentID), options: .default)
+        let green = PixelCompare.count(result.image) { r, g, b in g > 180 && r < 90 && b < 90 }
+        let blank = PixelCompare.isBlank(result.image)
+
+        // If the parent's surface is not actually empty on this OS, the case
+        // under test was never set up and the run must say so rather than pass:
+        // a green count above zero would then prove nothing at all.
+        guard blank || green > 0 else {
+            print("empty parent:  captured neither blank nor green — case not reproduced")
+            return true
+        }
+
+        let ok = !blank && green > 0
+        print("empty parent:  \(green) px of the child's colour, blank=\(blank) "
+            + "-> \(ok ? "OK" : "FAIL")")
+        return ok
     }
 
     /// Picking a child window must capture that window, not its whole group.

@@ -20,9 +20,27 @@ final class OverlayPanel: NSPanel {
     /// doing the work — and, critically, that the test can fail at all.
     static var usesSharingTypeNone = true
 
-    // Must become key to receive keyDown (Esc/Return/arrows) — but see the note
-    // in init about *not* activating the app.
-    override var canBecomeKey: Bool { true }
+    // **Never key.** This panel used to take key status to receive `keyDown`,
+    // and that is what made a menu-bar app's popup unpickable: those panels
+    // close when they resign key, so the thing the user was aiming at vanished
+    // the instant the overlay appeared.
+    //
+    // Measured 2026-08-05 with `Scripts/popup-key-probe.swift`, which raises
+    // this exact panel — same style mask, same shielding level, same collection
+    // behaviour — differing only in this property:
+    //
+    //     canBecomeKey = false -> popup survived 1500 ms, 3 of 3 rounds
+    //     canBecomeKey = true  -> popup died within 0-50 ms, 3 of 3 rounds
+    //
+    // `false` rather than merely not calling `makeKeyAndOrderFront`, because a
+    // click on a key-capable panel makes it key by itself — which would have
+    // killed the popup at the exact moment of picking it, one step before the
+    // capture.
+    //
+    // The keyboard comes from `OverlayController.bindKeys` instead: the keys
+    // this overlay needs are registered as transient Carbon hot keys, which
+    // arrive without focus and without an Accessibility grant.
+    override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 
     init(screen: NSScreen, view: NSView, hiddenFromCapture: Bool = true) {

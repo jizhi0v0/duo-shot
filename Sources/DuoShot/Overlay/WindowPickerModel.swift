@@ -27,16 +27,30 @@ final class WindowPickerModel {
     /// translator popup, an inspector palette, a mini player — and those are
     /// exactly what someone reaches for a window screenshot to capture.
     ///
-    /// Then two pieces of system furniture, because people screenshot those too:
-    /// the Dock (20) and the menu bar (24). Deliberately *not* everything in
-    /// between or above — Notification Center (21) is a full-screen window that
-    /// would swallow the display, Control Center's status items (25) are a
-    /// couple of dozen 32×30 tiles, and menus and tooltips live at 101. Negative
-    /// layers are the desktop and its icons.
+    /// Then three more, because people screenshot those too: the Dock (20), the
+    /// menu bar (24), and the pop-up menu layer (101), where a menu-bar app's
+    /// popup panel lives — `MenuBarExtra`'s window style and an `NSPopover`
+    /// anchored to a status item both land there. Measured 2026-08-04 on
+    /// DuoUpdater: layer 101, alpha 1.00, 510×367, and still on screen at full
+    /// opacity with the overlay up, so there was nothing wrong with the panel —
+    /// the picker was simply refusing to offer it, and the hover fell through to
+    /// the maximized window behind.
+    ///
+    /// 101 was previously excluded on the grounds that "menus and tooltips live
+    /// at 101". Both do, and neither is a reason to keep the layer out: a
+    /// tooltip is turned away by `isPickable(size:)`, and an open menu is a
+    /// perfectly ordinary screenshot target.
+    ///
+    /// Deliberately *not* everything in between or above — Notification Center
+    /// (21) is a full-screen window that would swallow the display, Control
+    /// Center's status items (25) are a couple of dozen 32×30 tiles, and the
+    /// levels above 101 are for overlays and help tags. Negative layers are the
+    /// desktop and its icons.
     private func isPickable(layer: Int) -> Bool {
         (0...WindowInfo.topAppLayer).contains(layer)
             || layer == WindowInfo.dockLayer
             || layer == WindowInfo.menuBarLayer
+            || layer == WindowInfo.popUpMenuLayer
     }
 
     /// Below this and it is a shadow helper, a tooltip or a 1×1 spy window.
@@ -91,12 +105,70 @@ final class WindowPickerModel {
         return nil
     }
 
+    /// Drops a window that is only another window's shadow host.
+    ///
+    /// A `MenuBarExtra` popup arrives as two windows, and offering both makes
+    /// the result a coin toss. Measured 2026-08-05 on DuoUpdater:
+    ///
+    ///     13817  (1113, 35)  360x217   solid content 214x129
+    ///     13818  (1038,-40)  510x367   solid content 361x217
+    ///                left 75  right 75  top 75  bottom 75
+    ///
+    /// The outer window's solid content is the *whole* of the inner window,
+    /// border and all, wrapped in another shadow — so picking it frames the
+    /// panel in a wide dark surround, and which one the pointer resolved to was
+    /// luck. Reported as "sometimes it works, sometimes it doesn't".
+    ///
+    /// Trimming cannot rescue this: the alpha ladder above shows the outer
+    /// window's content is genuinely 361x217, not a transparent margin. Only
+    /// declining to offer it makes the outcome the same every time.
+    ///
+    /// The test is a **uniform** inflation, not mere containment, and that is
+    /// the whole safety of the rule: 75 points on all four sides is what a
+    /// shadow host looks like, while a document window that happens to enclose
+    /// an inspector of the same app has four margins that differ. Same
+    /// application and same layer as well, so nothing is dropped on account of
+    /// an unrelated window that happens to line up.
+    private func shadowHostIDs(among candidates: [WindowInfo]) -> Set<CGWindowID> {
+        var hosts: Set<CGWindowID> = []
+        for outer in candidates {
+            for inner in candidates where inner.id != outer.id {
+                guard inner.bundleID == outer.bundleID, inner.layer == outer.layer,
+                      Self.isUniformInflation(of: inner.pickFrame, to: outer.pickFrame)
+                else { continue }
+                hosts.insert(outer.id)
+                Log.overlay.debug("""
+                    picker dropped \(outer.displayName, privacy: .public) \
+                    as a shadow host around window \(inner.id, privacy: .public)
+                    """)
+                break
+            }
+        }
+        return hosts
+    }
+
+    /// Whether `outer` is `inner` grown by the same margin on every side.
+    ///
+    /// Two points of slack, because the frames come from the window server as
+    /// CGFloat and a half-point of rounding on one edge should not decide this.
+    private static func isUniformInflation(of inner: CGRect, to outer: CGRect) -> Bool {
+        let margins = [inner.minX - outer.minX, outer.maxX - inner.maxX,
+                       inner.minY - outer.minY, outer.maxY - inner.maxY]
+        guard let smallest = margins.min(), let largest = margins.max() else { return false }
+        // Strictly bigger on every side: equal frames are not a host, and a
+        // window sticking out on one edge is a different window.
+        return smallest > 1 && largest - smallest <= 2
+    }
+
     /// Returns true if the pickable set changed, so a caller re-loading on a
     /// timer can skip the redraw — and the logging — when nothing moved.
     @discardableResult
     func load(_ candidates: [WindowInfo]) -> Bool {
         let previous = windows.map(\.id)
-        windows = candidates.filter { rejectionReason(for: $0) == nil }
+        let hosts = shadowHostIDs(among: candidates.filter { rejectionReason(for: $0) == nil })
+        windows = candidates.filter {
+            rejectionReason(for: $0) == nil && !hosts.contains($0.id)
+        }
         guard windows.map(\.id) != previous else { return false }
         logRejectionsInFront(of: candidates)
         return true

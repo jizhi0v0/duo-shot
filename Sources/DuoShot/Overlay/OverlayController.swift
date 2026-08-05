@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import ObjCException
 
 /// Owns one overlay panel per screen and exposes the whole interaction as a
@@ -29,6 +30,8 @@ final class OverlayController {
     private var continuation: CheckedContinuation<Outcome, Never>?
     private var screenObserver: (any NSObjectProtocol)?
     private var rankTimer: Timer?
+    /// Transient Carbon hot-key ids held for the life of this presentation.
+    private var keyBindings: [UInt32] = []
     private var ticksSinceEnumeration = 0
     private var isEnumerating = false
     private var suggestsWindows = true
@@ -297,10 +300,7 @@ final class OverlayController {
             }
         }
 
-        guard takeKeyboard() else {
-            tearDown()
-            return .cancelled
-        }
+        bindKeys()
 
         startRankPolling()
 
@@ -387,65 +387,111 @@ final class OverlayController {
         rankTimer = timer
     }
 
-    /// Makes the panel under the pointer key and its view first responder.
+    /// The overlay's keyboard, without the overlay ever holding focus.
     ///
-    /// Only the panel under the pointer needs the keyboard; AppKit routes mouse
-    /// events by position on its own. Returns false if AppKit threw while
-    /// ordering — see `ordering`.
-    @discardableResult
-    private func takeKeyboard() -> Bool {
-        let pointerDisplayID = ScreenIndex.screenUnderMouse().flatMap(ScreenIndex.displayID(of:))
-        let index = panelDisplayIDs.firstIndex { $0 == pointerDisplayID }
-            ?? (panels.isEmpty ? nil : 0)
-        guard let index else { return true }
-        let keyPanel = panels[index]
-        guard ordering({ keyPanel.makeKeyAndOrderFront(nil) }) else { return false }
-        keyPanel.makeFirstResponder(views[index])
-        return true
+    /// The panels refuse key status (see `OverlayPanel.canBecomeKey` for the
+    /// measurement that forced it: a menu-bar popup dies within 50 ms of
+    /// anything else becoming key, which is every popup the picker exists to
+    /// offer). So the keys arrive as transient Carbon hot keys instead — the
+    /// same mechanism the app's own shortcuts and the scrolling capture's Escape
+    /// already use, and the reason it is Carbon rather than a `CGEventTap` is
+    /// that it needs no Accessibility grant.
+    ///
+    /// Every modifier combination has to be spelled out: `RegisterEventHotKey`
+    /// matches an exact modifier mask, so a registration for a bare arrow does
+    /// not fire while Shift is held. Reading `NSEvent.modifierFlags` at fire
+    /// time cannot rescue that — the event never arrives.
+    ///
+    /// A combination that fails to register is logged and skipped rather than
+    /// aborting the presentation: losing ⇧← is a degraded overlay, and refusing
+    /// to open one is a broken app. The likely cause is the user having bound
+    /// the same combination themselves, which `HotKeyManager` reports as
+    /// `alreadyBound`.
+    private func bindKeys() {
+        let arrows = [kVK_LeftArrow, kVK_RightArrow, kVK_UpArrow, kVK_DownArrow]
+        // Shift is the 10-point step and Option resizes rather than moves, so
+        // both, and both together, are live combinations — not decoration.
+        let arrowModifiers: [NSEvent.ModifierFlags] = [[], .shift, .option, [.shift, .option]]
+
+        var combos = [KeyCombo(keyCode: UInt16(kVK_Escape), modifiers: []),
+                      KeyCombo(keyCode: UInt16(kVK_Return), modifiers: []),
+                      KeyCombo(keyCode: UInt16(kVK_ANSI_KeypadEnter), modifiers: [])]
+        for key in arrows {
+            for modifiers in arrowModifiers {
+                combos.append(KeyCombo(keyCode: UInt16(key), modifiers: modifiers))
+            }
+        }
+
+        for combo in combos {
+            do {
+                let id = try HotKeyManager.shared.registerTransient(combo) { [weak self] in
+                    self?.deliver(combo)
+                }
+                keyBindings.append(id)
+            } catch {
+                Log.overlay.error("""
+                    overlay could not bind \(combo.displayString, privacy: .public): \
+                    \(error.localizedDescription, privacy: .public)
+                    """)
+            }
+        }
+        Log.overlay.debug("""
+            overlay bound \(self.keyBindings.count, privacy: .public) of \
+            \(combos.count, privacy: .public) keys
+            """)
     }
 
-    /// Takes the keyboard back after some other application has been activated.
+    /// Releases every transient binding. Must run on **every** exit path: these
+    /// are global, so one left behind eats that key for the whole system.
+    private func unbindKeys() {
+        for id in keyBindings { HotKeyManager.shared.unregister(id) }
+        keyBindings.removeAll()
+    }
+
+    /// Routes a bound key to the view on the display under the pointer.
     ///
-    /// Measured 2026-07-30: a `.nonactivatingPanel` holding key status loses it
-    /// the instant any other application activates — which is precisely what
-    /// ⌘-Tab does, and ⌘-Tab is a gesture this overlay now actively supports,
-    /// since the picker follows the switch. Mouse tracking survives it (the
-    /// tracking area is `.activeAlways`), so the highlight keeps following the
-    /// pointer and nothing *looks* wrong — but `keyDown` stops arriving, and Esc,
-    /// Space, Return and the arrow keys all silently stop working. Reported as
-    /// "can't Esc out once a window is selected".
-    ///
-    /// Re-taking key does not undo the switch: measured, the frontmost
-    /// application stays the one the user just moved to.
-    private func restoreKeyboardIfLost() {
-        guard !panels.contains(where: \.isKeyWindow) else { return }
-        // The panels are not the only window this selection owns. The armed
-        // toolbar is a `FloatingBarPanel` of its own, one level above the shield,
-        // and it is *entitled* to the keyboard — it holds the Record button and a
-        // device menu. Yanking key away from it every 120 ms would fight whatever
-        // the user is doing in it.
-        //
-        // `NSApp.keyWindow` is by definition one of ours, so the second test is
-        // only about level: anything standing at or above the panels' shielding
-        // level is part of this selection's UI, not something the poll has to
-        // recover from.
-        if let key = NSApp.keyWindow {
-            if toolbar.windowIDs.contains(CGWindowID(key.windowNumber)) { return }
-            if let level = panels.first?.level, key.level >= level { return }
-        }
-        Log.overlay.debug("overlay lost key status; taking the keyboard back")
-        takeKeyboard()
+    /// The same choice the old `takeKeyboard` made, for the same reason: on a
+    /// multi-display selection only one view can meaningfully answer, and the
+    /// one under the pointer is the one the user is working in.
+    private func deliver(_ combo: KeyCombo) {
+        guard isPresenting else { return }
+        let pointerDisplayID = ScreenIndex.screenUnderMouse().flatMap(ScreenIndex.displayID(of:))
+        let index = panelDisplayIDs.firstIndex { $0 == pointerDisplayID }
+            ?? (views.isEmpty ? nil : 0)
+        guard let index else { return }
+        views[index].handle(keyCode: Int(combo.keyCode), modifiers: combo.flags)
     }
 
     private func poll() {
-        // Unconditional: every key the overlay handles dies with key status, not
-        // just the picker's.
-        restoreKeyboardIfLost()
         // The picker only has to be right while it is being read, and it is read
         // only while a suggestion could be shown. Mid-drag and once armed the
         // rect is the answer, so re-ranking then would be a `CGWindowList` read
         // and a redraw for a highlight nobody can see.
         guard suggestsWindows, !isArmed, model.phase == .idle else { return }
+
+        // **Frozen: the photograph is the world.**
+        //
+        // Both halves below exist to keep the picker current with a screen that
+        // is still moving. Under freeze mode there is no such screen — the user
+        // is looking at one still image, taken before the overlay appeared — and
+        // keeping the picker current is then precisely wrong: it offers windows
+        // that are not in the picture.
+        //
+        // Reported 2026-08-05, and visible in one line of the picker's own log:
+        //
+        //     picker loaded 47 of 74: Surge | — Menubar | Claude | ...
+        //     picker loaded 48 of 76: Surge | Surge | — Menubar | Claude | ...
+        //
+        // The second Surge window is a submenu that opened *after* the freeze.
+        // The photograph does not contain it, so the highlight landed on a
+        // rectangle of empty screen — and had it been clicked, the capture would
+        // have been of something the user never saw. Reported as "the expanded
+        // menu is invisible once frozen, but hovering still shows its box".
+        //
+        // It took the overlay giving up key status to make this reachable: until
+        // then the menu died as the overlay appeared, so it never got as far as
+        // opening a submenu behind the picture.
+        guard !backdrop.isFrozen else { return }
 
         if picker.reRank() { seedPointer() }
 
@@ -576,6 +622,9 @@ final class OverlayController {
     /// meant anything. Every cancelling path calls `tearDown()` directly, which
     /// is the only outcome it could ever have produced.
     func tearDown() {
+        // Global bindings, so this comes first and unconditionally: a key left
+        // registered after the overlay is gone is eaten system-wide.
+        unbindKeys()
         // Unconditional, not `if isArmed`. This is the one exit every path goes
         // through, and a toolbar left on screen at shielding level with no
         // overlay under it is unreachable furniture the user cannot dismiss.

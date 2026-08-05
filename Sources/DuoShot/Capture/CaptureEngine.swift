@@ -15,6 +15,17 @@ final class CaptureEngine {
 
     var shareableContent: ShareableContentCache { content }
 
+    /// The padding backdrop for a display, for the self-tests. The shipping
+    /// path reaches it through `pad`.
+    func wallpaperBackdrop(for displayID: CGDirectDisplayID) async -> CGImage? {
+        await wallpaper.image(for: displayID)
+    }
+
+    /// Drops the cached wallpaper, so a test can force a fresh grab.
+    func invalidateWallpaper() {
+        wallpaper.invalidate()
+    }
+
     func refreshContent(onScreenOnly: Bool = true) async throws {
         try await content.refresh(onScreenOnly: onScreenOnly)
     }
@@ -148,15 +159,7 @@ final class CaptureEngine {
             (image, size, scale) = try await captureRegion(
                 region, on: displayID, options: options)
         } else {
-            let filter = SCContentFilter(desktopIndependentWindow: window)
-            scale = CGFloat(filter.pointPixelScale)
-            let configuration = configuration(
-                for: filter.contentRect, scale: scale, options: options)
-            let output = try await SCKBridge.captureScreenshot(
-                filter: filter, configuration: configuration)
-            guard let captured = output.image else { throw CaptureError.noImageProduced }
-            image = captured
-            size = filter.contentRect.size
+            (image, size, scale) = try await captureIsolated(window, options: options)
         }
 
         let (padded, pointSize) = await pad(
@@ -169,6 +172,83 @@ final class CaptureEngine {
             sourceDescription: info?.displayName ?? "Window",
             capturedAt: .now
         )
+    }
+
+    /// Captures a single window, alone — and notices when "alone" left nothing.
+    ///
+    /// `includeChildWindows` is off (see `CaptureOptions` for the WeChat alert
+    /// that turned it off), and for most windows that is right. For some it is
+    /// catastrophic: a window can be a bare frame whose entire visible content
+    /// is a child window drawn inside it, and captured without its children it
+    /// comes back not merely wrong but *empty*.
+    ///
+    /// Measured 2026-08-04 on DuoUpdater's menu-bar popup, one flag apart, same
+    /// window and same instant:
+    ///
+    ///     includeChildWindows = false ->  0.0% non-black, mean luma  0.0
+    ///     includeChildWindows = true  -> 35.1% non-black, mean luma 13.9
+    ///
+    /// Reported as "window screenshot of the popup is a black rectangle with no
+    /// content", and true of every menu-bar popup tried — ClaudeUsageMenuBar's
+    /// came out black too.
+    ///
+    /// So: keep the flag off, and treat a blank result as the evidence it is.
+    /// Retrying is not a guess about which kind of window this was — it is a
+    /// response to a capture that is already known to be worthless, and it
+    /// cannot reach the case the flag exists for, because an alert composited
+    /// over its parent is many things but never empty. The first image is kept
+    /// if the retry is blank too, so a genuinely empty window is not made worse.
+    private func captureIsolated(
+        _ window: SCWindow, options: CaptureOptions
+    ) async throws -> (CGImage, CGSize, CGFloat) {
+        let filter = SCContentFilter(desktopIndependentWindow: window)
+        let scale = CGFloat(filter.pointPixelScale)
+        let size = filter.contentRect.size
+
+        let output = try await SCKBridge.captureScreenshot(
+            filter: filter,
+            configuration: configuration(for: filter.contentRect, scale: scale, options: options))
+        guard let captured = output.image else { throw CaptureError.noImageProduced }
+        guard !options.includeChildWindows, PixelCompare.isBlank(captured) else {
+            return trimmed(captured, size: size, scale: scale)
+        }
+
+        Log.capture.notice("""
+            window \(window.windowID, privacy: .public) captured blank; \
+            retrying with child windows
+            """)
+        var retried = options
+        retried.includeChildWindows = true
+        let second = try await SCKBridge.captureScreenshot(
+            filter: filter,
+            configuration: configuration(for: filter.contentRect, scale: scale, options: retried))
+        guard let image = second.image, !PixelCompare.isBlank(image) else {
+            return trimmed(captured, size: size, scale: scale)
+        }
+        return trimmed(image, size: size, scale: scale)
+    }
+
+    /// Drops a border of pixels the window never drew.
+    ///
+    /// The outline the picker drew is the window's frame, and this can return
+    /// less than that — which is normally the one thing a selection UI must not
+    /// do (see `CaptureOptions.includeChildWindows` for the version of that
+    /// mistake which cost a round). It is allowed here because the asymmetry
+    /// runs the safe way: nothing appears in the file that was not inside the
+    /// outline, only empty space is missing. The failure that rule exists to
+    /// prevent is the opposite one — another window's pixels arriving unasked.
+    private func trimmed(
+        _ image: CGImage, size: CGSize, scale: CGFloat
+    ) -> (CGImage, CGSize, CGFloat) {
+        guard let bounds = PixelCompare.opaqueBounds(image),
+              let cropped = image.cropping(to: bounds)
+        else { return (image, size, scale) }
+        Log.capture.notice("""
+            trimmed \(Int(size.width), privacy: .public)x\(Int(size.height), privacy: .public) pt \
+            to \(Int(bounds.width / scale), privacy: .public)x\
+            \(Int(bounds.height / scale), privacy: .public) pt of drawn content
+            """)
+        return (cropped, CGSize(width: bounds.width / scale, height: bounds.height / scale), scale)
     }
 
     /// Captures a window that is really a region of the screen, as that region.
@@ -218,10 +298,7 @@ final class CaptureEngine {
         let padding = options.windowPadding
         guard padding > 0 else { return (image, size) }
 
-        var backdrop: CGImage?
-        if let wallpaperFilter = content.wallpaperFilter(for: displayID) {
-            backdrop = await wallpaper.image(for: displayID, filter: wallpaperFilter)
-        }
+        let backdrop = await wallpaper.image(for: displayID)
         guard let result = await ImagePadding.padded(
             image, by: padding, scale: scale, backdrop: backdrop,
             fallbackFill: NSColor.windowBackgroundColor.cgColor)

@@ -80,25 +80,6 @@ final class ShareableContentCache {
         content?.displays.first { $0.displayID == id }
     }
 
-    /// A filter containing only the desktop: every running application excluded,
-    /// so what is left to render is the wallpaper. See `DesktopWallpaper`.
-    func wallpaperFilter(for displayID: CGDirectDisplayID) -> SCContentFilter? {
-        guard let content, let display = scDisplay(for: displayID) else { return nil }
-        let filter = SCContentFilter(
-            display: display,
-            excludingApplications: content.applications,
-            exceptingWindows: [])
-        // The menu bar belongs to no application, so excluding every application
-        // does not exclude it — and `includeMenuBar` defaults to true, measured.
-        // It leaked into the padding backdrop, where it showed up as a strip of
-        // some other app's menus across the top of the card, but only sometimes:
-        // the backdrop is aspect-filled, so a tall capture keeps the wallpaper's
-        // top edge while a wide one crops it away. Reported as "why does a window
-        // screenshot occasionally have a menu in the top-left".
-        filter.includeMenuBar = false
-        return filter
-    }
-
     var displayIDs: [CGDirectDisplayID] {
         content?.displays.map(\.displayID) ?? []
     }
@@ -128,6 +109,9 @@ extension WindowInfo {
     static let topAppLayer = Int(CGWindowLevelForKey(.modalPanelWindow))
     static let dockLayer = Int(CGWindowLevelForKey(.dockWindow))
     static let menuBarLayer = Int(CGWindowLevelForKey(.mainMenuWindow))
+    /// Where a menu-bar app's popup panel sits — and `NSMenu`, and tooltips.
+    /// 101, the same number as `NSWindow.Level.popUpMenu`.
+    static let popUpMenuLayer = Int(CGWindowLevelForKey(.popUpMenuWindow))
 
     fileprivate init(
         _ window: SCWindow, dockStrip: CGRect?, entries: [CGWindowID: WindowZOrder.Entry]

@@ -366,10 +366,26 @@ final class OverlayView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
-        let step: CGFloat = event.modifierFlags.contains(.shift) ? 10 : 1
-        let resizing = event.modifierFlags.contains(.option)
+        guard handle(keyCode: Int(event.keyCode), modifiers: event.modifierFlags) else {
+            super.keyDown(with: event)
+            return
+        }
+    }
 
-        switch Int(event.keyCode) {
+    /// The overlay's whole keyboard vocabulary, reachable without an `NSEvent`.
+    ///
+    /// Two callers, and they are not interchangeable: `keyDown` above (which no
+    /// longer fires in the shipping app, since `OverlayPanel` refuses key status,
+    /// but is what the self-tests' synthesised presses go through) and
+    /// `OverlayController.bindKeys`, which delivers the same keys as Carbon hot
+    /// keys. Returns false for a key it does not claim, so `keyDown` can fall
+    /// through to `super` exactly as it used to.
+    @discardableResult
+    func handle(keyCode: Int, modifiers: NSEvent.ModifierFlags) -> Bool {
+        let step: CGFloat = modifiers.contains(.shift) ? 10 : 1
+        let resizing = modifiers.contains(.option)
+
+        switch keyCode {
         case kVK_Return, kVK_ANSI_KeypadEnter:
             confirmFromKeyboard()
         case kVK_Escape:
@@ -383,8 +399,9 @@ final class OverlayView: NSView {
         case kVK_DownArrow:
             apply(CGVector(dx: 0, dy: -step), resizing: resizing)
         default:
-            super.keyDown(with: event)
+            return false
         }
+        return true
     }
 
     /// Return takes whichever of the two things is on offer.
