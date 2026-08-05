@@ -17,6 +17,11 @@ enum SelfTest {
     enum Mode {
         case permission
         case windows
+        /// Captures a named app's windows from *inside this process*, two ways:
+        /// straight through ScreenCaptureKit as a standalone probe would, and
+        /// through the app's own `CaptureEngine`. Both paths, one process — the
+        /// one comparison the standalone probes structurally cannot make.
+        case popupCapture(needle: String, rounds: Int)
         case capture(output: URL, displayIndex: Int?)
         /// Rect in AppKit global points: "x,y,w,h".
         case rect(CGRect, displayIndex: Int?, output: URL?)
@@ -167,6 +172,9 @@ enum SelfTest {
                 self = .permission
             case "--selftest-windows":
                 self = .windows
+            case "--selftest-popup-capture":
+                guard let needle = positional() else { return nil }
+                self = .popupCapture(needle: needle, rounds: Int(positional() ?? "") ?? 4)
             case "--selftest-sourcerect-space":
                 self = .sourceRectSpace
             case "--selftest-capture":
@@ -378,6 +386,8 @@ enum SelfTest {
             switch mode {
             case .permission: return permission()
             case .windows: return try await windows()
+            case .popupCapture(let needle, let rounds):
+                return try await popupCapture(needle: needle, rounds: rounds)
             case .capture(let url, let index): return try await capture(to: url, displayIndex: index)
             case .rect(let rect, let index, let url):
                 return try await rectCheck(rect, displayIndex: index, output: url)
@@ -3060,6 +3070,138 @@ enum SelfTest {
             + "\(magenta) px of a floating window -> \(ok ? "OK" : "FAIL")"
             + (notBlack ? "" : " (all black — or the wallpaper really is black)"))
         return ok
+    }
+
+    /// The one comparison a standalone probe cannot make: both capture paths,
+    /// inside this process.
+    ///
+    /// A `MenuBarExtra` popup captures translucent — mean body alpha 198, then
+    /// 162, then 0 on three consecutive real captures — while every standalone
+    /// probe of the same window through the same filter with the same flags
+    /// reads 252–254, thirty times running. Eleven explanations have been tried
+    /// and refuted by measurement: the flags, the API version, two captures in a
+    /// row, a full-display capture immediately before, a stale `SCWindow`, the
+    /// pixel-size arithmetic, the output image chosen, the window's own alpha
+    /// (read 1.000 while the capture came back empty), the post-capture crop,
+    /// and covering the popup with the overlay's own panel — including a
+    /// full-screen opaque photograph, which is what freeze mode puts there.
+    ///
+    /// What is left is the process. This app is a signed bundle launched by
+    /// LaunchServices holding its own Screen Recording grant; the probes are
+    /// `swift` scripts attributed to whatever terminal ran them. So run both
+    /// paths *here*:
+    ///
+    /// - **raw** — exactly what the probe does, no `CaptureEngine` involved.
+    /// - **engine** — the shipping path, `capture(.window(id))`.
+    ///
+    /// The two answers split the remaining space in half. Both degraded: it is
+    /// the process or its grant, and `CaptureEngine` is innocent. Only the
+    /// engine degraded: it is something still un-isolated in the capture flow,
+    /// and the bisection continues inside this file. Neither degraded: the
+    /// trigger is something only the *interactive* flow does, which is the
+    /// overlay, the hotkey or the user.
+    ///
+    /// Everything is logged as well as printed, because the honest way to run
+    /// this is `open -n -a` — a shell-spawned process is attributed to its
+    /// responsible ancestor, and the whole question is which process is asking.
+    private static func popupCapture(needle: String, rounds: Int) async throws -> Int32 {
+        // Long enough to open the popup after launching this by hand.
+        print("waiting 8s — open the popup now")
+        Log.capture.notice("popup-capture: waiting for '\(needle, privacy: .public)'")
+        try await Task.sleep(for: .seconds(8))
+
+        let engine = CaptureEngine()
+        try await engine.refreshContent()
+        let content = try await SCKBridge.shareableContent().value
+        let targets = content.windows.filter {
+            ($0.owningApplication?.applicationName ?? "")
+                .localizedCaseInsensitiveContains(needle)
+                && $0.frame.width * $0.frame.height > 20_000
+        }
+        guard !targets.isEmpty else {
+            print("no on-screen window owned by an app matching '\(needle)'")
+            Log.capture.notice("popup-capture: nothing matched")
+            return 0
+        }
+
+        func report(_ label: String, _ image: CGImage?) {
+            guard let image else {
+                print("    \(label): no image")
+                Log.capture.notice("popup-capture: \(label, privacy: .public) no image")
+                return
+            }
+            let opacity = PixelCompare.bodyOpacity(image)
+            let verdict = opacity.meanAlpha >= 250 ? "opaque" : "DEGRADED"
+            print("    \(label): body \(opacity.pixels)/4096 cells, "
+                + "mean alpha \(opacity.meanAlpha)/255  \(verdict)")
+            Log.capture.notice("""
+                popup-capture: \(label, privacy: .public) \
+                body \(opacity.pixels, privacy: .public)/4096 \
+                alpha \(opacity.meanAlpha, privacy: .public)/255 \
+                \(verdict, privacy: .public)
+                """)
+        }
+
+        for window in targets {
+            print("\n  id=\(window.windowID) "
+                + "\(Int(window.frame.width))x\(Int(window.frame.height))")
+            for round in 1...rounds {
+                // Raw: the probe's code, verbatim, in this process.
+                let filter = SCContentFilter(desktopIndependentWindow: window)
+                let scale = CGFloat(filter.pointPixelScale)
+                let configuration = SCScreenshotConfiguration()
+                let (width, height) = DisplayGeometry.pixelSize(
+                    of: filter.contentRect, scale: scale)
+                configuration.width = width
+                configuration.height = height
+                configuration.showsCursor = false
+                configuration.includeChildWindows = true
+                configuration.ignoreShadows = true
+                let raw = try? await SCKBridge.captureScreenshot(
+                    filter: filter, configuration: configuration).image
+                report("round \(round) raw   ", raw)
+
+                // Engine: the shipping path. No padding, so what is measured is
+                // the capture and not the compositor.
+                var options = CaptureOptions.default
+                options.windowPadding = 0
+                let engineImage = try? await engine.capture(
+                    .window(window.windowID), options: options).image
+                report("round \(round) engine", engineImage)
+
+                // Engine again, this time after the machinery the interactive
+                // flow drags in and this test otherwise skips.
+                //
+                // With no `excludedWindowIDs`, `ShareableContentCache.ownWindows`
+                // returns on its `guard !ids.isEmpty` and
+                // `getCurrentProcessShareableContent` is never called — while the
+                // real flow always calls it, because freezing the screen has to
+                // exclude the overlay's own panels. That is a different SCK entry
+                // point from the enumeration everything else uses, and whether
+                // asking it disturbs a subsequent window capture in the same
+                // process is untested. A bare display capture was tested and
+                // refuted; it did not exercise this.
+                if let displayID = engine.shareableContent.displayIDs.first {
+                    let panel = NSPanel(
+                        contentRect: CGRect(x: 0, y: 0, width: 400, height: 300),
+                        styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+                    panel.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
+                    panel.sharingType = .none
+                    panel.backgroundColor = .black
+                    panel.orderFrontRegardless()
+                    defer { panel.orderOut(nil) }
+
+                    var excluded = options
+                    excluded.excludedWindowIDs = [CGWindowID(panel.windowNumber)]
+                    _ = try? await engine.capture(.display(displayID), options: excluded)
+                    let after = try? await engine.capture(
+                        .window(window.windowID), options: excluded).image
+                    report("round \(round) after freeze", after)
+                }
+            }
+        }
+        return 0
     }
 
     /// A shadow host is not offered; a window that merely overlaps still is.

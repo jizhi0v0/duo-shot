@@ -162,6 +162,29 @@ final class CaptureEngine {
             (image, size, scale) = try await captureIsolated(window, options: options)
         }
 
+        // How opaque the window came back, for an open bug that no controlled
+        // experiment has yet reproduced.
+        //
+        // A `MenuBarExtra` popup has been captured at mean body alpha 198, 162
+        // and 0 on three consecutive real screenshots, and at 251-254 on all 78
+        // captures taken since under every condition anyone could think to vary
+        // — process identity, TCC attribution, capture flags, API version, a
+        // display capture before it, the overlay covering it, the exclusion
+        // machinery. So the remaining questions are ones only the wild can
+        // answer: how often does it happen, and on which OS. This line is how
+        // the next occurrence names itself instead of costing another round of
+        // temporary instrumentation.
+        //
+        // One 64×64 downscale per window capture, which is nothing next to the
+        // capture it follows.
+        let opacity = PixelCompare.bodyOpacity(image)
+        Log.capture.notice("""
+            window \(windowID, privacy: .public) opacity: \
+            body \(opacity.pixels, privacy: .public)/4096 cells, \
+            mean alpha \(opacity.meanAlpha, privacy: .public)/255\
+            \(opacity.meanAlpha >= 250 ? "" : "  DEGRADED", privacy: .public)
+            """)
+
         let (padded, pointSize) = await pad(
             image, size: size, scale: scale, on: displayID, options: options)
         return CaptureResult(

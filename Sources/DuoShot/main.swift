@@ -34,6 +34,7 @@ if let mode = SelfTest.Mode(arguments: arguments) {
 
           --selftest-permission
           --selftest-windows
+          --selftest-popup-capture <app-name> [rounds]
           --selftest-preferences
           --selftest-edit-menu
           --selftest-copy-text <dir>
