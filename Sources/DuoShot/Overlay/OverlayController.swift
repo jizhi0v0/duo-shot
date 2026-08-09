@@ -196,6 +196,11 @@ final class OverlayController {
         Set(panels.map { CGWindowID($0.windowNumber) }).union(toolbar.windowIDs)
     }
 
+    /// Told when the picker starts suggesting a different window, so a caller can
+    /// photograph it while it is still fully opaque. See `CaptureEngine.preCapture`.
+    var onHoveredWindow: ((WindowInfo) -> Void)?
+    private var lastHoverReported: CGWindowID?
+
     /// Presents the selection UI.
     ///
     /// `frozen` is freeze mode: one whole-screen photograph per display, taken
@@ -224,6 +229,7 @@ final class OverlayController {
         self.requiresConfirmation = requiresConfirmation
         self.toolbarStyle = toolbarStyle
         isArmed = false
+        lastHoverReported = nil
         model.reset()
 
         // The toolbar follows the selection, so it has to move on the same
@@ -236,6 +242,14 @@ final class OverlayController {
             publishBackdrops()
             views.forEach { $0.refresh() }
             if isArmed { repositionToolbar() }
+            // The suggestion changed, which is the last moment anything is
+            // certain to be alive: the click that accepts it is also the click
+            // that dismisses a menu-bar popup. `refresh` fires for selection
+            // changes too, hence the id check rather than trusting the callback.
+            if let hovered = picker.hovered, hovered.id != lastHoverReported {
+                lastHoverReported = hovered.id
+                onHoveredWindow?(hovered)
+            }
         }
         // Before the panels exist, so the first paint already has the picture:
         // seeding after they were on screen showed one live frame of the screen

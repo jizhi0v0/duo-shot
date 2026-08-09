@@ -42,7 +42,12 @@ final class BackdropCache {
     /// being handed to it again, which happens on every pointer move that stays
     /// inside the current patch. `CGImage` has no `==`, and does not need one
     /// here: two frames are the same frame when they are the same object.
-    struct Frame: Equatable {
+    // `nonisolated` on the type (SE-0466 opt-out), not on the one method that
+    // needs it: the properties are immutable and a `nonisolated` method could
+    // not read them through a MainActor-isolated type. Deliberately *not*
+    // Sendable — it holds a `CGImage`, and this module's rule is that images do
+    // not cross isolation boundaries.
+    nonisolated struct Frame: Equatable {
         static func == (lhs: Frame, rhs: Frame) -> Bool {
             lhs.image === rhs.image && lhs.scale == rhs.scale && lhs.covers == rhs.covers
         }
@@ -55,6 +60,29 @@ final class BackdropCache {
         /// The AppKit global rect the image covers: a whole screen for a base
         /// frame, a small square for a patch.
         let covers: CGRect
+
+        /// Cuts a region out of the photograph, clamped to what the photograph
+        /// actually holds.
+        ///
+        /// Returns the cropped image together with the point size of the crop
+        /// that *happened* — not of the rect that was asked for. A rect running
+        /// off the edge is clamped, and a point size that disagreed with the
+        /// pixels would put the wrong scale on the saved file.
+        ///
+        /// Two callers with the same arithmetic and no reason to differ: the
+        /// area path cropping a frozen selection, and the window path recovering
+        /// a window the compositor was fading (`CaptureEngine.captureWindow`).
+        func crop(toAppKitGlobal rect: CGRect) -> (image: CGImage, pointSize: CGSize)? {
+            let pixels = DisplayGeometry.pixelRect(
+                ofAppKitGlobal: rect, in: covers, scale: scale)
+            let bounds = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+            let clamped = pixels.intersection(bounds)
+            guard clamped.width >= 1, clamped.height >= 1,
+                  let cropped = image.cropping(to: clamped)
+            else { return nil }
+            return (cropped, CGSize(width: clamped.width / scale,
+                                    height: clamped.height / scale))
+        }
     }
 
     /// How big a patch is, and how far inside it the pointer has to be for the

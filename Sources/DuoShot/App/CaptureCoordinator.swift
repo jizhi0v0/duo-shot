@@ -27,6 +27,24 @@ final class CaptureCoordinator {
             try? await engine.refreshContent()
             return engine.shareableContent.windows
         }
+        // Speculatively capture whatever the picker is suggesting, while it is
+        // still fully opaque. A menu-bar popup is dismissed by the very click
+        // that picks it, and the fade that starts there cannot be outrun from
+        // the click — but it can be beaten from the hover. See
+        // `CaptureEngine.preCapture` for the measurement.
+        //
+        // Gated, because a window capture is not free and hover fires often. A
+        // popup is small or sits above the normal layer; an ordinary full-screen
+        // window is neither, and is never dismissed by our click anyway, so its
+        // live capture is always the authoritative one.
+        overlay.onHoveredWindow = { [engine] window in
+            let area = window.pickFrame.width * window.pickFrame.height
+            let display = NSScreen.main?.frame ?? .zero
+            let big = area > display.width * display.height / 4
+            guard window.layer > 0 || !big else { return }
+            engine.preCapture(window.id)
+        }
+
         // Same reasoning: `engine`, not `self`. The cursor is deliberately left
         // out — a loupe magnifying a frozen arrow, while the live one moves over
         // it, is a picture of two pointers.
@@ -66,6 +84,10 @@ final class CaptureCoordinator {
         }
         isCapturing = true
         defer { isCapturing = false }
+        // Each interactive session speculates afresh. A picture of a popup from
+        // the previous invocation is exactly the kind of thing that would be
+        // served silently and be wrong.
+        engine.forgetPreCaptures()
 
         do {
             try await engine.refreshContent()
@@ -77,10 +99,27 @@ final class CaptureCoordinator {
         // Before the overlay, or there is no point. Everything freeze mode is for
         // — a hover state, an open popover, a screen that is still moving — is
         // gone the instant a window that accepts mouse events covers the pointer.
-        let frozen = Preferences.shared.freezesScreen ? await freezeEveryDisplay() : [:]
+        //
+        // Taken whether or not freeze mode is on, and only *shown* when it is.
+        // The picture has a second job now: a menu-bar popup is dismissed by the
+        // same click that picks it, and no live capture can outrun the fade that
+        // starts (`WindowRecovery`). This is the only moment pixels from before
+        // that click can be had, and by then nobody knows yet whether the user
+        // is going to pick a window at all.
+        //
+        // ~80 ms per trigger for a user who has freeze off, measured with
+        // `--selftest-freeze`. Paid on every interactive capture, spent on maybe
+        // one in ten. The alternative — deciding later, once a popup is hovered —
+        // is a photograph taken after the overlay is up, and freeze mode exists
+        // precisely because that is too late.
+        let photographs = await freezeEveryDisplay()
+        let frozen = Preferences.shared.freezesScreen ? photographs : [:]
 
-        let outcome = await overlay.present(
-            windows: engine.shareableContent.windows, frozen: frozen)
+        let windowsAtPhotographTime = engine.shareableContent.windows
+        let recovery = WindowRecovery(
+            frames: photographs, windowsFrontToBack: windowsAtPhotographTime)
+
+        let outcome = await overlay.present(windows: windowsAtPhotographTime, frozen: frozen)
         let delay = Preferences.shared.captureDelaySeconds
 
         switch outcome {
@@ -111,6 +150,9 @@ final class CaptureCoordinator {
             var options = Preferences.shared.captureOptions
             options.excludedWindowIDs = countdown.lastWindowIDs
                 .union(additionalExcludedWindowIDs())
+            // No recovery on the delayed path: the whole point of a delay is that
+            // the interesting frame has not happened yet, so a photograph from
+            // before the countdown is the wrong picture by definition.
             return await perform(.window(windowID), options: options)
 
         case .area(let displayID, let rect) where frozen[displayID] != nil:
@@ -164,7 +206,7 @@ final class CaptureCoordinator {
                 .union(additionalExcludedWindowIDs())
             defer { overlay.tearDown() }
             return await perform(
-                .window(windowID), options: options,
+                .window(windowID), options: options, recovery: recovery,
                 afterCapture: { [overlay] in overlay.tearDown() })
         }
     }
@@ -336,21 +378,10 @@ final class CaptureCoordinator {
         _ frame: BackdropCache.Frame, to rectInAppKitGlobal: CGRect,
         on displayID: CGDirectDisplayID
     ) -> CaptureResult? {
-        let pixels = DisplayGeometry.pixelRect(
-            ofAppKitGlobal: rectInAppKitGlobal, in: frame.covers, scale: frame.scale)
-        let bounds = CGRect(x: 0, y: 0, width: frame.image.width, height: frame.image.height)
-        let clamped = pixels.intersection(bounds)
-        guard clamped.width >= 1, clamped.height >= 1,
-              let cropped = frame.image.cropping(to: clamped)
-        else { return nil }
+        guard let cut = frame.crop(toAppKitGlobal: rectInAppKitGlobal) else { return nil }
         return CaptureResult(
-            image: cropped,
-            // From the crop that actually happened, not from the rect that was
-            // asked for: a selection running off the edge of the screen is
-            // clamped above, and a point size that disagreed with the pixels
-            // would put the wrong scale on the saved file.
-            pointSize: CGSize(width: clamped.width / frame.scale,
-                              height: clamped.height / frame.scale),
+            image: cut.image,
+            pointSize: cut.pointSize,
             scale: frame.scale,
             sourceDisplayID: displayID,
             sourceDescription: "Area",
@@ -368,12 +399,13 @@ final class CaptureCoordinator {
     /// every capture look like a freeze. Not called on the failure path, where
     /// the retry still needs the panels.
     private func perform(
-        _ request: CaptureRequest, options: CaptureOptions, isRetry: Bool = false,
+        _ request: CaptureRequest, options: CaptureOptions,
+        recovery: WindowRecovery? = nil, isRetry: Bool = false,
         afterCapture: () -> Void = {}
     ) async -> CaptureResult? {
         lastExcludedWindowIDsForTest = options.excludedWindowIDs
         do {
-            let result = try await engine.capture(request, options: options)
+            let result = try await engine.capture(request, options: options, recovery: recovery)
             afterCapture()
             await onResult?(result)
             return result
@@ -395,7 +427,8 @@ final class CaptureCoordinator {
                 // capture. One refresh-and-retry covers the common race.
                 try? await engine.refreshContent()
                 return await perform(
-                    request, options: options, isRetry: true, afterCapture: afterCapture)
+                    request, options: options, recovery: recovery, isRetry: true,
+                    afterCapture: afterCapture)
             default:
                 NSSound.beep()
             }

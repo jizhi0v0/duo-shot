@@ -22,6 +22,12 @@ enum SelfTest {
         /// through the app's own `CaptureEngine`. Both paths, one process — the
         /// one comparison the standalone probes structurally cannot make.
         case popupCapture(needle: String, rounds: Int)
+        /// Captures a window the compositor is drawing at less than full
+        /// opacity, which is what a dismissing menu-bar popup is.
+        case fadedWindow
+        /// The photograph fallback's honesty check: does it refuse when the
+        /// photograph holds somebody else's pixels, and accept when it does not?
+        case occludedRecovery
         case capture(output: URL, displayIndex: Int?)
         /// Rect in AppKit global points: "x,y,w,h".
         case rect(CGRect, displayIndex: Int?, output: URL?)
@@ -175,6 +181,10 @@ enum SelfTest {
             case "--selftest-popup-capture":
                 guard let needle = positional() else { return nil }
                 self = .popupCapture(needle: needle, rounds: Int(positional() ?? "") ?? 4)
+            case "--selftest-faded-window":
+                self = .fadedWindow
+            case "--selftest-occluded-recovery":
+                self = .occludedRecovery
             case "--selftest-sourcerect-space":
                 self = .sourceRectSpace
             case "--selftest-capture":
@@ -388,6 +398,8 @@ enum SelfTest {
             case .windows: return try await windows()
             case .popupCapture(let needle, let rounds):
                 return try await popupCapture(needle: needle, rounds: rounds)
+            case .fadedWindow: return try await fadedWindowCheck()
+            case .occludedRecovery: return try await occludedRecoveryCheck()
             case .capture(let url, let index): return try await capture(to: url, displayIndex: index)
             case .rect(let rect, let index, let url):
                 return try await rectCheck(rect, displayIndex: index, output: url)
@@ -3070,6 +3082,568 @@ enum SelfTest {
             + "\(magenta) px of a floating window -> \(ok ? "OK" : "FAIL")"
             + (notBlack ? "" : " (all black — or the wallpaper really is black)"))
         return ok
+    }
+
+    /// A window capture must not report the compositor's fade as the window's
+    /// own pixels.
+    ///
+    /// The bug this stands in for: a `MenuBarExtra` popup is dismissed by the
+    /// same click that picks it, and a live window capture — 90–320 ms — cannot
+    /// outrun the 150–350 ms fade that click starts. Measured 2026-08-09 against
+    /// an outside observer, DuoShot read mean body alpha 0/255 at 14:32:33.32
+    /// while `kCGWindowAlpha` for the same window was 0.502 at 14:32:33.31.
+    ///
+    /// The popup itself cannot be driven from code — `MenuBarExtra` has no
+    /// presentation binding, its status button carries no target or action,
+    /// `performClick` does not open it, and calling `mouseDown` inline hangs the
+    /// run in the button's own tracking loop. So the fade is stood in for by the
+    /// one property that *is* the fade: a window whose `alphaValue` is below 1.
+    /// Verified equivalent before this check was written — a panel at
+    /// `alphaValue` 0.5 reads `kCGWindowAlpha` 0.500 and captures at mean body
+    /// alpha 0/255, which is the same reading the real popup produced.
+    ///
+    /// Every number here is taken twice, at full opacity and faded, because the
+    /// assertion that matters is a *difference*. A check that only ever looked at
+    /// the faded capture would pass on a machine where window captures are broken
+    /// in some other way.
+    private static func fadedWindowCheck() async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+        guard let screen = NSScreen.main,
+              let displayID = ScreenIndex.displayID(of: screen)
+        else {
+            print("result:        INCONCLUSIVE — no main display")
+            return 0
+        }
+
+        // Shaped like the window this check exists for, not like a test fixture.
+        //
+        // A menu-bar popup draws a panel *inside* a larger frame — measured on
+        // DuoUpdater's, 312×343 pt of content in a 360×373 pt window — so every
+        // window capture of one goes through `trimmed`. The first version of this
+        // check used an opaque panel filling its whole frame, which makes
+        // `opaqueBounds` return nil and skips that code path entirely. It passed
+        // while the trim was cutting the wrong rectangle out of the photograph,
+        // and Bobby's screenshot came back with the left third of the panel
+        // missing.
+        //
+        // So: a transparent margin, and the drawn part deliberately off-centre,
+        // so that a crop which is the right *size* in the wrong *place* cannot
+        // look like a pass.
+        // An opaque sheet behind the fixture, so the check does not depend on
+        // what happens to be on the developer's screen.
+        //
+        // The recovered image is cut from a photograph of the desktop, so
+        // whatever sits behind the panel shows through its margins — and the
+        // first version of this fiducial duly found "yellow" in a terminal's
+        // syntax colouring and reported the ink box as 619 px wide instead of
+        // 260. Nothing behind the panel, nothing to confuse it with.
+        let backdrop = NSWindow(
+            contentRect: screen.frame, styleMask: [.borderless],
+            backing: .buffered, defer: false)
+        backdrop.setFrame(screen.frame, display: true)
+        backdrop.isOpaque = true
+        backdrop.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 1)
+        backdrop.level = .normal
+        backdrop.orderFrontRegardless()
+        defer { backdrop.orderOut(nil) }
+
+        let size = CGSize(width: 420, height: 300)
+        let inset = CGRect(x: 70, y: 40, width: 300, height: 210)
+        let panel = NSPanel(
+            contentRect: CGRect(
+                x: screen.frame.midX - size.width / 2,
+                y: screen.frame.midY - size.height / 2,
+                width: size.width, height: size.height),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered, defer: false)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.contentView = FadeFixtureView(drawn: inset)
+        // Where a menu-bar popup lives, so the fallback's occlusion rule is
+        // exercised against the same z-order the real case has.
+        panel.level = NSWindow.Level(rawValue: 101)
+        panel.orderFrontRegardless()
+        defer { panel.orderOut(nil) }
+        try await Task.sleep(for: .milliseconds(400))
+
+        let engine = CaptureEngine()
+        try await engine.refreshContent()
+        let windowID = CGWindowID(panel.windowNumber)
+        guard engine.shareableContent.windows.contains(where: { $0.id == windowID }) else {
+            print("result:        INCONCLUSIVE — the stand-in panel never reached the window list")
+            return 0
+        }
+
+        var options = CaptureOptions.default
+        options.windowPadding = 0
+
+        // The control. If this is not opaque the check cannot say anything about
+        // the faded one.
+        let before = try await engine.capture(.window(windowID), options: options)
+        let opaque = PixelCompare.bodyOpacity(before.image)
+        print("at alpha 1.0:  body \(opaque.pixels)/4096 cells, mean alpha \(opaque.meanAlpha)/255")
+        guard opaque.meanAlpha >= 250 else {
+            print("""
+                result:        INCONCLUSIVE — an ordinary opaque panel already captures \
+                translucent here, so the faded reading below would prove nothing
+                """)
+            return 0
+        }
+
+        // The photograph the fix is allowed to fall back to: the screen as it was
+        // *before* the fade, which is the whole point. Taken through the same
+        // engine so its scale and geometry come from the capture itself.
+        let photograph = try await engine.capture(.display(displayID), options: options)
+        let recovery = WindowRecovery(
+            frames: [displayID: BackdropCache.Frame(
+                image: photograph.image, scale: photograph.scale, covers: screen.frame)],
+            windowsFrontToBack: engine.shareableContent.windows)
+
+        // What the fixture looks like at full opacity, which is the only reading
+        // that knows where the panel really is.
+        guard let reference = fixtureGeometry(before.image) else {
+            print("result:        INCONCLUSIVE — the fixture drew nothing measurable")
+            return 0
+        }
+        let referenceOffset = CGPoint(
+            x: reference.ink.minX - reference.panel.minX,
+            y: reference.ink.minY - reference.panel.minY)
+        print("at alpha 1.0:  panel \(rectString(reference.panel)) px, "
+            + "ink +\(Int(referenceOffset.x)),+\(Int(referenceOffset.y))")
+
+        // Asserted against the panel, not against the crop.
+        //
+        // A recovered capture is deliberately framed to the window's whole frame
+        // while a clean one is trimmed to what the window drew, so their crops
+        // differ by design and comparing image coordinates would fail on the fix
+        // rather than on the bug. What must hold is what the user was complaining
+        // about: the panel is all there, and the picture inside it has not moved.
+        //
+        // Two depths, because they used to fail differently. `trimmed` finds the
+        // drawn content by asking "alpha > 0" on a downscale, and a fade pushes
+        // the faintest edges below the 8-bit floor before it touches the body, so
+        // the deeper the fade the further in the trim walked. Measured in the wild
+        // on DuoUpdater's popup, same window every time: mean alpha 254/180/174
+        // all trimmed to 312x343 pt; mean alpha 0 trimmed to 297x335, then
+        // 291x332. Asymmetrically — hence "the left third is missing".
+        var ok = !reference.clipped
+        if reference.clipped {
+            print("               the reference itself is clipped; the fixture does not fit")
+        }
+        // Framing seen at each depth, so the depths can be held against *each
+        // other*. This is the assertion the first three versions of this check
+        // were missing, and without it the negative control passed: the panel
+        // survived, the ink stayed put relative to it, and only the crop quietly
+        // changed size with the fade. "A screenshot must not depend on how far
+        // through its dismissal animation the window happened to be" is the whole
+        // requirement, and it is stated here and nowhere else.
+        var framings: [(fade: Double, size: CGSize)] = []
+
+        for fade in [0.6, 0.06] {
+            panel.alphaValue = fade
+            try await Task.sleep(for: .milliseconds(250))
+            let serverAlpha = WindowZOrder.entries()[windowID]?.alpha ?? -1
+
+            try await engine.refreshContent()
+            let after = try await engine.capture(
+                .window(windowID), options: options, recovery: recovery)
+            let recovered = PixelCompare.bodyOpacity(after.image)
+            framings.append((fade, CGSize(width: after.image.width, height: after.image.height)))
+
+            let opaqueEnough = recovered.meanAlpha >= 250
+            var notes: [String] = []
+            if !opaqueEnough { notes.append("NOT OPAQUE") }
+
+            var geometryOK = false
+            if let seen = fixtureGeometry(after.image) {
+                let offset = CGPoint(x: seen.ink.minX - seen.panel.minX,
+                                     y: seen.ink.minY - seen.panel.minY)
+                geometryOK = !seen.clipped && offset == referenceOffset
+                    && seen.panel.size == reference.panel.size
+                    && seen.ink.size == reference.ink.size
+                if seen.clipped { notes.append("PANEL CLIPPED") }
+                if offset != referenceOffset { notes.append("INK MOVED") }
+                if seen.panel.size != reference.panel.size { notes.append("PANEL RESIZED") }
+                print("at alpha \(String(format: "%.2f", fade)): "
+                    + "server \(String(format: "%.3f", serverAlpha)), "
+                    + "panel \(rectString(seen.panel)) px "
+                    + "in \(after.image.width)x\(after.image.height), "
+                    + "ink +\(Int(offset.x)),+\(Int(offset.y)), "
+                    + "mean alpha \(recovered.meanAlpha)/255"
+                    + (notes.isEmpty ? "" : "  " + notes.joined(separator: ", ")))
+            } else {
+                print("at alpha \(String(format: "%.2f", fade)): NOTHING MEASURABLE")
+            }
+            ok = ok && opaqueEnough && geometryOK
+
+            if !geometryOK || !opaqueEnough {
+                // A percentage does not show a geometric difference. Leaving both
+                // behind turns the next failure into a look instead of another
+                // round of instrumentation.
+                let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+                    .appendingPathComponent("duoshot-faded-window")
+                try? FileManager.default.createDirectory(
+                    at: directory, withIntermediateDirectories: true)
+                try? ImageEncoder.write(
+                    before.image, to: directory.appendingPathComponent("full-opacity.png"),
+                    as: .png, scale: before.scale)
+                try? ImageEncoder.write(
+                    after.image,
+                    to: directory.appendingPathComponent("recovered-at-\(fade).png"),
+                    as: .png, scale: after.scale)
+                print("  images:      \(directory.path)")
+            }
+        }
+
+        // The pre-capture path: the picture taken while the pointer was only
+        // hovering, before any fade.
+        //
+        // This is the assertion the photograph fallback structurally cannot pass.
+        // A photograph is a picture of the *screen*, so a recovery cut from it is
+        // framed to the window's whole frame and carries whatever the popup drew
+        // outside its panel; a pre-capture is an isolated capture like any other,
+        // so it trims to the same rect a clean capture would and is
+        // indistinguishable from one. "Indistinguishable from a clean capture" is
+        // the whole requirement, and only this phase states it.
+        panel.alphaValue = 1
+        engine.forgetPreCaptures()
+        try await Task.sleep(for: .milliseconds(250))
+        try await engine.refreshContent()
+        engine.preCapture(windowID)
+        // The lead a human gives us by aiming before clicking. 50 ms is enough by
+        // measurement; 400 ms also lets the speculative capture finish storing.
+        try await Task.sleep(for: .milliseconds(400))
+
+        panel.alphaValue = 0.06
+        try await Task.sleep(for: .milliseconds(250))
+        try await engine.refreshContent()
+        let hovered = try await engine.capture(
+            .window(windowID), options: options, recovery: recovery)
+        let hoveredOpacity = PixelCompare.bodyOpacity(hovered.image)
+        let sameFraming = hovered.image.width == before.image.width
+            && hovered.image.height == before.image.height
+        var sameGeometry = false
+        if let seen = fixtureGeometry(hovered.image) {
+            sameGeometry = !seen.clipped
+                && seen.panel == reference.panel && seen.ink == reference.ink
+            print("pre-captured:  \(engine.preCaptureCount) speculative capture(s), "
+                + "panel \(rectString(seen.panel)) px "
+                + "in \(hovered.image.width)x\(hovered.image.height), "
+                + "mean alpha \(hoveredOpacity.meanAlpha)/255"
+                + (sameFraming && sameGeometry
+                    ? "  identical to the clean capture"
+                    : "  DIFFERS FROM THE CLEAN CAPTURE"))
+        } else {
+            print("pre-captured:  NOTHING MEASURABLE")
+        }
+        ok = ok && hoveredOpacity.meanAlpha >= 250 && sameFraming && sameGeometry
+
+        let stable = Set(framings.map { "\(Int($0.size.width))x\(Int($0.size.height))" })
+        if stable.count > 1 {
+            ok = false
+            print("framing:       " + framings
+                .map { "\(String(format: "%.2f", $0.fade)) -> "
+                     + "\(Int($0.size.width))x\(Int($0.size.height))" }
+                .joined(separator: ", ")
+                + "  FADE-DEPENDENT")
+        } else {
+            print("framing:       \(stable.first ?? "none") at every fade depth")
+        }
+
+        print("result:        \(ok ? "PASS" : "FAIL")")
+        return ok ? 0 : 1
+    }
+
+    /// The photograph fallback must refuse exactly when the photograph is not a
+    /// picture of the window it claims to be.
+    ///
+    /// Two cases, and both are needed — one of them alone is a rule that always
+    /// says no, or always says yes:
+    ///
+    /// - **clear**, with an *invisible* window ranked in front of the target. The
+    ///   recovery must go ahead. This is the case that broke the first rule: it
+    ///   asked the window server for z-order and frame intersection, and on the
+    ///   test machine `UserNotificationCenter` — listed at depth 3, `alpha=1.00`,
+    ///   frame (830,190 260x364), drawing nothing whatsoever — vetoed every
+    ///   recovery there while doing nothing at all on the developer's machine.
+    ///   A window list cannot say "this one draws nothing"; pixels can.
+    ///
+    /// - **occluded**, with an opaque window really covering the target. The
+    ///   recovery must refuse, and — the assertion that matters — the returned
+    ///   image must contain none of the occluder's colour. Handing back another
+    ///   window's pixels as the picked window is the worst thing this code can
+    ///   do, and it is the thing loosening the first rule risks.
+    ///
+    /// The pre-capture path is deliberately disabled here (`forgetPreCaptures`),
+    /// because it would rescue both cases and prove nothing about the fallback.
+    private static func occludedRecoveryCheck() async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+        guard let screen = NSScreen.main,
+              let displayID = ScreenIndex.displayID(of: screen)
+        else {
+            print("result:        INCONCLUSIVE — no main display")
+            return 0
+        }
+
+        let backdrop = NSWindow(
+            contentRect: screen.frame, styleMask: [.borderless],
+            backing: .buffered, defer: false)
+        backdrop.setFrame(screen.frame, display: true)
+        backdrop.isOpaque = true
+        backdrop.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 1)
+        backdrop.level = .normal
+        backdrop.orderFrontRegardless()
+        defer { backdrop.orderOut(nil) }
+
+        let size = CGSize(width: 420, height: 300)
+        let frame = CGRect(
+            x: screen.frame.midX - size.width / 2,
+            y: screen.frame.midY - size.height / 2,
+            width: size.width, height: size.height)
+        let panel = NSPanel(
+            contentRect: frame, styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered, defer: false)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.level = NSWindow.Level(rawValue: 101)
+        panel.contentView = FadeFixtureView(drawn: CGRect(x: 70, y: 40, width: 300, height: 210))
+        panel.orderFrontRegardless()
+        defer { panel.orderOut(nil) }
+
+        /// A window that is on screen, listed, `alpha = 1`, ranked in front of
+        /// the fixture — and draws nothing. `UserNotificationCenter` in a bottle.
+        let ghost = NSPanel(
+            contentRect: frame.insetBy(dx: -20, dy: -20),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered, defer: false)
+        ghost.isOpaque = false
+        ghost.backgroundColor = .clear
+        ghost.hasShadow = false
+        ghost.level = NSWindow.Level(rawValue: 102)
+        ghost.orderFrontRegardless()
+        defer { ghost.orderOut(nil) }
+
+        try await Task.sleep(for: .milliseconds(500))
+
+        let engine = CaptureEngine()
+        try await engine.refreshContent()
+        let windowID = CGWindowID(panel.windowNumber)
+        guard engine.shareableContent.windows.contains(where: { $0.id == windowID }) else {
+            print("result:        INCONCLUSIVE — the fixture never reached the window list")
+            return 0
+        }
+        let ghostRanked = engine.shareableContent.windows
+            .prefix(while: { $0.id != windowID })
+            .contains { $0.id == CGWindowID(ghost.windowNumber) }
+        print("ghost window:  ranked in front of the fixture: \(ghostRanked)"
+            + (ghostRanked ? "" : "  <- the case under test is not set up"))
+
+        var options = CaptureOptions.default
+        options.windowPadding = 0
+
+        func photograph() async throws -> WindowRecovery {
+            let shot = try await engine.capture(.display(displayID), options: options)
+            return WindowRecovery(
+                frames: [displayID: BackdropCache.Frame(
+                    image: shot.image, scale: shot.scale, covers: screen.frame)],
+                windowsFrontToBack: engine.shareableContent.windows)
+        }
+
+        // --- clear: nothing real over the fixture, only the ghost -------------
+        let clearRecovery = try await photograph()
+        panel.alphaValue = 0.3
+        try await Task.sleep(for: .milliseconds(250))
+        engine.forgetPreCaptures()
+        try await engine.refreshContent()
+        let clear = try await engine.capture(
+            .window(windowID), options: options, recovery: clearRecovery)
+        let clearOpacity = PixelCompare.bodyOpacity(clear.image)
+        let clearOK = clearOpacity.meanAlpha >= 250
+        print("clear:         mean alpha \(clearOpacity.meanAlpha)/255 "
+            + "\(clearOK ? "recovered" : "NOT RECOVERED — the ghost vetoed it")")
+
+        // --- occluded: an opaque window really covering it --------------------
+        panel.alphaValue = 1
+        let occluder = NSPanel(
+            contentRect: CGRect(x: frame.minX, y: frame.minY,
+                                width: frame.width, height: frame.height / 2),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered, defer: false)
+        occluder.isOpaque = true
+        occluder.backgroundColor = NSColor(calibratedRed: 0.9, green: 0.1, blue: 0.1, alpha: 1)
+        occluder.level = NSWindow.Level(rawValue: 103)
+        occluder.orderFrontRegardless()
+        defer { occluder.orderOut(nil) }
+        try await Task.sleep(for: .milliseconds(400))
+
+        let occludedRecovery = try await photograph()
+        panel.alphaValue = 0.3
+        try await Task.sleep(for: .milliseconds(250))
+        engine.forgetPreCaptures()
+        try await engine.refreshContent()
+        let occluded = try await engine.capture(
+            .window(windowID), options: options, recovery: occludedRecovery)
+        let occludedOpacity = PixelCompare.bodyOpacity(occluded.image)
+
+        // The direct statement of the invariant: none of the occluder's colour
+        // may appear in a capture of the window it was covering.
+        let red = colourBounds(occluded.image) { r, g, b in r > 170 && g < 90 && b < 90 }
+        let occludedOK = red == nil
+        print("occluded:      mean alpha \(occludedOpacity.meanAlpha)/255, "
+            + "occluder's colour in the result: \(red.map(rectString) ?? "none")"
+            + (occludedOK ? "  refused, as it must" : "  LEAKED SOMEBODY ELSE'S PIXELS"))
+
+        // How deep a fade the rule can still see through, measured rather than
+        // assumed. The un-premultiply amplifies quantisation by 255/alpha, so the
+        // clear reading rises as the window fades; the question is where it meets
+        // the occluded one. The threshold in `CaptureEngine` has to sit in the gap
+        // this prints, and the gap closing is the honest limit of the method.
+        print("sweep:         fade   clear   occluded   (mean |photo - colour|, /255)")
+        // Both photographs must be taken with the window at full opacity — that
+        // is what a pre-click photograph is. Taking them while it was still faded
+        // from the case above made the *clear* reading 60 instead of 2, which is
+        // the check measuring its own setup rather than the thing under test.
+        panel.alphaValue = 1
+        occluder.orderOut(nil)
+        try await Task.sleep(for: .milliseconds(400))
+        let sweepClear = try await photograph()
+        occluder.orderFrontRegardless()
+        try await Task.sleep(for: .milliseconds(400))
+        let sweepOccluded = try await photograph()
+
+        for fade in [0.6, 0.3, 0.15, 0.08, 0.04] {
+            panel.alphaValue = fade
+            try await Task.sleep(for: .milliseconds(200))
+            try await engine.refreshContent()
+            engine.forgetPreCaptures()
+            _ = try? await engine.capture(
+                .window(windowID), options: options, recovery: sweepClear)
+            let readingClear = engine.lastPhotographDisagreement
+            engine.forgetPreCaptures()
+            _ = try? await engine.capture(
+                .window(windowID), options: options, recovery: sweepOccluded)
+            let readingOccluded = engine.lastPhotographDisagreement
+            print(String(format: "               %.2f   %@   %@",
+                         fade,
+                         readingClear.map { String(format: "%5d", $0) } ?? "  n/a",
+                         readingOccluded.map { String(format: "%8d", $0) } ?? "     n/a"))
+        }
+        panel.alphaValue = 1
+
+        let ok = clearOK && occludedOK
+        print("result:        \(ok ? "PASS" : "FAIL")")
+        return ok ? 0 : 1
+    }
+
+    /// The box containing every pixel of one of the fixture's two colours, in
+    /// image pixels with the origin at the top left.
+    ///
+    /// A fiducial rather than a whole-image comparison. `PixelCompare.compare`
+    /// reports 87% of pixels differing between two *correctly aligned* captures
+    /// here, and it is right to: outside the panel the isolated capture is
+    /// transparent while the recovered one shows what was behind it. A metric
+    /// that cannot tell that apart from a shifted crop is no use.
+    private static func colourBounds(
+        _ image: CGImage, matching hit: (Int, Int, Int) -> Bool
+    ) -> CGRect? {
+        let width = image.width, height = image.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let drawn = pixels.withUnsafeMutableBytes { raw -> Bool in
+            guard let context = CGContext(
+                data: raw.baseAddress, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return false }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard drawn else { return nil }
+
+        var minX = width, maxX = -1, minY = height, maxY = -1
+        for y in 0..<height {
+            for x in 0..<width {
+                let index = (y * width + x) * 4
+                guard hit(Int(pixels[index]), Int(pixels[index + 1]), Int(pixels[index + 2]))
+                else { continue }
+                minX = min(minX, x); maxX = max(maxX, x)
+                minY = min(minY, y); maxY = max(maxY, y)
+            }
+        }
+        guard maxX >= 0 else { return nil }
+        // The context is bottom-up; report from the top, like `cropping(to:)`.
+        return CGRect(x: minX, y: height - 1 - maxY,
+                      width: maxX - minX + 1, height: maxY - minY + 1)
+    }
+
+    /// The fixture's panel and its stripes, and whether the panel ran off the
+    /// edge of the capture.
+    ///
+    /// `clipped` is the reported symptom, stated as a measurement: "the left
+    /// third of the panel is missing" is the panel's box touching the frame.
+    private static func fixtureGeometry(
+        _ image: CGImage
+    ) -> (panel: CGRect, ink: CGRect, clipped: Bool)? {
+        guard let panel = colourBounds(image, matching: { r, g, b in
+            r < 110 && b > 150 && g > 70 && g < 160
+        }), let ink = colourBounds(image, matching: { r, g, b in
+            r > 200 && g > 180 && b < 120
+        }) else { return nil }
+        let clipped = panel.minX <= 0 || panel.minY <= 0
+            || panel.maxX >= CGFloat(image.width) - 1
+            || panel.maxY >= CGFloat(image.height) - 1
+        return (panel, ink, clipped)
+    }
+
+    /// The stand-in popup: an off-centre rounded panel with enough asymmetric
+    /// detail that a crop taken a few points off cannot be mistaken for a good
+    /// one, surrounded by the transparent margin that makes `trimmed` run.
+    private final class FadeFixtureView: NSView {
+        private let drawn: CGRect
+
+        init(drawn: CGRect) {
+            self.drawn = drawn
+            super.init(frame: .zero)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { fatalError("not used") }
+
+        override func draw(_ dirtyRect: NSRect) {
+            NSColor.clear.setFill()
+            dirtyRect.fill()
+
+            // A very faint halo around the panel, wider on the left, and the
+            // reason this fixture reproduces the bug at all.
+            //
+            // `opaqueBounds` asks "alpha > 0" on a downscale, so what decides the
+            // crop is the *faintest* thing the window drew. A hard-edged fixture
+            // keeps its edges at any fade and the check passes while the shipping
+            // path is broken — the first two versions of this did exactly that.
+            // A real popup has soft edges, and those are what quantisation eats
+            // first: at alpha 6/255 this halo survives a 0.6 fade (3.6 -> 4) and
+            // dies in a 0.06 one (0.36 -> 0), so the crop shrinks, asymmetrically,
+            // exactly as it did on DuoUpdater's popup.
+            NSColor(calibratedWhite: 1, alpha: 6.0 / 255).setFill()
+            CGRect(x: drawn.minX - 40, y: drawn.minY - 12,
+                   width: drawn.width + 55, height: drawn.height + 30)
+                .intersection(bounds).fill()
+
+            NSBezierPath(roundedRect: drawn, xRadius: 12, yRadius: 12).addClip()
+            NSColor(calibratedRed: 0.15, green: 0.35, blue: 0.75, alpha: 1).setFill()
+            drawn.fill()
+            // Stripes down one side only. A uniform fill is the same picture
+            // after a horizontal shift; this is not.
+            NSColor(calibratedRed: 0.95, green: 0.85, blue: 0.20, alpha: 1).setFill()
+            for step in 0..<6 {
+                CGRect(x: drawn.minX + 8, y: drawn.minY + 12 + CGFloat(step) * 32,
+                       width: 40 + CGFloat(step) * 18, height: 16).fill()
+            }
+            NSColor.white.setFill()
+            CGRect(x: drawn.maxX - 34, y: drawn.maxY - 34, width: 22, height: 22).fill()
+        }
     }
 
     /// The one comparison a standalone probe cannot make: both capture paths,
