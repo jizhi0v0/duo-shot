@@ -82,9 +82,28 @@ in `make test`. Conventions that are load-bearing:
   measuring and changes the very frame under test — three rounds of conclusions
   were built on numbers it had corrupted. Photograph the real window instead
   (`photographEditor`, or `coordinator.engine.capture`).
-- Two traps in the harness itself: `perform(Selector(...))` on a method that is
-  not `@objc` crashes, and a synthesized drag delivered into `NSTextView`
-  enters AppKit's modal tracking loop and hangs the run for ten minutes.
+- Three traps in the harness itself. `perform(Selector(...))` on a method that
+  is not `@objc` crashes. A synthesized drag delivered into `NSTextView` enters
+  AppKit's modal tracking loop and hangs the run for ten minutes. And the
+  `click` helper calls `mouseDown` directly, which on an **`NSButton`** enters
+  `NSCell.trackMouse(…untilMouseUp:)` — it pulls from an event queue no
+  synthesized mouse-up is ever posted to. Use `hitTest` to prove the button is
+  reachable and `performClick(nil)` to fire it (`--selftest-delete` does).
+- **Some checks are red on the mini at pristine HEAD, and *which* ones drifts.**
+  Measured three times: 2026-08-05 `rect pipeline` / `selection loupe` /
+  `freeze mode` / `scroll capture flow`; 2026-08-09 only `sourceRect semantics`;
+  2026-08-12 `faded window` / `occluded recovery` / `scroll capture flow`, plus
+  `edit menu (paste)` INCONCLUSIVE. Almost no overlap between the three.
+  So **never attribute a red on the mini to your change, and never clear one
+  either, without diffing against a detached-HEAD worktree in the same session**
+  — `git worktree add <dir> --detach HEAD` then `make test-mini
+  CHECK_DIR='~/duo-shot-headbase'`. Any list written down here is stale by the
+  time you read it; the comparison is the only answer.
+- Anything that builds the **status menu** reads `ShareSettings.shared`, whose
+  initialiser reads the Keychain, which headless can block on a prompt nobody is
+  there to answer. This is why `--selftest-share-card`, `--selftest-share-flow`
+  and `--selftest-failure-notice-ui` are **not** in `make test`. Keep menu
+  assertions out of the suite; put the coordinator-level contract in it instead.
 
 ## The image editor
 
