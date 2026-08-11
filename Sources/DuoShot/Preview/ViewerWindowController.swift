@@ -93,6 +93,7 @@ final class ViewerWindowController {
                                   styleMask: [.titled, .closable, .miniaturizable, .resizable],
                                   backing: .buffered, defer: false)
         window.title = entry.url.lastPathComponent
+        window.fileURL = entry.url
         window.contentView = content.view
         window.contentMinSize = content.minSize
         // The window outlives its close — `windows` is what decides lifetime, and
@@ -446,6 +447,9 @@ final class ViewerWindowController {
 /// At the window rather than in either content view, so the answer cannot depend
 /// on what is being shown.
 private final class ViewerWindow: NSWindow {
+    /// The capture on show, so ⌘⌫ knows what to throw away. Set by `show`.
+    var fileURL: URL?
+
     override func cancelOperation(_ sender: Any?) {
         performClose(nil)
     }
@@ -455,9 +459,24 @@ private final class ViewerWindow: NSWindow {
         // and a viewer that swallowed them would be worse than one that cannot
         // be closed with the keyboard.
         if super.performKeyEquivalent(with: event) { return true }
-        guard event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
-              event.charactersIgnoringModifiers?.lowercased() == "w"
-        else { return false }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags == .command else { return false }
+
+        if event.keyCode == 51 {  // ⌘⌫
+            // `ImageEditor.performKeyEquivalent` returns false while its typing
+            // box is up, so control arrives here — and `performKeyEquivalent`
+            // runs *before* `keyDown`, which is where ⌘⌫ means "delete to the
+            // start of the line". Without this guard, ⌘⌫ while typing an
+            // annotation throws the whole capture in the Trash instead of
+            // deleting a word.
+            if (contentView as? ImageEditor)?.isTyping == true { return false }
+            guard let url = fileURL else { return false }
+            performClose(nil)
+            Task { await CaptureTrash.delete(url) }
+            return true
+        }
+
+        guard event.charactersIgnoringModifiers?.lowercased() == "w" else { return false }
         performClose(nil)
         return true
     }

@@ -41,6 +41,21 @@ final class CaptureSearchModel {
         }
     }
 
+    /// Throws the capture away and takes its row with it.
+    ///
+    /// The row is dropped here rather than waiting for a re-search, because the
+    /// query has not changed and nothing else would make the list run again —
+    /// leaving a hit pointing at a file in the Trash until the window is
+    /// reopened. `forgetMissingFiles()` on the next `refresh()` is the backstop,
+    /// not the mechanism.
+    func delete(_ url: URL) {
+        Task {
+            guard await CaptureTrash.delete(url) != nil else { return }
+            hits.removeAll { $0.url == url }
+            indexed = await index.count
+        }
+    }
+
     private func run() {
         generation += 1
         let token = generation
@@ -57,6 +72,7 @@ final class CaptureSearchModel {
 
 struct CaptureSearchView: View {
     @Bindable var model: CaptureSearchModel
+    @State private var selected: URL?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -83,12 +99,23 @@ struct CaptureSearchView: View {
                 }
                 .frame(maxHeight: .infinity)
             } else {
-                List(model.hits, id: \.url) { hit in
+                List(model.hits, id: \.url, selection: $selected) { hit in
                     row(hit)
                         .contentShape(Rectangle())
                         .onTapGesture(count: 2) { open(hit) }
+                        .contextMenu {
+                            Button("Open") { open(hit) }
+                            Button("Move to Trash") { model.delete(hit.url) }
+                        }
                 }
                 .listStyle(.inset)
+                // ⌫ on the selected row. The context menu above is the
+                // discoverable half and the one the self-test can assert
+                // through, since `onDeleteCommand` needs the list to hold focus
+                // and nothing in this tree exercises that path.
+                .onDeleteCommand {
+                    if let selected { model.delete(selected) }
+                }
             }
 
             Divider()

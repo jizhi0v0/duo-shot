@@ -40,6 +40,11 @@ enum SelfTest {
         /// Runs a capture through the real output pipeline into a throwaway
         /// directory: filename, encoding, save, clipboard.
         case output(directory: URL)
+        case saveFailure(directory: URL)
+        case failureNotice
+        case failureNoticeUI
+        case delete(directory: URL)
+        case annotate(directory: URL)
         /// Presents a real floating preview and checks that it never takes focus,
         /// stays out of the next capture, and auto-dismisses.
         case preview(directory: URL)
@@ -199,6 +204,19 @@ enum SelfTest {
                 )
             case "--selftest-output":
                 self = .output(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
+            case "--selftest-save-failure":
+                self = .saveFailure(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
+            case "--selftest-failure-notice":
+                self = .failureNotice
+            case "--selftest-failure-notice-ui":
+                self = .failureNoticeUI
+            case "--selftest-delete":
+                self = .delete(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
+            case "--selftest-annotate":
+                self = .annotate(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-share-flow":
                 self = .shareFlow
             case "--selftest-share-credentials":
@@ -407,6 +425,11 @@ enum SelfTest {
             case .overlay(let rect, let url, let excluding):
                 return try await overlayExclusion(rect, output: url, excluding: excluding)
             case .output(let directory): return try await outputPipeline(into: directory)
+            case .saveFailure(let directory): return try await saveFailure(into: directory)
+            case .failureNotice: return await failureNotice()
+            case .failureNoticeUI: return failureNoticeUI()
+            case .delete(let directory): return try await deleteCapture(into: directory)
+            case .annotate(let directory): return try await annotateHotkey(into: directory)
             case .preview(let directory): return try await previewPanel(into: directory)
             case .previewStack(let count, let directory):
                 return try await previewStack(count: count, into: directory)
@@ -1927,6 +1950,512 @@ enum SelfTest {
         let pass = exists && output.wasSaved && sizeOK && pasteboardImage != nil && templateOK
         print("result:        \(pass ? "PASS" : "FAIL")")
         return pass ? 0 : 1
+    }
+
+    // MARK: - Save failure
+
+    /// A capture whose save failed must survive, and prune must not be able to
+    /// reach it.
+    ///
+    /// Two halves, because there are two independent ways to lose the file and
+    /// each has its own revert: the pipeline can fail to quarantine it, or prune
+    /// can delete the quarantine out from under it. The second is the subtle one
+    /// — a subdirectory is an ordinary entry in `contentsOfDirectory` and
+    /// `removeItem` on a directory is recursive.
+    private static func saveFailure(into directory: URL) async throws -> Int32 {
+        var failed = false
+        let fileManager = FileManager.default
+
+        // Half 1 — the shipping pipeline, with a save destination that cannot
+        // work. `/dev/null` is a character device, so `createDirectory` beneath
+        // it throws ENOTDIR every time on every machine: no chmod, no root, and
+        // nothing of the user's touched.
+        //
+        // The capture is synthesised rather than photographed, and deliberately:
+        // what is under test is the save path, not ScreenCaptureKit. Taking a
+        // real picture would make this check need a grant, an awake display and
+        // a still screen — three ways to go INCONCLUSIVE that have nothing to do
+        // with what it asserts. (Found the hard way: the display slept
+        // mid-session and both halves stopped running.)
+        let result = CaptureResult(
+            image: blankImage(), pointSize: CGSize(width: 10, height: 10), scale: 1,
+            sourceDisplayID: CGMainDisplayID(), sourceDescription: "save-failure self-test",
+            capturedAt: .now)
+
+        guard let output = await OutputPipeline.shared.process(
+            result, saveDirectoryOverride: URL(fileURLWithPath: "/dev/null/duoshot"))
+        else {
+            print("result:        FAIL — pipeline returned nothing")
+            return 1
+        }
+        // This half runs against the real `StagingStore.shared`, because that is
+        // the object the shipping pipeline holds. One file is created in the
+        // user's Unsaved folder and this takes it away again.
+        defer { try? fileManager.removeItem(at: output.url) }
+
+        let unsaved = StagingStore.shared.unsavedDirectory
+        let held = output.url.deletingLastPathComponent().standardizedFileURL.path
+            == unsaved.standardizedFileURL.path
+        let onDisk = fileManager.fileExists(atPath: output.url.path)
+        print("save failed:   \(output.saveFailed)")
+        print("landed in:     \(output.url.deletingLastPathComponent().lastPathComponent)/"
+              + "\(output.url.lastPathComponent)")
+        if !output.saveFailed {
+            print("result:        FAIL — an impossible save directory reported success")
+            failed = true
+        }
+        if !held {
+            print("result:        FAIL — save-failed capture is not in Unsaved")
+            failed = true
+        }
+        if !onDisk {
+            print("result:        FAIL — save-failed capture is not on disk at all")
+            failed = true
+        }
+
+        // Half 2 — prune pressure, on an injected store so the user's real
+        // staging directory is never pruned by a test.
+        let tmp = directory.appendingPathComponent("staging-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fileManager.removeItem(at: tmp) }
+        let store = StagingStore(directory: tmp)
+
+        let victim = store.directory.appendingPathComponent("victim.png")
+        try Data([0x00]).write(to: victim)
+        let quarantined = store.quarantine(victim)
+
+        // Written after the quarantine so every one of them is newer than the
+        // Unsaved directory itself — which is what puts that directory past the
+        // cap, and so makes revert #2 actually fail rather than pass by luck.
+        let fillers = 250
+        for index in 0..<fillers {
+            try Data([0x00]).write(
+                to: store.directory.appendingPathComponent("filler-\(index).bin"))
+        }
+        store.prune()
+
+        let survived = fileManager.fileExists(atPath: quarantined.path)
+        var isDirectory: ObjCBool = false
+        let folderStands = fileManager.fileExists(
+            atPath: store.unsavedDirectory.path, isDirectory: &isDirectory) && isDirectory.boolValue
+        let remaining = (try? fileManager.contentsOfDirectory(
+            at: store.directory, includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]))?.count ?? 0
+
+        print("after prune:   quarantined survived=\(survived) folder=\(folderStands) "
+              + "root entries=\(remaining) (wrote \(fillers))")
+        if !survived {
+            print("result:        FAIL — prune deleted a save-failed capture")
+            failed = true
+        }
+        if !folderStands {
+            print("result:        FAIL — prune removed the Unsaved directory")
+            failed = true
+        }
+        // Without this the two assertions above pass for the wrong reason if
+        // prune ever silently stops running: nothing was deleted, so nothing was
+        // wrongly deleted.
+        if remaining >= fillers {
+            print("result:        FAIL — prune did not run (\(remaining) entries left of \(fillers))")
+            failed = true
+        }
+
+        print("result:        \(failed ? "FAIL" : "PASS")")
+        return failed ? 1 : 0
+    }
+
+    // MARK: - Capture area and annotate
+
+    /// ⇧⌘W: the same capture as ⇧⌘A, handed to the editor as well as the card.
+    ///
+    /// Two halves. The migration half is pure logic and always runs; the
+    /// end-to-end half needs a screen to drag a selection on.
+    private static func annotateHotkey(into directory: URL) async throws -> Int32 {
+        var failures = 0
+        func check(_ what: String, _ ok: Bool, _ detail: String = "") {
+            print("  \(ok ? "ok  " : "FAIL") \(what)\(detail.isEmpty ? "" : " — \(detail)")")
+            if !ok { failures += 1 }
+        }
+
+        // MARK: does the shortcut reach the user at all
+        //
+        // Three fixtures, because the ledger has three answers and only one of
+        // them is "hand it over".
+        let combo = HotKeyAction.captureAreaAnnotate.defaultCombo
+        check("the action has a default combo", combo != nil)
+
+        // A defaults dictionary written before the ledger existed. Without
+        // `sinceLedger` naming the new case, this branch calls it already-seen
+        // and the shortcut silently never arrives.
+        let preLedger = Preferences.migratedHotkeys(
+            [.captureArea: KeyCombo(keyCode: UInt16(kVK_ANSI_A), modifiers: [.shift, .command])],
+            seen: nil)
+        check("a pre-ledger install is given ⇧⌘W",
+              preLedger[.captureAreaAnnotate] == combo,
+              preLedger[.captureAreaAnnotate]?.displayString ?? "<nothing>")
+
+        // Cleared on purpose stays cleared: the ledger has seen it, so it is not
+        // resurrected on the next launch.
+        let cleared = Preferences.migratedHotkeys([:], seen: Set(HotKeyAction.allCases))
+        check("an action the ledger knows is not resurrected",
+              cleared[.captureAreaAnnotate] == nil,
+              cleared[.captureAreaAnnotate]?.displayString ?? "<nothing>")
+
+        // Never steals: if the user already put ⇧⌘W on something else, the new
+        // action arrives unbound rather than taking it.
+        let taken = Preferences.migratedHotkeys(
+            [.captureFullscreen: combo!], seen: nil)
+        check("⇧⌘W already in use is not stolen",
+              taken[.captureAreaAnnotate] == nil && taken[.captureFullscreen] == combo,
+              "annotate=\(taken[.captureAreaAnnotate]?.displayString ?? "<nothing>")")
+
+        // MARK: does it actually open the editor
+        guard ScreenPermission.isGranted else {
+            print("""
+                result:        INCONCLUSIVE — no screen-recording grant, so only the migration \
+                half ran. Those checks still stand.
+                """)
+            return failures == 0 ? 0 : 1
+        }
+
+        let coordinator = CaptureCoordinator()
+        let previews = PreviewStackController()
+        previews.timeout = .seconds(30)
+        coordinator.additionalExcludedWindowIDs = { previews.panelWindowIDs }
+        let viewer = ViewerWindowController.shared
+        viewer.activatesOnShow = false
+        defer {
+            viewer.closeAll()
+            previews.dismissAllForTest()
+        }
+
+        var staged: [URL] = []
+        defer { for url in staged { try? FileManager.default.removeItem(at: url) } }
+        coordinator.onResult = { result in
+            guard let output = await OutputPipeline.shared.process(
+                result, saveDirectoryOverride: directory) else { return nil }
+            staged.append(output.url)
+            let entry = await PreviewEntry(output)
+            previews.present(entry)
+            return entry
+        }
+
+        /// Drives one capture through the overlay, and answers what it produced.
+        func capture(intent: CaptureCoordinator.Intent) async -> Int {
+            let task = Task { await coordinator.captureArea(intent: intent) }
+            for _ in 0..<40 where !coordinator.overlay.isArmedForTest {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            let anchor = CGPoint(x: 300, y: 300)
+            coordinator.overlay.forceHover(atAppKitGlobal: anchor)
+            coordinator.overlay.dragForTest(
+                from: anchor, to: CGPoint(x: anchor.x + 200, y: anchor.y + 150))
+            _ = await task.value
+            try? await Task.sleep(for: .milliseconds(400))
+            return viewer.openWindowCount
+        }
+
+        let annotated = await capture(intent: .annotate)
+        check("⇧⌘W opens the editor on the capture", annotated == 1, "\(annotated) window(s)")
+        // Card *and* editor. Asserted rather than assumed, because "the editor
+        // replaces the card" was the plausible alternative design and nothing
+        // else in the tree would notice if it silently became true.
+        check("and leaves the card up too", previews.count == 1, "\(previews.count) card(s)")
+
+        viewer.closeAll()
+        previews.dismissAllForTest()
+        try? await Task.sleep(for: .milliseconds(200))
+
+        // The negative control, in the same run: the ordinary shortcut must not
+        // start opening editors. Without this half, a `deliver` that ignored the
+        // intent entirely would pass.
+        let ordinary = await capture(intent: .standard)
+        check("⇧⌘A opens no editor", ordinary == 0, "\(ordinary) window(s)")
+
+        print("result:        \(failures == 0 ? "PASS" : "FAIL")")
+        return failures == 0 ? 0 : 1
+    }
+
+    // MARK: - Deleting a capture
+
+    /// The bin on the card, ⌘⌫ in the viewer, and the guard that stops ⌘⌫
+    /// deleting the picture while you are typing on it.
+    ///
+    /// Asserts the file reaches the **Trash**, not merely that it stopped
+    /// existing: recoverability is the entire reason this control is allowed to
+    /// act on one click with no confirmation, so `removeItem` has to be a
+    /// failing answer rather than an equivalent one.
+    private static func deleteCapture(into directory: URL) async throws -> Int32 {
+        var failures = 0
+        func check(_ what: String, _ ok: Bool, _ detail: String = "") {
+            print("  \(ok ? "ok  " : "FAIL") \(what)\(detail.isEmpty ? "" : " — \(detail)")")
+            if !ok { failures += 1 }
+        }
+
+        let fileManager = FileManager.default
+        let trash = try fileManager.url(
+            for: .trashDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
+        // A stem nothing else can own, so "is it in the Trash" is answerable by
+        // looking rather than by guessing which of several files it was.
+        let stem = "duoshot-selftest-\(UUID().uuidString)"
+
+        // Big enough that the editor's canvas covers the coordinates the typing
+        // recipe clicks at. A 10-point fixture opens a viewer smaller than the
+        // click, which hit-tests to nothing and produces no box — a failure of
+        // the fixture that reads exactly like a failure of the guard.
+        let fixtureSize = CGSize(width: 600, height: 400)
+        func fixture(_ suffix: String) throws -> URL {
+            let url = directory.appendingPathComponent("\(stem)-\(suffix).png")
+            guard let image = flatImage(
+                width: Int(fixtureSize.width), height: Int(fixtureSize.height))
+            else { throw CocoaError(.fileWriteUnknown) }
+            try ImageEncoder.write(image, to: url, as: .png, scale: 1, quality: 1)
+            return url
+        }
+        func inTrash(_ name: String) -> Bool {
+            fileManager.fileExists(atPath: trash.appendingPathComponent(name).path)
+        }
+        /// The delete is fire-and-forget from the UI's point of view, so the
+        /// assertions have to wait for it rather than race it.
+        func settle(until done: () async -> Bool) async {
+            for _ in 0..<60 where !(await done()) {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+        }
+        // Whatever happens, nothing of this run is left in the Trash.
+        defer {
+            for suffix in ["card", "viewer", "typing"] {
+                try? fileManager.removeItem(
+                    at: trash.appendingPathComponent("\(stem)-\(suffix).png"))
+            }
+        }
+
+        // MARK: the card's bin
+
+        let card = try fixture("card")
+        // Recorded directly rather than through Vision: what is under test is
+        // that deleting forgets, not that OCR works. Netted out by the delete.
+        await CaptureIndex.shared.record(card, text: stem, capturedAt: .now)
+        check("the capture is findable to begin with",
+              !(await CaptureIndex.shared.search(stem).isEmpty))
+
+        let previews = PreviewStackController()
+        defer { previews.dismissAllForTest() }
+        previews.present(PreviewEntry(
+            kind: .image(pointSize: fixtureSize),
+            thumbnail: NSImage(size: PreviewCardView.cardSize),
+            url: card, sourceDisplayID: CGMainDisplayID()))
+        previews.setHoverForTest(true)
+
+        guard let cardView = previews.frontCardForTest,
+              let content = previews.panelContentViewForTest,
+              let bin = cardView.trashButtonForTest
+        else {
+            print("result:        FAIL — no card, panel or bin to act on")
+            return 1
+        }
+        // Reachability by hit test, from the panel's content view — where a real
+        // click starts. A geometry assertion would have passed for the Redact
+        // button too, and that one was dead.
+        let centre = bin.convert(CGRect(origin: .zero, size: bin.bounds.size), to: content)
+        check("the bin is where a click would land on it",
+              content.hitTest(CGPoint(x: centre.midX, y: centre.midY)) === bin,
+              "\(String(describing: content.hitTest(CGPoint(x: centre.midX, y: centre.midY))))")
+
+        // `performClick`, not the `click` helper: that one calls `mouseDown`
+        // directly, and `NSButton.mouseDown` runs `NSCell.trackMouse` which
+        // pulls events from a queue no synthesized mouse-up is ever posted to.
+        bin.performClick(nil)
+        await settle { !fileManager.fileExists(atPath: card.path) }
+
+        check("clicking it takes the file out of the save folder",
+              !fileManager.fileExists(atPath: card.path))
+        check("and puts it in the Trash, recoverable", inTrash("\(stem)-card.png"))
+        check("and the card goes with it", previews.count == 0, "\(previews.count)")
+        await settle { await CaptureIndex.shared.search(stem).isEmpty }
+        check("and it stops being findable",
+              await CaptureIndex.shared.search(stem).isEmpty,
+              "\(await CaptureIndex.shared.search(stem).map(\.name))")
+
+        // MARK: ⌘⌫ in the viewer
+
+        let viewer = ViewerWindowController.shared
+        viewer.activatesOnShow = false
+        defer { viewer.closeAll() }
+
+        let opened = try fixture("viewer")
+        viewer.show(PreviewEntry(
+            kind: .image(pointSize: fixtureSize),
+            thumbnail: NSImage(size: PreviewCardView.cardSize),
+            url: opened, sourceDisplayID: CGMainDisplayID()))
+        await settle { viewer.windowForTest(opened) != nil }
+        guard let window = viewer.windowForTest(opened) else {
+            print("result:        FAIL — the viewer never opened")
+            return 1
+        }
+        // Through `performKeyEquivalent`, which is the real routing entry for a
+        // command key, rather than by calling whatever handles it.
+        _ = window.performKeyEquivalent(with: commandDelete(for: window))
+        await settle { !fileManager.fileExists(atPath: opened.path) }
+        check("⌘⌫ in the viewer trashes the capture", inTrash("\(stem)-viewer.png"))
+        check("and closes the window", viewer.windowForTest(opened) == nil)
+
+        // MARK: the typing guard
+
+        let typed = try fixture("typing")
+        viewer.show(PreviewEntry(
+            kind: .image(pointSize: fixtureSize),
+            thumbnail: NSImage(size: PreviewCardView.cardSize),
+            url: typed, sourceDisplayID: CGMainDisplayID()))
+        await settle { viewer.windowForTest(typed) != nil }
+        guard let typingWindow = viewer.windowForTest(typed),
+              let editor = typingWindow.contentView as? ImageEditor
+        else {
+            print("result:        FAIL — no editor to type into")
+            return 1
+        }
+        // The text tool, then a *click* to place the box — the recipe the edit
+        // check already proves works. Never a drag: a synthesized drag into
+        // NSTextView enters AppKit's modal tracking loop and hangs the run for
+        // ten minutes.
+        press("t", on: editor, in: typingWindow)
+        if let canvas = editor.hitTest(CGPoint(x: 200, y: 200)) {
+            let inWindow = canvas.convert(CGPoint(x: 120, y: 260), to: nil)
+            if let down = NSEvent.mouseEvent(
+                with: .leftMouseDown, location: inWindow, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: typingWindow.windowNumber, context: nil,
+                eventNumber: 0, clickCount: 1, pressure: 1) {
+                canvas.mouseDown(with: down)
+            }
+        }
+        check("a typing box is up", editor.isTyping)
+
+        _ = typingWindow.performKeyEquivalent(with: commandDelete(for: typingWindow))
+        // Given a chance to do the wrong thing before being asked if it did.
+        try? await Task.sleep(for: .milliseconds(300))
+        check("⌘⌫ while typing does not trash the capture",
+              fileManager.fileExists(atPath: typed.path))
+        check("and leaves the window open", viewer.windowForTest(typed) != nil)
+        try? fileManager.removeItem(at: typed)
+
+        print("result:        \(failures == 0 ? "PASS" : "FAIL")")
+        return failures == 0 ? 0 : 1
+    }
+
+    private static func commandDelete(for window: NSWindow) -> NSEvent {
+        NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [.command],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber, context: nil,
+            characters: "\u{7F}", charactersIgnoringModifiers: "\u{7F}",
+            isARepeat: false, keyCode: 51)!
+    }
+
+    // MARK: - Capture failure is reported
+
+    /// A capture that finally fails must say so, exactly once.
+    ///
+    /// Deliberately does **not** build the status menu. Menu construction reads
+    /// the share settings, which read the Keychain, which in a headless run can
+    /// block on a prompt nobody is there to answer — the same reason
+    /// `--selftest-share-card` and `--selftest-share-flow` are not in
+    /// `make test`. The menu-bar surface is asserted by
+    /// `--selftest-failure-notice-ui`, which is excluded for that reason.
+    private static func failureNotice() async -> Int32 {
+        var failures = 0
+        func check(_ what: String, _ ok: Bool, _ detail: String = "") {
+            print("  \(ok ? "ok  " : "FAIL") \(what)\(detail.isEmpty ? "" : " — \(detail)")")
+            if !ok { failures += 1 }
+        }
+
+        // Every failure has to have something a person can read. Driven off
+        // `allCases` so a fifth case cannot quietly arrive without one.
+        for failure in CaptureFailure.allCases {
+            let sentence = failure.summary
+            check("\(failure) has a sentence",
+                  !sentence.isEmpty && sentence.first!.isUppercase, "\"\(sentence)\"")
+        }
+
+        // A display ID that cannot exist. This fails the same way whether or not
+        // there is a screen, a grant, or anybody at the machine — which is the
+        // point: the check is about the reporting path, not about capturing.
+        let coordinator = CaptureCoordinator()
+        var reported: [CaptureFailure] = []
+        coordinator.onCaptureFailed = { reported.append($0) }
+
+        let result = await coordinator.captureDisplay(0xDEAD_BEEF)
+        check("an impossible capture returns nothing", result == nil)
+        // Exactly one, not two: `.noCaptureSource` is refreshed and retried once
+        // before it is terminal, and reporting the attempt as well as the
+        // outcome would put a warning in the menu bar for a race the app
+        // handled by itself. Counting pins the retry as well as the report.
+        check("and is reported exactly once", reported.count == 1, "got \(reported.count)")
+        check("as the failure it was", reported.first == .noCaptureSource, "\(reported)")
+
+        print("result:        \(failures == 0 ? "PASS" : "FAIL")")
+        return failures == 0 ? 0 : 1
+    }
+
+    /// The menu-bar half: the sentence reaches the tool tip, the icon, and a row.
+    ///
+    /// **Not in `make test`**, and not by oversight: `buildMenu` reaches
+    /// `ShareSettings.shared`, whose initialiser reads the Keychain, and a
+    /// Keychain read in a headless run can block on a prompt nobody is there to
+    /// answer. `--selftest-share-card` and `--selftest-share-flow` are excluded
+    /// for the same reason. Run it by hand on a machine with a logged-in
+    /// Keychain.
+    private static func failureNoticeUI() -> Int32 {
+        var failures = 0
+        func check(_ what: String, _ ok: Bool, _ detail: String = "") {
+            print("  \(ok ? "ok  " : "FAIL") \(what)\(detail.isEmpty ? "" : " — \(detail)")")
+            if !ok { failures += 1 }
+        }
+
+        let coordinator = CaptureCoordinator()
+        let overlay = OverlayController()
+        let status = StatusItemController(
+            coordinator: coordinator,
+            recorder: RecordingCoordinator(overlay: overlay),
+            scroller: ScrollCaptureCoordinator(engine: coordinator.engine, overlay: overlay))
+        status.install()
+        defer { status.remove() }
+
+        guard let button = status.buttonForTest else {
+            print("result:        INCONCLUSIVE — no status item button to assert on")
+            return 0
+        }
+        check("the idle icon says nothing is wrong",
+              button.image?.accessibilityDescription == "DuoShot",
+              button.image?.accessibilityDescription ?? "<nil>")
+
+        // Through the shipping wiring, not a copy of it.
+        status.observeFailures(of: coordinator)
+        coordinator.onCaptureFailed?(.authorisationLost)
+
+        let sentence = CaptureFailure.authorisationLost.summary
+        check("the tool tip carries the sentence", button.toolTip == sentence,
+              button.toolTip ?? "<nil>")
+        check("the icon turns into a warning",
+              button.image?.accessibilityDescription == "A capture failed",
+              button.image?.accessibilityDescription ?? "<nil>")
+
+        let row = status.menuForTest().item(at: 0)
+        check("the menu's first row is the sentence", row?.title == sentence,
+              row?.title ?? "<nil>")
+
+        // `sendAction` rather than `perform(Selector(...))`: the latter crashes
+        // on anything not `@objc`, which CLAUDE.md records as a harness trap.
+        if let action = row?.action {
+            NSApp.sendAction(action, to: row?.target, from: row)
+        }
+        check("clicking it clears the notice", button.toolTip == nil,
+              button.toolTip ?? "<nil>")
+        check("and puts the idle icon back",
+              button.image?.accessibilityDescription == "DuoShot",
+              button.image?.accessibilityDescription ?? "<nil>")
+
+        print("result:        \(failures == 0 ? "PASS" : "FAIL")")
+        return failures == 0 ? 0 : 1
     }
 
     // MARK: - Preview panel
@@ -6968,7 +7497,7 @@ enum SelfTest {
         // rest of this test could never make: everything else here is a
         // screenshot for a human to look at, and a human looked straight past
         // that gap for weeks.
-        let expectedButtons = ShareService.shared.isConfigured ? 3 : 2
+        let expectedButtons = ShareService.shared.isConfigured ? 4 : 3
         if let layout = previews.actionBarLayoutForTest {
             print("action bar:    \(rectString(layout.frame)) "
                   + "\(layout.visibleButtons) buttons, configured=\(ShareService.shared.isConfigured)")

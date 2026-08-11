@@ -334,7 +334,14 @@ final class Preferences {
     nonisolated static func migratedHotkeys(
         _ decoded: [HotKeyAction: KeyCombo], seen: Set<HotKeyAction>?
     ) -> [HotKeyAction: KeyCombo] {
-        let seen = seen ?? Set(HotKeyAction.allCases.filter { $0 != .captureScrolling })
+        // Everything introduced *after* the ledger, which by definition a nil
+        // ledger cannot have recorded. **This list has to grow with every new
+        // case**, and forgetting is silent in the worst way: the action is
+        // treated as already seen, so it never gets its default combo and the
+        // only symptom is a shortcut that does nothing on the installs old
+        // enough to predate the ledger.
+        let sinceLedger: Set<HotKeyAction> = [.captureScrolling, .captureAreaAnnotate]
+        let seen = seen ?? Set(HotKeyAction.allCases.filter { !sinceLedger.contains($0) })
         var result = decoded
         let taken = Set(decoded.values)
         for action in HotKeyAction.allCases where !seen.contains(action) {

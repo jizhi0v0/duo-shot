@@ -104,6 +104,20 @@ final class PreviewStackController {
         callbacks.close = { [weak self, weak item] in
             if let item { self?.dismiss(item) }
         }
+        callbacks.delete = { [weak self, weak item] in
+            guard let item else { return }
+            // Nothing should go on watching a file that is about to stop
+            // existing; the card is leaving either way.
+            ShareService.shared.stopObserving(entry.url)
+            // Dismissed first, and not awaited: the Trash is a round trip
+            // through NSWorkspace, and a card that stays put for it reads as a
+            // button that did not work.
+            self?.dismiss(item)
+            // An upload in flight reads from this file and will fail when it
+            // goes. Left that way on purpose — the user asked for the capture to
+            // be gone, and cancelling uploads to be tidy would be a surprise.
+            Task { await CaptureTrash.delete(entry.url) }
+        }
         // DuoShot's own window, not `NSWorkspace.shared.open`. Deliberately does
         // NOT dismiss the card, unlike copy and reveal: looking at a capture is
         // how you decide whether to copy it, so consuming the card on the way in
@@ -700,10 +714,23 @@ final class PreviewStackController {
         dismiss(oldest)
     }
 
+    /// Takes every card down, so a check that presented some does not leave
+    /// them floating over the next one.
+    func dismissAllForTest() {
+        for item in items { dismiss(item) }
+    }
+
     /// The front card's action-bar geometry, for `--selftest-share-card`.
     var actionBarLayoutForTest: (frame: CGRect, visibleButtons: Int)? {
         items.first?.card.actionBarLayoutForTest
     }
+
+    /// The front card itself, for `--selftest-delete` — which has to hit-test
+    /// the bin through the panel's real view tree rather than trust a frame.
+    var frontCardForTest: PreviewCardView? { items.last?.card }
+
+    /// The panel's content view, so a hit test starts where a real click does.
+    var panelContentViewForTest: NSView? { panel?.contentView }
 
     func setHoverForTest(_ hovering: Bool) {
         for item in items { item.card.setHoverForTest(hovering) }

@@ -46,6 +46,11 @@ if let mode = SelfTest.Mode(arguments: arguments) {
           --selftest-overlay <x,y,w,h> [--out <file.png>] [--no-exclude] [--sharing-default]
           --selftest-sourcerect-space
           --selftest-output <dir>
+          --selftest-save-failure <dir>
+          --selftest-failure-notice
+          --selftest-failure-notice-ui   (not in `make test`: reads the Keychain)
+          --selftest-delete <dir>
+          --selftest-annotate <dir>
           --selftest-preview <dir> [--sharing-default]
           --selftest-window <dir>
           --selftest-fullscreen <dir>

@@ -19,7 +19,7 @@ final class StagingStore {
     private let retainedByteBudget = 2 * 1024 * 1024 * 1024
 
     private(set) lazy var directory: URL = {
-        let base = fileManager
+        let base = root ?? fileManager
             .urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
             .appendingPathComponent("DuoShot", isDirectory: true)
             .appendingPathComponent("Staging", isDirectory: true)
@@ -27,7 +27,35 @@ final class StagingStore {
         return base
     }()
 
-    private init() {}
+    /// Where a capture goes when the move into the save directory failed.
+    ///
+    /// A subdirectory rather than a flag on the file, because the directory *is*
+    /// the ledger: `prune()` only ever sees a directory listing, so the exemption
+    /// has to be something a listing can express. It also survives the relaunch
+    /// `ScreenPermission.relaunch()` performs after a re-grant — which is one of
+    /// the situations in which saves start failing, so an in-memory set would
+    /// evaporate exactly when it is load-bearing. And unlike an extended
+    /// attribute it is legible: a folder called `Unsaved` answers "which of these
+    /// two hundred identical timestamps is the one that never made it" without
+    /// any code at all.
+    ///
+    /// Deliberately **not** pruned. Being pruned is the thing this exists to
+    /// prevent, so it is bounded by visibility instead — the menu-bar notice says
+    /// how many are in here, and `prune()` logs its size every time it runs.
+    private(set) lazy var unsavedDirectory: URL = {
+        let base = directory.appendingPathComponent("Unsaved", isDirectory: true)
+        try? fileManager.createDirectory(at: base, withIntermediateDirectories: true)
+        return base
+    }()
+
+    /// Non-nil only under test.
+    private let root: URL?
+
+    /// - Parameter directory: for the self-test, which must not prune the user's
+    ///   real staging folder. **One instance per directory**, for the reason
+    ///   `CaptureIndex.init(location:)` gives: two stores over one path would
+    ///   prune each other's files. The app has `shared` and nothing else.
+    init(directory: URL? = nil) { self.root = directory }
 
     /// Encodes the capture into staging and returns where it landed.
     ///
@@ -88,6 +116,35 @@ final class StagingStore {
         return url
     }
 
+    /// Moves a capture whose save failed out of prune's reach.
+    ///
+    /// The user believes this file is in their save folder and it is not. Left in
+    /// staging it would be deleted the moment 200 newer captures landed on top of
+    /// it — about three days at a heavy user's rate — with the beep at the time
+    /// being the only thing that ever said so.
+    /// Does not throw: its only caller has already failed once and has nowhere
+    /// better to go. If even this move fails the file stays in staging — where
+    /// prune can still take it — and both errors are in the log.
+    func quarantine(_ url: URL) -> URL {
+        let destination = uniqueURL(for: url.lastPathComponent, in: unsavedDirectory)
+        do {
+            try fileManager.moveItem(at: url, to: destination)
+            return destination
+        } catch {
+            Log.app.error(
+                "quarantine failed: \(error.localizedDescription, privacy: .public)")
+            return url
+        }
+    }
+
+    /// How many captures are sitting in `unsavedDirectory`, for the notice that
+    /// makes them visible. Zero is the ordinary answer.
+    func unsavedCount() -> Int {
+        (try? fileManager.contentsOfDirectory(
+            at: unsavedDirectory, includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]))?.count ?? 0
+    }
+
     /// "Save" is a move, not a re-encode: atomic and instant.
     func move(_ url: URL, to directory: URL) throws -> URL {
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -106,13 +163,22 @@ final class StagingStore {
     func prune() {
         guard let entries = try? fileManager.contentsOfDirectory(
             at: directory,
-            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+            includingPropertiesForKeys: [
+                .contentModificationDateKey, .fileSizeKey, .isDirectoryKey,
+            ],
             options: [.skipsHiddenFiles]
         ) else { return }
 
-        let keys: Set<URLResourceKey> = [.contentModificationDateKey, .fileSizeKey]
-        let stat = entries.map { url -> (url: URL, date: Date, size: Int) in
+        let keys: Set<URLResourceKey> = [
+            .contentModificationDateKey, .fileSizeKey, .isDirectoryKey,
+        ]
+        // Directories are skipped, and `unsavedDirectory` is why this matters:
+        // a subdirectory is an ordinary entry in the listing with a nil file
+        // size, and `removeItem` on a directory is recursive — so without this
+        // the first prune past the cap would take the whole quarantine with it.
+        let stat = entries.compactMap { url -> (url: URL, date: Date, size: Int)? in
             let values = try? url.resourceValues(forKeys: keys)
+            if values?.isDirectory == true { return nil }
             return (url, values?.contentModificationDate ?? .distantPast, values?.fileSize ?? 0)
         }
         // Newest first, so "keep" is a prefix under both caps.
@@ -139,6 +205,14 @@ final class StagingStore {
             }
             try? fileManager.removeItem(at: file.url)
             removed += 1
+        }
+        // Said every time there is anything in quarantine, not only when
+        // something was pruned: the folder is deliberately unbounded, so the log
+        // is half of what keeps its growth from being silent. The notice in the
+        // menu bar is the other half.
+        let unsaved = unsavedCount()
+        if unsaved > 0 {
+            Log.app.notice("\(unsaved, privacy: .public) captures held in Unsaved")
         }
         guard removed > 0 else { return }
         Log.app.notice("pruned \(removed, privacy: .public) staged files")

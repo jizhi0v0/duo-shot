@@ -9,6 +9,7 @@ nonisolated enum HotKeyAction: String, CaseIterable, Codable, Sendable {
     case recordArea
     case recordFullscreen
     case captureScrolling
+    case captureAreaAnnotate
 
     var title: String {
         switch self {
@@ -19,6 +20,7 @@ nonisolated enum HotKeyAction: String, CaseIterable, Codable, Sendable {
         case .recordArea: "Record Area"
         case .recordFullscreen: "Record Fullscreen"
         case .captureScrolling: "Scrolling Capture"
+        case .captureAreaAnnotate: "Capture Area and Annotate"
         }
     }
 
@@ -30,14 +32,17 @@ nonisolated enum HotKeyAction: String, CaseIterable, Codable, Sendable {
         switch self {
         case .recordArea, .recordFullscreen: true
         case .captureArea, .captureWindow, .captureFullscreen, .captureLastArea,
-             .captureScrolling: false
+             .captureScrolling, .captureAreaAnnotate: false
         }
     }
 
     /// Defaults mirror the user's existing CleanShot X bindings so muscle memory
-    /// carries over. ⇧⌘W is still deliberately free — it is bound to annotate
-    /// there, which does not exist yet, and taking it now would train the wrong
-    /// reflex. ⇧⌘Y was being held for recording and is now claimed.
+    /// carries over. ⇧⌘Y was being held for recording and is now claimed; ⇧⌘W
+    /// was being held for annotate, which the editor now provides, and is now
+    /// claimed too. Reaching the editor used to mean waiting for the card to
+    /// settle in a corner and clicking it inside its six-second timeout, which
+    /// is a mouse trip paid on every capture that was only ever taken in order
+    /// to draw on it.
     var defaultCombo: KeyCombo? {
         switch self {
         case .captureArea:
@@ -48,6 +53,8 @@ nonisolated enum HotKeyAction: String, CaseIterable, Codable, Sendable {
             KeyCombo(keyCode: UInt16(kVK_ANSI_Y), modifiers: [.shift, .command])
         case .captureScrolling:
             KeyCombo(keyCode: UInt16(kVK_ANSI_L), modifiers: [.shift, .command])
+        case .captureAreaAnnotate:
+            KeyCombo(keyCode: UInt16(kVK_ANSI_W), modifiers: [.shift, .command])
         case .captureFullscreen, .captureLastArea, .recordFullscreen:
             nil
         }

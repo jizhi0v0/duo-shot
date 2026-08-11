@@ -30,8 +30,8 @@ struct PreviewEntry {
     /// on playback.
     var isIncomplete = false
     /// The save into the user's save folder threw. The card says so, because
-    /// everything else about the capture looks like it worked and the file is
-    /// sitting in staging waiting to be pruned.
+    /// everything else about the capture looks like it worked while the file is
+    /// actually being held in staging's `Unsaved` folder.
     var saveFailed = false
 
     var isVideo: Bool {

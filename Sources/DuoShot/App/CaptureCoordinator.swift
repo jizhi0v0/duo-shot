@@ -10,14 +10,45 @@ final class CaptureCoordinator {
     let overlay = OverlayController()
     let countdown = CaptureCountdown()
 
+    /// What the capture was asked for, which decides only where it is *handed*
+    /// once taken. The photograph itself is identical either way, which is why
+    /// this branches at delivery rather than there being a second capture path.
+    nonisolated enum Intent: Sendable {
+        case standard
+        /// Open the editor on it immediately, as well as showing the card.
+        ///
+        /// As well as, not instead of: `PreviewStackController`'s `open`
+        /// callback has always left the card up when the viewer is opened from
+        /// it, so this is a state the app already ships. The card is also the
+        /// only surface carrying upload progress and the "Not saved" badge, and
+        /// it retires itself after a few seconds anyway.
+        case annotate
+    }
+
     /// `async` because the output pipeline is: the encode leg leaves the main
     /// thread and the caller has to be able to wait for it.
-    var onResult: ((CaptureResult) async -> Void)?
+    ///
+    /// Returns the card it built, so `deliver` can hand that same entry to the
+    /// editor. The alternative was one-shot state on the coordinator for
+    /// somebody else's closure to find, which is worse in every way.
+    var onResult: ((CaptureResult) async -> PreviewEntry?)?
     /// Extra windows to keep out of the shot — the floating previews, which are
     /// on screen from a previous capture and would otherwise be photographed.
     var additionalExcludedWindowIDs: () -> Set<CGWindowID> = { [] }
     /// Fired when ScreenCaptureKit reports the Screen Recording grant has lapsed.
     var onAuthorisationLost: (() -> Void)?
+    /// Fired once per capture that finally failed, with the sentence describing
+    /// why.
+    ///
+    /// `CaptureFailure.summary` has always written four plain-English
+    /// explanations and always handed them straight to `Log.capture.error`,
+    /// where nobody was ever going to read them. This is how they get out.
+    ///
+    /// **Terminal outcomes only.** Not fired on the `.noCaptureSource` branch
+    /// that is about to refresh and retry — that one usually succeeds, and
+    /// reporting it would put a warning in the menu bar for a race the app just
+    /// handled by itself.
+    var onCaptureFailed: ((CaptureFailure) -> Void)?
 
     init() {
         // Captures `engine` rather than `self`: the overlay holds this closure
@@ -77,7 +108,7 @@ final class CaptureCoordinator {
     /// the window the overlay is suggesting. Which of the two the user ends up
     /// with is only known at confirm time, so both outcomes are handled here.
     @discardableResult
-    func captureInteractive() async -> CaptureResult? {
+    func captureInteractive(intent: Intent = .standard) async -> CaptureResult? {
         guard !isCapturing else {
             Log.capture.notice("capture already in progress; ignoring trigger")
             return nil
@@ -142,7 +173,8 @@ final class CaptureCoordinator {
             options.excludedWindowIDs = countdown.lastWindowIDs
                 .union(additionalExcludedWindowIDs())
             return await perform(
-                .area(displayID: displayID, rectInAppKitGlobal: rect), options: options)
+                .area(displayID: displayID, rectInAppKitGlobal: rect), options: options,
+                intent: intent)
 
         case .window(let windowID) where delay > 0:
             overlay.tearDown()
@@ -153,7 +185,7 @@ final class CaptureCoordinator {
             // No recovery on the delayed path: the whole point of a delay is that
             // the interesting frame has not happened yet, so a photograph from
             // before the countdown is the wrong picture by definition.
-            return await perform(.window(windowID), options: options)
+            return await perform(.window(windowID), options: options, intent: intent)
 
         case .area(let displayID, let rect) where frozen[displayID] != nil:
             lastArea = (displayID, rect)
@@ -172,13 +204,13 @@ final class CaptureCoordinator {
                     .union(additionalExcludedWindowIDs())
                 return await perform(
                     .area(displayID: displayID, rectInAppKitGlobal: rect), options: options,
-                    afterCapture: { [overlay] in overlay.tearDown() })
+                    intent: intent, afterCapture: { [overlay] in overlay.tearDown() })
             }
             // The overlay comes down before the output pipeline encodes, exactly
             // as `perform` does it — the panels are not holding an exclusion list
             // open here, so there is nothing to wait for.
             overlay.tearDown()
-            await onResult?(result)
+            await deliver(result, intent: intent)
             return result
 
         case .area(let displayID, let rect):
@@ -194,7 +226,7 @@ final class CaptureCoordinator {
             defer { overlay.tearDown() }
             return await perform(
                 .area(displayID: displayID, rectInAppKitGlobal: rect), options: options,
-                afterCapture: { [overlay] in overlay.tearDown() })
+                intent: intent, afterCapture: { [overlay] in overlay.tearDown() })
 
         case .window(let windowID):
             // The panels are still on screen, as in the area case above. A window
@@ -207,7 +239,7 @@ final class CaptureCoordinator {
             defer { overlay.tearDown() }
             return await perform(
                 .window(windowID), options: options, recovery: recovery,
-                afterCapture: { [overlay] in overlay.tearDown() })
+                intent: intent, afterCapture: { [overlay] in overlay.tearDown() })
         }
     }
 
@@ -248,8 +280,8 @@ final class CaptureCoordinator {
     var hasPreviousArea: Bool { lastArea != nil }
 
     @discardableResult
-    func captureArea() async -> CaptureResult? {
-        await captureInteractive()
+    func captureArea(intent: Intent = .standard) async -> CaptureResult? {
+        await captureInteractive(intent: intent)
     }
 
     /// Captures the window under the pointer with no overlay at all.
@@ -401,13 +433,14 @@ final class CaptureCoordinator {
     private func perform(
         _ request: CaptureRequest, options: CaptureOptions,
         recovery: WindowRecovery? = nil, isRetry: Bool = false,
+        intent: Intent = .standard,
         afterCapture: () -> Void = {}
     ) async -> CaptureResult? {
         lastExcludedWindowIDsForTest = options.excludedWindowIDs
         do {
             let result = try await engine.capture(request, options: options, recovery: recovery)
             afterCapture()
-            await onResult?(result)
+            await deliver(result, intent: intent)
             return result
         } catch {
             let failure = CaptureFailure(error)
@@ -422,18 +455,35 @@ final class CaptureCoordinator {
                 // SCK does not re-prompt on our behalf; without this the app
                 // just silently stops working once macOS expires the grant.
                 onAuthorisationLost?()
+                // Reported as well as prompted. The "one cause must not raise
+                // two dialogs" rule in `reportRecordingLost` is about modals;
+                // a tooltip and a menu row interrupt nothing, and this is the
+                // most useful of the four sentences.
+                onCaptureFailed?(failure)
             case .noCaptureSource where !isRetry:
                 // A display or window disappeared between enumeration and
                 // capture. One refresh-and-retry covers the common race.
                 try? await engine.refreshContent()
                 return await perform(
                     request, options: options, recovery: recovery, isRetry: true,
-                    afterCapture: afterCapture)
+                    intent: intent, afterCapture: afterCapture)
             default:
                 NSSound.beep()
+                onCaptureFailed?(failure)
             }
             return nil
         }
+    }
+
+    /// Hands a finished capture on: always to the preview stack, and to the
+    /// editor as well when that is what was asked for.
+    ///
+    /// The single place either of those happens, so a new capture path cannot
+    /// forget one of them.
+    private func deliver(_ result: CaptureResult, intent: Intent) async {
+        let entry = await onResult?(result)
+        guard intent == .annotate, let entry else { return }
+        ViewerWindowController.shared.show(entry)
     }
 
     @discardableResult
@@ -445,23 +495,23 @@ final class CaptureCoordinator {
         }
         isCapturing = true
         defer { isCapturing = false }
-        do {
-            try await engine.refreshContent()
-            let target = displayID
-                ?? ScreenIndex.screenUnderMouse().flatMap(ScreenIndex.displayID(of:))
-                ?? CGMainDisplayID()
-            guard await countdown.wait(
-                seconds: Preferences.shared.captureDelaySeconds, on: Self.screen(for: target))
-            else { return nil }
-            var options = Preferences.shared.captureOptions
-            options.excludedWindowIDs = countdown.lastWindowIDs
-                .union(additionalExcludedWindowIDs())
-            let result = try await engine.capture(.display(target), options: options)
-            await onResult?(result)
-            return result
-        } catch {
-            Log.capture.error("display capture failed: \(error.localizedDescription, privacy: .public)")
-            return nil
-        }
+        // Only the setup is guarded here. The capture itself goes through
+        // `perform`, which is the whole point of this shape: the tail of this
+        // method used to be its own `try engine.capture` + `onResult` with a
+        // `catch` that logged and returned nil — no beep, no authorisation
+        // recovery, no refresh-and-retry, while the area path beside it had all
+        // three. A fullscreen capture that failed was the one completely silent
+        // outcome in the app.
+        try? await engine.refreshContent()
+        let target = displayID
+            ?? ScreenIndex.screenUnderMouse().flatMap(ScreenIndex.displayID(of:))
+            ?? CGMainDisplayID()
+        guard await countdown.wait(
+            seconds: Preferences.shared.captureDelaySeconds, on: Self.screen(for: target))
+        else { return nil }
+        var options = Preferences.shared.captureOptions
+        options.excludedWindowIDs = countdown.lastWindowIDs
+            .union(additionalExcludedWindowIDs())
+        return await perform(.display(target), options: options)
     }
 }

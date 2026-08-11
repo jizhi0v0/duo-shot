@@ -17,9 +17,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// What `setHiddenFromCapture` was last told, so an item installed part-way
     /// through a take is created in the state the take left the old one in.
     private var isHiddenFromCapture = false
-    /// Why the last file dropped on the item was not shared, until it is
-    /// dismissed or another drop succeeds.
-    private var dropNotice: String?
+    /// Why the last thing that had nowhere else to report itself failed — a file
+    /// dropped on the item, or a capture — until it is dismissed or superseded.
+    private var notice: String?
 
     var onOpenSettings: () -> Void = {}
 
@@ -89,25 +89,46 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
         button.addSubview(drop)
         ShareService.shared.onDropNotice = { [weak self] notice in
-            self?.showDropNotice(notice)
+            self?.showNotice(notice)
         }
     }
 
-    /// The one thing a dropped file's failure can say, since it has no card.
+    /// The one thing a failure with no card of its own can say.
     ///
     /// Two places, because the menu is only seen if it is opened: the tool tip
-    /// puts the sentence where the pointer already is a second after the drop,
+    /// puts the sentence where the pointer already is a second after the event,
     /// and the menu keeps it until it is read and dismissed.
-    private func showDropNotice(_ notice: String?) {
-        dropNotice = notice
+    ///
+    /// Shared by dropped files and failed captures because they are the same
+    /// shape of problem — no window, no card, one sentence — and a second
+    /// mechanism for the second case would be a notification framework nobody
+    /// asked for.
+    private func showNotice(_ notice: String?) {
+        self.notice = notice
         statusItem?.button?.toolTip = notice
-        statusItem?.menu = buildMenu()
+        refreshRecordingState()
     }
 
-    private func dropNoticeItem() -> NSMenuItem? {
-        guard let dropNotice else { return nil }
+    /// A capture that finally failed. `CaptureFailure.summary` is written for a
+    /// person to read; until this existed it only ever reached the log.
+    func noteCaptureFailure(_ failure: CaptureFailure) {
+        showNotice(failure.summary)
+    }
+
+    /// Wires the coordinator's terminal failures to the menu bar.
+    ///
+    /// A method rather than a closure written out in `AppDelegate` so the
+    /// self-test exercises the shipping wiring instead of its own copy of it.
+    func observeFailures(of coordinator: CaptureCoordinator) {
+        coordinator.onCaptureFailed = { [weak self] failure in
+            self?.noteCaptureFailure(failure)
+        }
+    }
+
+    private func noticeItem() -> NSMenuItem? {
+        guard let notice else { return nil }
         let item = NSMenuItem(
-            title: dropNotice, action: #selector(clearDropNotice), keyEquivalent: "")
+            title: notice, action: #selector(clearNotice), keyEquivalent: "")
         item.target = self
         item.image = NSImage(
             systemSymbolName: "exclamationmark.triangle", accessibilityDescription: nil)
@@ -115,8 +136,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         return item
     }
 
-    @objc private func clearDropNotice() {
-        showDropNotice(nil)
+    @objc private func clearNotice() {
+        showNotice(nil)
     }
 
     func noteOutput(_ output: OutputPipeline.Output) {
@@ -155,6 +176,16 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             // window is being dragged — constantly, during a screen recording.
             RunLoop.main.add(ticker, forMode: .common)
             recordingTicker = ticker
+        } else if notice != nil {
+            // Below recording in the order deliberately: the clock is
+            // load-bearing during a take — it is the only thing saying the
+            // machine is being recorded — and a warning must not replace it.
+            // The notice keeps until dismissed, so it is still here afterwards.
+            button.image = NSImage(
+                systemSymbolName: "exclamationmark.triangle.fill",
+                accessibilityDescription: "A capture failed")
+            button.image?.isTemplate = true
+            button.title = ""
         } else {
             button.image = NSImage(
                 systemSymbolName: "camera.viewfinder", accessibilityDescription: "DuoShot")
@@ -270,6 +301,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// For `--selftest-share-flow`, which has no way to click a menu bar item.
     func menuForTest() -> NSMenu { buildMenu() }
 
+    /// The item's button, for the checks that assert on what the menu bar
+    /// actually shows — the icon's accessibility description and the tool tip.
+    /// Nil between `remove()` and the next `install()`.
+    var buttonForTest: NSStatusBarButton? { statusItem?.button }
+
     private func buildMenu() -> NSMenu {
         let menu = NSMenu()
         menu.delegate = self
@@ -278,7 +314,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         // one thing in this menu the user has not already been told, and it is
         // information rather than an action, so the short recording menu below
         // has no reason to exclude it.
-        if let notice = dropNoticeItem() {
+        if let notice = noticeItem() {
             menu.addItem(notice)
             menu.addItem(.separator())
         }
@@ -333,7 +369,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         // behind the status menu and capture *that* — a wrong answer delivered
         // silently, which is the one thing this shortcut is written to avoid.
         // It stays on its hotkey, where the pointer is wherever the user left it.
-        var actions: [HotKeyAction] = [.captureArea, .captureFullscreen]
+        // Menu-safe, like `.captureArea` and unlike `.captureWindow`: it opens a
+        // selection, so where the pointer was when the menu closed does not
+        // matter.
+        var actions: [HotKeyAction] = [.captureArea, .captureAreaAnnotate, .captureFullscreen]
         if coordinator.hasPreviousArea { actions.append(.captureLastArea) }
         // Menu-safe, unlike `.captureWindow`: it opens a selection, so where
         // the pointer was when the menu closed does not matter.
@@ -418,6 +457,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         case .captureArea:
             guard !scroller.isActive else { NSSound.beep(); return }
             await coordinator.captureArea()
+        case .captureAreaAnnotate:
+            guard !scroller.isActive else { NSSound.beep(); return }
+            await coordinator.captureArea(intent: .annotate)
         case .captureWindow:
             guard !scroller.isActive else { NSSound.beep(); return }
             await coordinator.captureWindow()

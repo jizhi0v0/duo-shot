@@ -25,6 +25,13 @@ final class PreviewCardView: NSView {
         /// the card decides which from its own share state, so the stack does not
         /// have to hand down three closures for one button.
         var share: () -> Void = {}
+        /// Move the capture to the Trash and take the card with it.
+        ///
+        /// Distinct from `close`, which is next to it on the card and only puts
+        /// the card away: the ✕ has always meant "I have finished looking at
+        /// this", and it must go on meaning only that now that a control which
+        /// really deletes sits a few points away.
+        var delete: () -> Void = {}
     }
 
     static let cardSize = CGSize(width: 208, height: 132)
@@ -69,6 +76,11 @@ final class PreviewCardView: NSView {
     private var barButtons: [NSButton] = []
     private static let barButtonWidth: CGFloat = 30
     private var shareButton: NSButton?
+    private var trashButton: NSButton?
+    /// The bin's own words. macOS's phrasing, on purpose: "Move to Trash" is
+    /// what tells the user this is recoverable, which is the whole reason the
+    /// button is allowed to act on one click with no confirmation.
+    private let trashTooltip = "Move to Trash"
     private var buttonRing: ButtonRingView?
     private var centerRing: ButtonRingView?
     /// Non-nil only while uploading. The two rings are derived from this and
@@ -191,13 +203,21 @@ final class PreviewCardView: NSView {
         if saveFailed { buildSaveWarning() }
 
         // Viewing is not in this bar: it is the button in the middle of the card.
-        // These two are the actions that consume the card and send the capture
-        // somewhere else; opening it is what you do *before* deciding, so it gets
-        // the position your eye is already on.
+        // These are the actions that consume the card and send the capture
+        // somewhere — or nowhere; opening it is what you do *before* deciding, so
+        // it gets the position your eye is already on.
+        //
+        // The bin is last, and that is the whole of its misclick protection
+        // along with the Trash being recoverable: it is the maximum distance
+        // from Copy, which is first and is the one reached for by reflex. A
+        // confirmation sheet was considered and rejected — this panel does not
+        // take focus, so a modal over it would interrupt whatever the user was
+        // actually doing, which is worse than the mistake it prevents.
         let specs: [(symbol: String, tip: String, action: Selector)] = [
             ("doc.on.doc", "Copy", #selector(copyTapped)),
             ("folder", "Show in Finder", #selector(revealTapped)),
             ("square.and.arrow.up", "Upload and copy link", #selector(shareTapped)),
+            ("trash", trashTooltip, #selector(deleteTapped)),
         ]
         let buttonWidth = Self.barButtonWidth
         let barWidth = CGFloat(specs.count) * buttonWidth + 6
@@ -232,6 +252,7 @@ final class PreviewCardView: NSView {
             bar.addSubview(button)
             barButtons.append(button)
             if spec.symbol == "square.and.arrow.up" { shareButton = button }
+            if spec.symbol == "trash" { trashButton = button }
         }
         // One source of truth for how this button looks.
         //
@@ -382,8 +403,8 @@ final class PreviewCardView: NSView {
         pill.layer?.cornerRadius = pill.frame.height / 2
         pill.layer?.cornerCurve = .continuous
         pill.layer?.backgroundColor = NSColor.systemOrange.withAlphaComponent(0.9).cgColor
-        pill.toolTip = "Saving to your folder failed. The file is still in DuoShot's "
-            + "staging folder — copy or drag it somewhere before it is pruned."
+        pill.toolTip = "Saving to your folder failed. The file is being held in "
+            + "DuoShot's Unsaved folder, and will not be deleted."
         label.setFrameOrigin(CGPoint(x: padding.width, y: padding.height))
         pill.addSubview(label)
         addSubview(pill)
@@ -446,6 +467,11 @@ final class PreviewCardView: NSView {
         (actionBar?.frame ?? .zero, barButtons.filter { !$0.isHidden }.count)
     }
 
+    /// The bin, so `--selftest-delete` can prove it is reachable by hit-testing
+    /// rather than by measuring where it ought to be — the Redact button passed
+    /// every geometry assertion while being un-clickable.
+    var trashButtonForTest: NSButton? { trashButton }
+
     func setShareState(_ state: ShareService.State?) {
         shareState = state
 
@@ -466,6 +492,11 @@ final class PreviewCardView: NSView {
         case .done:
             uploadFraction = nil
             refreshUploadIndicator()
+            // Says what the bin will and will not do, now that there is a
+            // published URL to be wrong about. Deleting the local file leaves
+            // the link serving; revoking it is a separate, unrecoverable action
+            // that lives behind ⌥ in Recent Links.
+            trashButton?.toolTip = "\(trashTooltip) (the link keeps working)"
             shareButton?.isHidden = false
             shareButton?.isEnabled = true
             shareButton?.toolTip = "Copy link"
@@ -792,4 +823,5 @@ final class PreviewCardView: NSView {
     @objc private func copyTapped() { callbacks.copy() }
     @objc private func revealTapped() { callbacks.reveal() }
     @objc private func closeTapped() { callbacks.close() }
+    @objc private func deleteTapped() { callbacks.delete() }
 }

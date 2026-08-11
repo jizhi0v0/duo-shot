@@ -7,7 +7,9 @@ import ScreenCaptureKit
 /// for Screen Recording roughly monthly, and when the grant lapses SCK does not
 /// prompt on our behalf — it just fails. Without routing that back into the
 /// permission flow, DuoShot would appear to break for no reason once a month.
-nonisolated enum CaptureFailure: Sendable, Equatable {
+/// `CaseIterable` so the check that every one of these has a sentence a person
+/// can read cannot be outgrown by adding a fifth case.
+nonisolated enum CaptureFailure: Sendable, Equatable, CaseIterable {
     case authorisationLost
     case noCaptureSource
     case transient

@@ -39,14 +39,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Wiring
 
     private func wireCoordinator() {
+        // Returns the entry so `CaptureCoordinator.deliver` can open the editor
+        // on the same one under ⇧⌘W. Built here even when the preview overlay is
+        // switched off: the card is optional, the entry is what identifies the
+        // capture, and "Capture Area and Annotate" has to work either way.
         coordinator.onResult = { [weak self] result in
             guard let self, let output = await OutputPipeline.shared.process(result)
-            else { return }
+            else { return nil }
             self.statusItem.noteOutput(output)
+            let entry = await PreviewEntry(output)
             if Preferences.shared.showsPreviewOverlay {
                 self.previews.timeout = .seconds(Preferences.shared.previewTimeout)
-                await self.previews.present(output)
+                self.previews.present(entry)
             }
+            return entry
         }
         // A preview left over from the previous capture is on screen; keep it out
         // of the next one.
@@ -69,6 +75,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         coordinator.onAuthorisationLost = { [weak self] in
             Task { await self?.handleAuthorisationLost() }
         }
+        statusItem.observeFailures(of: coordinator)
     }
 
     private func wireRecorder() {

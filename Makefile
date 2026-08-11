@@ -326,6 +326,10 @@ test-only:
 	run "rect pipeline"          --selftest-rect 400,300,640,400; \
 	run "overlay exclusion"      --selftest-overlay 400,300,640,400 --sharing-default; \
 	run "output pipeline"        --selftest-output $(TEST_OUT); \
+	run "save failure kept"      --selftest-save-failure $(TEST_OUT); \
+	run "capture failure said"   --selftest-failure-notice; \
+	run "delete a capture"       --selftest-delete $(TEST_OUT); \
+	run "annotate hotkey"        --selftest-annotate $(TEST_OUT); \
 	run "preview panel"          --selftest-preview $(TEST_OUT) --sharing-default; \
 	run "window mode"            --selftest-window $(TEST_OUT); \
 	run "fullscreen menu bar"    --selftest-fullscreen $(TEST_OUT); \

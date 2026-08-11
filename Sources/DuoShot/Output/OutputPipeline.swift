@@ -61,6 +61,7 @@ final class OutputPipeline {
             } catch {
                 Log.app.error("save failed: \(error.localizedDescription, privacy: .public)")
                 saveFailed = true
+                finalURL = staging.quarantine(stagedURL)
             }
         }
 
@@ -68,9 +69,10 @@ final class OutputPipeline {
             Clipboard.write(result, fileURL: finalURL)
         }
         // A failed save gets the error sound, not the shutter, and gets it
-        // whatever `playsSound` says. The capture is still in staging and prune
-        // will eventually take it, so the one thing that must not happen is the
-        // usual success chime telling the user the file is in their save folder.
+        // whatever `playsSound` says. The capture is held in staging's `Unsaved`
+        // folder, out of prune's reach, so the one thing that must not happen is
+        // the usual success chime telling the user the file is in their save
+        // folder.
         if saveFailed {
             NSSound.beep()
         } else if preferences.playsSound {
@@ -112,6 +114,7 @@ final class OutputPipeline {
             } catch {
                 Log.record.error("save failed: \(error.localizedDescription, privacy: .public)")
                 saveFailed = true
+                finalURL = staging.quarantine(result.url)
             }
         }
 

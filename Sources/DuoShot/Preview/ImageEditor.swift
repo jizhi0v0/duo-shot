@@ -975,6 +975,15 @@ final class ImageEditor: NSView {
     /// the same problem `ViewerWindow` solves for ⌘W. Claimed after `super`
     /// rather than before it so the text field being typed into keeps its own
     /// undo, which is a different thing being undone.
+    /// Whether a typing box is up, for the window above.
+    ///
+    /// `ViewerWindow` needs it because ⌘⌫ means two different things depending
+    /// on the answer: "throw this capture away" outside the box, and "delete to
+    /// the start of the line" inside it. Key equivalents are offered to the
+    /// window before `keyDown` ever runs, so without asking, the window's
+    /// meaning would win every time.
+    var isTyping: Bool { canvas.isTyping }
+
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if super.performKeyEquivalent(with: event) { return true }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
