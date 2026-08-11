@@ -183,6 +183,37 @@ final class HUDPill: NSView {
     /// nobody asked for.
     private(set) var isLive = true
 
+    /// How big a pill is inside, which is not the same question as how tall it
+    /// is.
+    ///
+    /// The overlay's toolbar and the recording HUD are bars that appear over
+    /// someone's screen for a few seconds and are sized to stay out of the way.
+    /// The image editor's bar is furniture in a window that is looked at for
+    /// minutes, and it was sized like the other two — a 37-point square with a
+    /// 10-point glyph in the middle of it, nine of them in a row. Reported as
+    /// the whole thing being 小气: cramped, and not obviously pressable.
+    ///
+    /// One struct rather than a second pill class, because everything else about
+    /// the two is identical and a fork would drift.
+    struct Sizing: Sendable {
+        var horizontalPadding: CGFloat = 13
+        var markSize: CGFloat = 11
+        var markTextGap: CGFloat = 7
+        var fontSize: CGFloat = 13
+        var symbolPointSize: CGFloat = 10
+        var cornerRadius: CGFloat = HUDMetrics.controlRadius
+
+        var font: NSFont { .systemFont(ofSize: fontSize, weight: .semibold) }
+
+        static let standard = Sizing()
+        /// The image editor's: a wider target, a glyph big enough to read as the
+        /// thing it depicts, and a corner that matches a 36-point control.
+        static let editor = Sizing(
+            horizontalPadding: 15, markSize: 16, markTextGap: 8, fontSize: 13.5,
+            symbolPointSize: 14, cornerRadius: 10)
+    }
+
+    private let sizing: Sizing
     private static let horizontalPadding: CGFloat = 13
     private static let markSize: CGFloat = 11
     private static let markTextGap: CGFloat = 7
@@ -194,10 +225,11 @@ final class HUDPill: NSView {
     /// An empty title is a pill that is only its mark — what a bar full of tools
     /// needs, where four words would be wider than the window and the four marks
     /// read as one control. Such a pill carries its meaning in a `toolTip`.
-    static func width(for title: String) -> CGFloat {
-        guard !title.isEmpty else { return horizontalPadding * 2 + markSize }
-        let text = (title as NSString).size(withAttributes: [.font: font]).width.rounded(.up)
-        return horizontalPadding * 2 + markSize + markTextGap + text
+    static func width(for title: String, sizing: Sizing = .standard) -> CGFloat {
+        guard !title.isEmpty else { return sizing.horizontalPadding * 2 + sizing.markSize }
+        let text = (title as NSString)
+            .size(withAttributes: [.font: sizing.font]).width.rounded(.up)
+        return sizing.horizontalPadding * 2 + sizing.markSize + sizing.markTextGap + text
     }
 
     private let tint: NSColor
@@ -207,46 +239,52 @@ final class HUDPill: NSView {
     private var markDot: NSView?
     private var markGlyph: NSImageView?
 
-    init(title: String, mark: Mark, tint: NSColor, height: CGFloat = HUDMetrics.controlHeight) {
+    init(
+        title: String, mark: Mark, tint: NSColor,
+        height: CGFloat = HUDMetrics.controlHeight, sizing: Sizing = .standard,
+        minimumWidth: CGFloat = 0
+    ) {
         self.tint = tint
+        self.sizing = sizing
         self.label = NSTextField(labelWithString: title)
-        let width = Self.width(for: title)
+        let width = max(minimumWidth, Self.width(for: title, sizing: sizing))
         super.init(frame: CGRect(x: 0, y: 0, width: width, height: height))
         wantsLayer = true
-        layer?.cornerRadius = HUDMetrics.controlRadius
+        layer?.cornerRadius = sizing.cornerRadius
         layer?.cornerCurve = .continuous
         layer?.backgroundColor = tint.cgColor
 
-        let markY = ((height - Self.markSize) / 2).rounded()
+        let markY = ((height - sizing.markSize) / 2).rounded()
         // Centred when there is no title to sit beside.
         let markX = title.isEmpty
-            ? ((width - Self.markSize) / 2).rounded() : Self.horizontalPadding
+            ? ((width - sizing.markSize) / 2).rounded() : sizing.horizontalPadding
         switch mark {
         case .dot:
             let dot = NSView(frame: CGRect(
                 x: markX, y: markY,
-                width: Self.markSize, height: Self.markSize))
+                width: sizing.markSize, height: sizing.markSize))
             dot.wantsLayer = true
             dot.layer?.backgroundColor = NSColor.white.cgColor
-            dot.layer?.cornerRadius = Self.markSize / 2
+            dot.layer?.cornerRadius = sizing.markSize / 2
             addSubview(dot)
             markDot = dot
         case .symbol(let name):
             let glyph = NSImageView(frame: CGRect(
                 x: markX, y: markY,
-                width: Self.markSize, height: Self.markSize))
-            glyph.image = HUDMetrics.symbol(name, pointSize: 10, weight: .bold)
+                width: sizing.markSize, height: sizing.markSize))
+            glyph.image = HUDMetrics.symbol(
+                name, pointSize: sizing.symbolPointSize, weight: .bold)
             glyph.contentTintColor = .white
             glyph.imageScaling = .scaleProportionallyDown
             addSubview(glyph)
             markGlyph = glyph
         }
 
-        label.font = Self.font
+        label.font = sizing.font
         label.textColor = .white
         label.sizeToFit()
         label.setFrameOrigin(CGPoint(
-            x: Self.horizontalPadding + Self.markSize + Self.markTextGap,
+            x: sizing.horizontalPadding + sizing.markSize + sizing.markTextGap,
             y: ((height - label.frame.height) / 2).rounded()))
         addSubview(label)
     }
@@ -279,7 +317,7 @@ final class HUDPill: NSView {
         label.stringValue = title
         label.sizeToFit()
         label.setFrameOrigin(CGPoint(
-            x: Self.horizontalPadding + Self.markSize + Self.markTextGap,
+            x: sizing.horizontalPadding + sizing.markSize + sizing.markTextGap,
             y: ((bounds.height - label.frame.height) / 2).rounded()))
     }
 

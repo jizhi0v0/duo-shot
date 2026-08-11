@@ -94,6 +94,7 @@ final class ViewerWindowController {
                                   backing: .buffered, defer: false)
         window.title = entry.url.lastPathComponent
         window.contentView = content.view
+        window.contentMinSize = content.minSize
         // The window outlives its close — `windows` is what decides lifetime, and
         // a released-on-close window would be freed while this dictionary still
         // pointed at it.
@@ -172,6 +173,15 @@ final class ViewerWindowController {
         var view: NSView
         /// The size the window should open at, in points.
         var size: CGSize
+        /// The smallest the window may be dragged to.
+        ///
+        /// Not optional and not a guess: the still viewer's chrome is a bar of
+        /// fixed width, and a window narrower than it does not reflow — it
+        /// *clips*, so the tools at both ends of the row disappear off the sides
+        /// of the window and Done goes with them. The window opened at a size
+        /// that fitted and could then be dragged to any size at all, which is
+        /// how it was reported: 缩小就变成这样了.
+        var minSize: CGSize = CGSize(width: 320, height: 240)
         /// What the window should hand the keyboard to, when that is not the
         /// content view itself: a recording's player is inside a container now,
         /// and Space and the arrow keys are the player's, not the container's.
@@ -280,7 +290,16 @@ final class ViewerWindowController {
             editor?.redactSensitive()
         })
 
-        return Content(view: editor, size: size, onShown: { editor.zoomToFit() })
+        // Wide enough for the bar, and tall enough that the picture between the
+        // two bands is still a picture rather than a sliver. `minimumPicture` is
+        // the floor the *opening* size is clamped to; this is the floor a drag
+        // is clamped to, and they are the same numbers for the same reason.
+        return Content(
+            view: editor, size: size,
+            minSize: CGSize(
+                width: ImageEditor.minimumContentWidth,
+                height: ImageEditor.chromeHeight + 160),
+            onShown: { editor.zoomToFit() })
     }
 
     // MARK: - Geometry
@@ -294,7 +313,8 @@ final class ViewerWindowController {
     /// either side of it, since a bar that touched both edges of its own window
     /// would look like a mistake, and tall enough that the picture is the thing
     /// in the window rather than the thing between two bands.
-    static let minimumPicture = CGSize(width: 560, height: 420)
+    static let minimumPicture = CGSize(
+        width: max(560, ImageEditor.minimumContentWidth), height: 420)
 
     /// The largest window that shows the whole thing without covering the screen.
     ///
@@ -319,9 +339,18 @@ final class ViewerWindowController {
     /// a frame two sizes too big, which is the state this whole band of sizes
     /// exists to avoid.
     ///
-    /// The top left stays put. Growing or shrinking about the centre moves the
-    /// title bar out from under the pointer that just finished a drag, and every
-    /// other window on this system resizes downward and to the right.
+    /// **The centre stays put**, and it did not: the top left did.
+    ///
+    /// The argument for the top left was that every other window on this system
+    /// resizes downward and to the right, and that growing about the centre moves
+    /// the title bar out from under a pointer that has just finished a drag. Both
+    /// are true of a window being *dragged* by its corner. Neither is true here:
+    /// nothing is under the pointer, the window shrinks by however much was
+    /// cropped away, and it walks off towards the top left of wherever it was —
+    /// reported, plainly, as 裁剪后 window 没有居中.
+    ///
+    /// Clamped back inside the screen afterwards, because a window centred on a
+    /// point near the edge can be centred and still be half off it.
     private func resize(_ window: NSWindow, toPicture size: CGSize) {
         let picture = fitted(Self.band(around: size), reserving: ImageEditor.chromeHeight)
         let content = CGSize(
@@ -329,8 +358,14 @@ final class ViewerWindowController {
         let frame = window.frameRect(forContentRect: CGRect(origin: .zero, size: content))
         guard abs(frame.width - window.frame.width) > 1
             || abs(frame.height - window.frame.height) > 1 else { return }
+        let centre = CGPoint(x: window.frame.midX, y: window.frame.midY)
+        var origin = CGPoint(x: centre.x - frame.width / 2, y: centre.y - frame.height / 2)
+        if let visible = (window.screen ?? NSScreen.main)?.visibleFrame {
+            origin.x = min(max(origin.x, visible.minX), visible.maxX - frame.width)
+            origin.y = min(max(origin.y, visible.minY), visible.maxY - frame.height)
+        }
         window.setFrame(
-            CGRect(x: window.frame.minX, y: window.frame.maxY - frame.height,
+            CGRect(x: origin.x.rounded(), y: origin.y.rounded(),
                    width: frame.width, height: frame.height),
             display: true, animate: false)
     }

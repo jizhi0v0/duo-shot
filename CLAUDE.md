@@ -86,6 +86,50 @@ in `make test`. Conventions that are load-bearing:
 `ImageEdit` (model + renderer, `Output/`) and `ImageEditor` (UI, `Preview/`).
 The rules that are easy to break from either side:
 
+- **A mark carries its own `Ink`** (colour + weight) as a defaulted associated
+  value on the enum case. Defaults are what let a hundred existing call sites
+  keep saying `.arrow(a, b)`; pattern *matches* still have to name the extra
+  binding. Nothing reads the toolbar at render time — an arrow drawn in red
+  stays red when the next one is blue, the same rule the text size already had.
+- **`EditMetrics`, not `HUDMetrics`.** The editor's chrome is furniture in a
+  window that is worked in; `HUDMetrics` sizes a bar that appears over the
+  screen for a few seconds. They were shared, and the editor looked like a HUD
+  doing a job it was not built for. `HUDPill.Sizing.editor` is the matching
+  pill geometry.
+- **The two bands are the same height**, even though the top one holds two rows
+  and the bottom one holds one. Unequal bands put the picture half the
+  difference below the middle of the *window* — invisible until a crop leaves a
+  small picture floating in a large one. The slack goes above the footer.
+- **A resize keeps the window's centre**, not its top left. The top-left rule is
+  about a window being dragged by its corner; a crop shrinks it with nothing
+  under the pointer, and it walked off towards the corner.
+- **Share Link is gated on `ShareService.shared.isConfigured`**, not on
+  `canShare(fileAt:)` — the latter asks whether the file *type* could be
+  uploaded, which for a PNG is always yes. It is the one control in the chrome
+  that is hidden rather than dimmed, same as the preview card's upload button.
+- **The window's minimum width comes from the bar** (`minimumContentWidth`),
+  measured from a real `EditToolbar`. It was a number typed out beside it, and
+  the moment the bar grew a second row a small capture opened with the leftmost
+  tool sliced off by the edge of its own window.
+- **That floor is `contentMinSize` as well as an opening size.** The bar does not
+  reflow, it clips, and a viewer with no minimum could be dragged to 300 points
+  wide — losing the tools at both ends of the row and Done with them. Note when
+  testing this: `setFrame` ignores `contentMinSize`; AppKit enforces it on a
+  user's drag. So squeeze to the window's own `contentMinSize` and assert that
+  *that* size is enough, rather than to an arbitrary small frame.
+- **Escape means "out of here", once.** Box, then selection, then the window. It
+  used to put the *tool* down as a middle step, which with nine tools meant it
+  almost never reached the window — reported as "esc 没法直接退出 window". V
+  puts the pointer back and says so on a button.
+- **A re-opened annotation is suspended, not removed.** `takeText` leaves the
+  entry in the list and `visibleEdits` hides it while the box stands in for it.
+  It used to remove it and rely on the commit to put it back, so Escape and
+  changing tool both deleted the note — with the preview a render behind, so
+  nothing said so until later. Anything that ends the box goes through
+  `onTypingFinished`.
+- **Anything that writes commits the box first** (`copyOut`, `saveAs`,
+  `shareOut`). The box's words are not in the list until it commits, so Copy
+  used to export the picture without the note being typed onto it.
 - **Coordinates**: image *points*, origin bottom-left — the space the user drew
   in, which on a 2× capture is not the bitmap's pixels. `ImageEdit.render` holds
   the one scale that separates them.

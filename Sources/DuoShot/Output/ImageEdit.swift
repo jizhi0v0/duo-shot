@@ -20,11 +20,14 @@ import UniformTypeIdentifiers
 /// scale that separates the two, so nothing upstream has to think about it.
 nonisolated enum ImageEdit: Equatable {
     /// Averaged away, not covered up. `Redaction` owns the how and the why.
+    ///
+    /// The one mark with no `Ink`: a redaction is not drawn in a colour, it is
+    /// an absence of the pixels that were there.
     case redact(CGRect)
     /// A numbered dot. The number is not stored: it is the marker's position in
     /// the list, worked out at render time, so undoing the second of three
     /// renumbers the third rather than leaving a gap.
-    case marker(CGPoint)
+    case marker(CGPoint, Ink = .default)
     /// Text, positioned by the **top left of its first line's box** — not by the
     /// baseline, which is where this started and had to move.
     ///
@@ -38,12 +41,12 @@ nonisolated enum ImageEdit: Equatable {
     /// The size travels with the text rather than being read from a setting at
     /// render time: a note written large stays large when a later one is written
     /// small, which is the only behaviour anyone expects from a size control.
-    case text(CGPoint, String, CGFloat)
+    case text(CGPoint, String, CGFloat, Ink = .default)
     /// Lightweight callouts. Points stay in image coordinates so preview and
     /// export share the exact same geometry at every backing scale.
-    case line(CGPoint, CGPoint)
-    case arrow(CGPoint, CGPoint)
-    case rectangle(CGRect)
+    case line(CGPoint, CGPoint, Ink = .default)
+    case arrow(CGPoint, CGPoint, Ink = .default)
+    case rectangle(CGRect, Ink = .default)
     /// A wash of colour that leaves what is under it readable — the opposite of
     /// `redact`, which exists to make sure nothing under it can be read.
     ///
@@ -52,7 +55,7 @@ nonisolated enum ImageEdit: Equatable {
     /// what a highlighter never does; multiplying leaves anything already dark
     /// exactly where it was and only tints what was light. That is the whole
     /// behaviour of the physical object, and the self-test asserts it.
-    case highlight(CGRect)
+    case highlight(CGRect, Ink = .highlighter)
     /// What survives. Applied last and only once — the *last* crop in the list
     /// wins, so cropping twice is a correction rather than a compounding.
     case crop(CGRect)
@@ -72,24 +75,116 @@ nonisolated enum ImageEdit: Equatable {
         switch self {
         case .redact(let rect):
             return .redact(rect.offsetBy(dx: offset.x, dy: offset.y))
-        case .marker(let point):
-            return .marker(CGPoint(x: point.x + offset.x, y: point.y + offset.y))
-        case .text(let point, let string, let size):
-            return .text(CGPoint(x: point.x + offset.x, y: point.y + offset.y), string, size)
-        case .line(let start, let end):
+        case .marker(let point, let ink):
+            return .marker(CGPoint(x: point.x + offset.x, y: point.y + offset.y), ink)
+        case .text(let point, let string, let size, let ink):
+            return .text(
+                CGPoint(x: point.x + offset.x, y: point.y + offset.y), string, size, ink)
+        case .line(let start, let end, let ink):
             return .line(
                 CGPoint(x: start.x + offset.x, y: start.y + offset.y),
-                CGPoint(x: end.x + offset.x, y: end.y + offset.y))
-        case .arrow(let start, let end):
+                CGPoint(x: end.x + offset.x, y: end.y + offset.y), ink)
+        case .arrow(let start, let end, let ink):
             return .arrow(
                 CGPoint(x: start.x + offset.x, y: start.y + offset.y),
-                CGPoint(x: end.x + offset.x, y: end.y + offset.y))
-        case .rectangle(let rect):
-            return .rectangle(rect.offsetBy(dx: offset.x, dy: offset.y))
-        case .highlight(let rect):
-            return .highlight(rect.offsetBy(dx: offset.x, dy: offset.y))
+                CGPoint(x: end.x + offset.x, y: end.y + offset.y), ink)
+        case .rectangle(let rect, let ink):
+            return .rectangle(rect.offsetBy(dx: offset.x, dy: offset.y), ink)
+        case .highlight(let rect, let ink):
+            return .highlight(rect.offsetBy(dx: offset.x, dy: offset.y), ink)
         case .crop(let rect):
             return .crop(rect.offsetBy(dx: offset.x, dy: offset.y))
+        }
+    }
+
+    // MARK: - Picking one out of the list
+
+    /// The rectangle this mark occupies, or nil for the one that has no place on
+    /// the picture at all.
+    ///
+    /// A crop answers nil deliberately: it is the frame around what survives
+    /// rather than something drawn onto it, and a selection rectangle that could
+    /// land on it would let ⌫ delete "the picture's shape" as if it were a mark.
+    ///
+    /// `picture` is the *original's* point size, the space the list is in — the
+    /// same argument `bounds(ofText:)` takes and for the same reason: a piece of
+    /// text wraps at the right edge, so how tall it is depends on how far from
+    /// that edge it starts.
+    func bounds(within picture: CGSize) -> CGRect? {
+        switch self {
+        case .redact(let rect), .rectangle(let rect, _), .highlight(let rect, _):
+            return rect
+        case .marker(let centre, let ink):
+            let radius = Self.markerRadius * ink.weight.markerScale
+            return CGRect(x: centre.x - radius, y: centre.y - radius,
+                          width: radius * 2, height: radius * 2)
+        case .text(let origin, let string, let size, _):
+            return Self.bounds(ofText: string, at: origin, size: size, within: picture)
+        case .line(let start, let end, let ink), .arrow(let start, let end, let ink):
+            return CGRect(x: min(start.x, end.x), y: min(start.y, end.y),
+                          width: abs(end.x - start.x), height: abs(end.y - start.y))
+                .insetBy(dx: -Self.strokeWidth * ink.weight.strokeScale,
+                         dy: -Self.strokeWidth * ink.weight.strokeScale)
+        case .crop:
+            return nil
+        }
+    }
+
+    /// Whether a click at `point` picked this mark.
+    ///
+    /// Not simply `bounds.contains`, and the difference is the whole reason this
+    /// exists: the bounding box of a diagonal arrow is a rectangle whose corners
+    /// are nowhere near the arrow. Clicking one of those corners to select the
+    /// arrow and getting it is fine; clicking one to select the *rectangle
+    /// behind it* and getting the arrow instead is the bug. Strokes are picked
+    /// by distance to the segment, everything else by its box.
+    func contains(_ point: CGPoint, within picture: CGSize, slop: CGFloat = 4) -> Bool {
+        switch self {
+        case .line(let start, let end, let ink), .arrow(let start, let end, let ink):
+            let reach = Self.strokeWidth * ink.weight.strokeScale / 2 + slop
+            return Self.distance(from: point, toSegmentFrom: start, to: end) <= reach
+        default:
+            guard let box = bounds(within: picture) else { return false }
+            return box.insetBy(dx: -slop, dy: -slop).contains(point)
+        }
+    }
+
+    private static func distance(
+        from point: CGPoint, toSegmentFrom start: CGPoint, to end: CGPoint
+    ) -> CGFloat {
+        let run = CGPoint(x: end.x - start.x, y: end.y - start.y)
+        let squared = run.x * run.x + run.y * run.y
+        guard squared > 0 else { return hypot(point.x - start.x, point.y - start.y) }
+        let t = min(1, max(0, ((point.x - start.x) * run.x + (point.y - start.y) * run.y)
+            / squared))
+        return hypot(point.x - (start.x + run.x * t), point.y - (start.y + run.y * t))
+    }
+
+    /// The same mark in a different colour and weight, for the swatch pressed
+    /// while something is selected — which is how anyone expects a colour
+    /// control in an editor to behave once there is a selection to apply it to.
+    ///
+    /// A redaction and a crop answer with themselves: neither has an ink, and
+    /// silently doing nothing is better than pretending a grey mosaic can be
+    /// blue.
+    func inked(_ ink: Ink) -> ImageEdit {
+        switch self {
+        case .redact, .crop: return self
+        case .marker(let point, _): return .marker(point, ink)
+        case .text(let point, let string, let size, _): return .text(point, string, size, ink)
+        case .line(let start, let end, _): return .line(start, end, ink)
+        case .arrow(let start, let end, _): return .arrow(start, end, ink)
+        case .rectangle(let rect, _): return .rectangle(rect, ink)
+        case .highlight(let rect, _): return .highlight(rect, ink)
+        }
+    }
+
+    /// The ink this mark is made in, or nil for the two that are not made in one.
+    var ink: Ink? {
+        switch self {
+        case .redact, .crop: nil
+        case .marker(_, let ink), .text(_, _, _, let ink), .line(_, _, let ink),
+             .arrow(_, _, let ink), .rectangle(_, let ink), .highlight(_, let ink): ink
         }
     }
 
@@ -163,12 +258,129 @@ nonisolated enum ImageEdit: Equatable {
     /// spreadsheet, a black terminal — and what buys that is the shadow in
     /// `setShadow`, not an outline: two rounds of looking at outlined text and a
     /// ringed disc said the same thing both times.
-    static let inkColor = CGColor(srgbRed: 1, green: 0.23, blue: 0.19, alpha: 1)
+    static let inkColor = InkColour.red.stroke
     /// Opaque, and that is not a mistake: it is multiplied rather than blended,
     /// so its own alpha would only wash the tint out. White under it becomes
     /// this colour exactly; black under it stays black.
-    static let highlightColor = CGColor(srgbRed: 1, green: 0.86, blue: 0.2, alpha: 1)
+    static let highlightColor = InkColour.yellow.wash
     static let haloColor = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
+}
+
+/// What colour a mark is made in.
+///
+/// A closed set of eight rather than a colour well, and that is the point: these
+/// are drawn over *screenshots*, which are already every colour there is, and the
+/// job is to be seen against them. Each of these carries a hand-picked wash for
+/// the highlighter and a hand-picked ink for a marker's number, because neither
+/// follows from the stroke colour — yellow needs a black number and red needs a
+/// white one, and no formula gets both right at the ends of the range.
+nonisolated enum InkColour: String, CaseIterable, Sendable {
+    case red, orange, yellow, green, blue, purple, white, black
+
+    /// What a line, a box, a marker's disc and a piece of text are drawn in.
+    var stroke: CGColor {
+        switch self {
+        case .red: CGColor(srgbRed: 1, green: 0.23, blue: 0.19, alpha: 1)
+        case .orange: CGColor(srgbRed: 1, green: 0.58, blue: 0, alpha: 1)
+        case .yellow: CGColor(srgbRed: 1, green: 0.84, blue: 0.04, alpha: 1)
+        case .green: CGColor(srgbRed: 0.16, green: 0.78, blue: 0.35, alpha: 1)
+        case .blue: CGColor(srgbRed: 0.04, green: 0.52, blue: 1, alpha: 1)
+        case .purple: CGColor(srgbRed: 0.75, green: 0.35, blue: 0.95, alpha: 1)
+        case .white: CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
+        case .black: CGColor(srgbRed: 0.07, green: 0.07, blue: 0.08, alpha: 1)
+        }
+    }
+
+    /// The highlighter's band, which is multiplied rather than blended: it has to
+    /// be light enough that black text under it stays black and readable. The
+    /// stroke colours are far too saturated for that — blue ink over grey text
+    /// gives a navy smear with nothing legible in it.
+    var wash: CGColor {
+        switch self {
+        case .red: CGColor(srgbRed: 1, green: 0.62, blue: 0.58, alpha: 1)
+        case .orange: CGColor(srgbRed: 1, green: 0.78, blue: 0.48, alpha: 1)
+        case .yellow: CGColor(srgbRed: 1, green: 0.86, blue: 0.2, alpha: 1)
+        case .green: CGColor(srgbRed: 0.6, green: 0.95, blue: 0.66, alpha: 1)
+        case .blue: CGColor(srgbRed: 0.6, green: 0.83, blue: 1, alpha: 1)
+        case .purple: CGColor(srgbRed: 0.85, green: 0.7, blue: 1, alpha: 1)
+        case .white: CGColor(srgbRed: 0.88, green: 0.88, blue: 0.9, alpha: 1)
+        case .black: CGColor(srgbRed: 0.55, green: 0.55, blue: 0.57, alpha: 1)
+        }
+    }
+
+    /// The number inside a marker's disc. White on the dark half of the palette
+    /// and near-black on the light half; a white "3" on a yellow disc is a disc
+    /// with nothing in it.
+    var onStroke: CGColor {
+        switch self {
+        case .yellow, .white: CGColor(srgbRed: 0.1, green: 0.1, blue: 0.11, alpha: 1)
+        default: CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
+        }
+    }
+
+    /// For the swatch in the toolbar, which is the same colour as the mark it
+    /// makes.
+    var label: String { rawValue.capitalized }
+}
+
+/// How heavy a mark is.
+///
+/// Three, not a slider. The number that matters is how thick the line looks
+/// against the screenshot, and the honest answers to that are "thinner",
+/// "normal" and "thicker" — a slider invites picking 4.7 and then wondering
+/// whether the next one is the same.
+///
+/// Every scale here multiplies a constant that is already in image points, so a
+/// thick arrow on a 5K capture is as thick relative to the picture as a thick
+/// arrow on a window shot.
+nonisolated enum InkWeight: String, CaseIterable, Sendable {
+    case thin, medium, thick
+
+    var strokeScale: CGFloat {
+        switch self {
+        case .thin: 0.55
+        case .medium: 1
+        case .thick: 1.75
+        }
+    }
+
+    /// A marker's disc grows with the weight too, but not as fast: at the stroke
+    /// ratio a thick marker is a coin on top of the thing it was pointing at.
+    var markerScale: CGFloat {
+        switch self {
+        case .thin: 0.78
+        case .medium: 1
+        case .thick: 1.3
+        }
+    }
+
+    var label: String { rawValue.capitalized }
+}
+
+/// The colour and weight a mark carries with it.
+///
+/// Stored on the edit rather than read from the toolbar at render time, for the
+/// same reason the text size is: a red arrow drawn ten minutes ago stays red
+/// when the next one is drawn in blue. A palette that reached back and recoloured
+/// everything already on the picture is not a palette, it is a theme.
+nonisolated struct Ink: Equatable, Sendable {
+    var colour: InkColour
+    var weight: InkWeight
+
+    init(colour: InkColour = .red, weight: InkWeight = .medium) {
+        self.colour = colour
+        self.weight = weight
+    }
+
+    /// What every tool starts on, and what every `ImageEdit` written without one
+    /// gets — which is what keeps a hundred existing call sites, most of them in
+    /// the self-tests, saying exactly what they said before colour existed.
+    static let `default` = Ink()
+
+    /// The highlighter's own default. Yellow because that is what a highlighter
+    /// is, and it is the one tool whose colour nobody expects to inherit from the
+    /// pen.
+    static let highlighter = Ink(colour: .yellow)
 }
 
 /// The undo stack, which is the whole reason the edits are a list.
@@ -308,30 +520,31 @@ nonisolated extension ImageEdit {
                       let pixelated = Redaction.pixelate(snapshot, regions: regions)
                 else { return nil }
                 context.draw(pixelated, in: full)
-            case .marker(let centre):
+            case .marker(let centre, let ink):
                 markerNumber += 1
-                draw(marker: markerNumber, at: scaled(centre, by: scale), unit: unit, in: context)
+                draw(marker: markerNumber, at: scaled(centre, by: scale),
+                     ink: ink, unit: unit, in: context)
                 index += 1
-            case .text(let origin, let string, let size):
+            case .text(let origin, let string, let size, let ink):
                 draw(text: string, at: scaled(origin, by: scale), size: size,
-                     wrappingAt: pixels.width, unit: unit, in: context)
+                     wrappingAt: pixels.width, ink: ink, unit: unit, in: context)
                 index += 1
-            case .line(let start, let end):
+            case .line(let start, let end, let ink):
                 drawStroke(from: scaled(start, by: scale), to: scaled(end, by: scale),
-                           arrow: false, unit: unit, in: context)
+                           arrow: false, ink: ink, unit: unit, in: context)
                 index += 1
-            case .arrow(let start, let end):
+            case .arrow(let start, let end, let ink):
                 drawStroke(from: scaled(start, by: scale), to: scaled(end, by: scale),
-                           arrow: true, unit: unit, in: context)
+                           arrow: true, ink: ink, unit: unit, in: context)
                 index += 1
-            case .rectangle(let rect):
-                drawRectangle(scaled(rect, by: scale), unit: unit, in: context)
+            case .rectangle(let rect, let ink):
+                drawRectangle(scaled(rect, by: scale), ink: ink, unit: unit, in: context)
                 index += 1
-            case .highlight(let rect):
+            case .highlight(let rect, let ink):
                 // Not coalesced the way consecutive redactions are. Averaging an
                 // average is wrong, which is why those are gathered up; ink laid
                 // twice over the same words really is darker, on paper and here.
-                drawHighlight(scaled(rect, by: scale), in: context)
+                drawHighlight(scaled(rect, by: scale), ink: ink, in: context)
                 index += 1
             case .crop:
                 // Last, and outside the loop: a crop half way through the list
@@ -447,7 +660,7 @@ nonisolated extension ImageEdit {
     /// differently enough to make a committed line visibly tighten.
     static func drawEditorText(
         _ string: String, size pointSize: CGFloat, unit: CGFloat,
-        wrappingAt limit: CGFloat, in context: CGContext
+        wrappingAt limit: CGFloat, colour: InkColour = .red, in context: CGContext
     ) {
         guard !string.isEmpty else { return }
         context.saveGState()
@@ -474,15 +687,15 @@ nonisolated extension ImageEdit {
             guard !text.isEmpty else { continue }
             context.textPosition = CGPoint(
                 x: 0, y: CGFloat(index) * stride + baselineFromTop)
-            CTLineDraw(typeset(text, size: pixelSize, fill: inkColor, halo: false), context)
+            CTLineDraw(typeset(text, size: pixelSize, fill: colour.stroke, halo: false), context)
         }
         context.restoreGState()
     }
 
     private static func draw(
-        marker number: Int, at centre: CGPoint, unit: CGFloat, in context: CGContext
+        marker number: Int, at centre: CGPoint, ink: Ink, unit: CGFloat, in context: CGContext
     ) {
-        let radius = markerRadius * unit
+        let radius = markerRadius * ink.weight.markerScale * unit
         let circle = CGRect(
             x: centre.x - radius, y: centre.y - radius,
             width: radius * 2, height: radius * 2)
@@ -493,11 +706,12 @@ nonisolated extension ImageEdit {
         // same colour.
         context.saveGState()
         setShadow(unit: unit, in: context)
-        context.setFillColor(inkColor)
+        context.setFillColor(ink.colour.stroke)
         context.fillEllipse(in: circle)
         context.restoreGState()
 
-        let line = typeset("\(number)", size: radius * 1.15, fill: haloColor, halo: false)
+        let line = typeset("\(number)", size: radius * 1.15, fill: ink.colour.onStroke,
+                           halo: false)
         let bounds = CTLineGetBoundsWithOptions(line, .useOpticalBounds)
         context.textPosition = CGPoint(
             x: centre.x - bounds.width / 2 - bounds.minX,
@@ -506,13 +720,13 @@ nonisolated extension ImageEdit {
     }
 
     private static func drawStroke(
-        from start: CGPoint, to end: CGPoint, arrow: Bool,
+        from start: CGPoint, to end: CGPoint, arrow: Bool, ink: Ink,
         unit: CGFloat, in context: CGContext
     ) {
-        let width = strokeWidth * unit
+        let width = strokeWidth * ink.weight.strokeScale * unit
         context.saveGState()
         setShadow(unit: unit, in: context)
-        context.setStrokeColor(inkColor)
+        context.setStrokeColor(ink.colour.stroke)
         context.setLineWidth(width)
         context.setLineCap(.round)
         context.setLineJoin(.round)
@@ -520,7 +734,9 @@ nonisolated extension ImageEdit {
         context.addLine(to: end)
         if arrow {
             let angle = atan2(end.y - start.y, end.x - start.x)
-            let head = arrowHeadLength * unit
+            // The head grows with the line: a hairline arrow with a full-weight
+            // head is a dart, and a thick one with a stock head is a stick.
+            let head = arrowHeadLength * ink.weight.strokeScale * unit
             for turn in [CGFloat.pi * 0.82, -CGFloat.pi * 0.82] {
                 context.move(to: end)
                 context.addLine(to: CGPoint(
@@ -535,19 +751,21 @@ nonisolated extension ImageEdit {
     /// No shadow and no outline, unlike every other mark here. A highlighter
     /// leaves a flat band of colour; an edge or a drop shadow would make it read
     /// as a box that happens to be yellow.
-    private static func drawHighlight(_ rect: CGRect, in context: CGContext) {
+    private static func drawHighlight(_ rect: CGRect, ink: Ink, in context: CGContext) {
         context.saveGState()
         context.setBlendMode(.multiply)
-        context.setFillColor(highlightColor)
+        context.setFillColor(ink.colour.wash)
         context.fill(rect)
         context.restoreGState()
     }
 
-    private static func drawRectangle(_ rect: CGRect, unit: CGFloat, in context: CGContext) {
-        let width = strokeWidth * unit
+    private static func drawRectangle(
+        _ rect: CGRect, ink: Ink, unit: CGFloat, in context: CGContext
+    ) {
+        let width = strokeWidth * ink.weight.strokeScale * unit
         context.saveGState()
         setShadow(unit: unit, in: context)
-        context.setStrokeColor(inkColor)
+        context.setStrokeColor(ink.colour.stroke)
         context.setLineWidth(width)
         context.setLineJoin(.round)
         context.stroke(rect.insetBy(dx: width / 2, dy: width / 2))
@@ -556,7 +774,7 @@ nonisolated extension ImageEdit {
 
     private static func draw(
         text string: String, at origin: CGPoint, size pointSize: CGFloat,
-        wrappingAt limit: CGFloat, unit: CGFloat, in context: CGContext
+        wrappingAt limit: CGFloat, ink: Ink, unit: CGFloat, in context: CGContext
     ) {
         guard !string.isEmpty else { return }
         let size = pointSize * unit
@@ -577,7 +795,7 @@ nonisolated extension ImageEdit {
         let baselineFromTop = textBaselineFromTop(at: pointSize)
         for (index, text) in lines.enumerated() {
             guard !text.isEmpty else { continue }
-            let line = typeset(text, size: size, fill: inkColor, halo: false)
+            let line = typeset(text, size: size, fill: ink.colour.stroke, halo: false)
             // One offset for every line, not each line's own: see
             // `textBaselineFromTop`. The box being typed into is held to the
             // same number, so a line of Chinese and a line of English sit on the

@@ -4335,6 +4335,73 @@ enum SelfTest {
             + "\(rectString(stillWindow.contentLayoutRect))")
         checkFits(stillWindow, "still")
 
+        // MARK: dragged as small as it goes
+        //
+        // The window opened at a size the bar fitted in and could then be dragged
+        // to any size at all. The bar does not reflow — it clips — so a narrow
+        // window lost the tools at both ends of the row off the sides, and Done
+        // with them. Reported with a picture of a window about 300 points wide
+        // holding half a toolbar.
+        //
+        // Squeezed to the window's *own* declared minimum, not to some arbitrary
+        // 200×200: `setFrame` ignores `contentMinSize` — AppKit enforces it on a
+        // user's drag, not on a programmatic frame — so shrinking past it here
+        // would be testing a size no one can reach. The claim under test is the
+        // one that matters: that the minimum the window will let anyone drag to
+        // is *enough* for everything in it. A minimum that is merely set proves
+        // nothing.
+        if let editor = viewer.editorForTest(still.url) {
+            let restore = stillWindow.frame
+            let smallest = stillWindow.contentMinSize
+            print("  content minimum: \(Int(smallest.width))×\(Int(smallest.height))")
+            if smallest.width < 100 || smallest.height < 100 {
+                failures.append("the viewer window has no useful minimum size")
+            }
+            let frame = stillWindow.frameRect(
+                forContentRect: CGRect(origin: restore.origin, size: smallest))
+            stillWindow.setFrame(frame, display: true)
+            stillWindow.layoutIfNeeded()
+            editor.layoutSubtreeIfNeeded()
+            let bar = editor.barFrameForTest
+            let foot = editor.footerFrameForTest
+            let barFits = bar.minX >= -0.5 && bar.maxX <= editor.bounds.width + 0.5
+            let footFits = foot.minX >= -0.5 && foot.maxX <= editor.bounds.width + 0.5
+            print("  squeezed to the minimum: content \(rectString(editor.bounds)), "
+                + "bar \(rectString(bar)) \(barFits ? "fits" : "CLIPPED"), "
+                + "footer \(rectString(foot)) \(footFits ? "fits" : "CLIPPED")")
+            if !barFits { failures.append("the toolbar is clipped in the smallest window") }
+            if !footFits { failures.append("the footer is clipped in the smallest window") }
+            // And the picture is still a picture, not a sliver between two bars.
+            let area = editor.pictureFrameForTest.height
+            print(String(format: "  squeezed: picture area %.0f pt tall", area))
+            if area < 100 {
+                failures.append("the smallest window leaves \(Int(area)) pt of picture")
+            }
+            stillWindow.setFrame(restore, display: true)
+            stillWindow.layoutIfNeeded()
+            try await Task.sleep(for: .milliseconds(200))
+        }
+
+        // MARK: the picture sits in the middle of its window
+        //
+        // Half of 裁剪后 window 没有居中，中心点不对. The picture area sat between
+        // two bands of different heights — the tools are two rows and Copy is one
+        // — so it was half the difference below the middle of the window.
+        //
+        // Measured against the *window*, which is the measurement the old
+        // geometry checks did not make: the picture was perfectly centred in the
+        // space it had been given, and the space was in the wrong place. That is
+        // the shape of mistake this file keeps making, so it is worth naming.
+        if let editor = viewer.editorForTest(still.url) {
+            let drift = editor.pictureFrameForTest.midY - editor.bounds.midY
+            print(String(format: "  picture area %@ in %@ -> off centre by %.1f pt",
+                         rectString(editor.pictureFrameForTest) as NSString,
+                         rectString(editor.bounds) as NSString, drift))
+            if abs(drift) > 1 {
+                failures.append("the picture area is \(Int(drift)) pt off the window's middle")
+            }
+        }
+
         // The still viewer's picture area is the capture's own size clamped into
         // a band — see `standardPicture` and `minimumPicture`. Two things to hold
         // it to: it never swims (a capture inside the band gets its own size plus
@@ -4403,27 +4470,70 @@ enum SelfTest {
         // The same rule applied again. A window that keeps the shape of the
         // picture it used to hold leaves the cropped one floating in the middle
         // of a frame two sizes too big.
-        if let editor = viewer.editorForTest(still.url) {
-            let before = stillWindow.frame
-            editor.addEditForTest(.crop(CGRect(x: 40, y: 30, width: 300, height: 180)))
-            await editor.flushForTest()
-            try await Task.sleep(for: .milliseconds(120))
-            let after = stillWindow.contentLayoutRect.size
-            let picture = CGSize(
-                width: after.width, height: after.height - ImageEditor.chromeHeight)
-            // 300×180 is under the floor, so the floor is what it gets — the
-            // point is that it shrank and that the top left stayed put.
-            let shrank = after.width < before.width - 10 || after.height < before.height - 10
-            let anchored = abs(stillWindow.frame.maxY - before.maxY) <= 1
-                && abs(stillWindow.frame.minX - before.minX) <= 1
-            print(String(format: "  after a crop: picture area %.0f×%.0f -> %@, %@",
-                         picture.width, picture.height,
-                         (shrank ? "smaller" : "UNCHANGED") as NSString,
-                         (anchored ? "top left held" : "MOVED") as NSString))
-            if !shrank { failures.append("the window did not shrink to the cropped picture") }
-            if !anchored { failures.append("the window jumped when it resized") }
-            editor.undoForTest()
-            await editor.flushForTest()
+        //
+        // On a capture large enough for the window to actually shrink, which the
+        // 640×360 one above is not: the toolbar's floor is wider than it, so no
+        // crop can change that window's size at all. The check that used to be
+        // here ran on it anyway and "passed" by comparing a *frame* height
+        // against a *content* height — two numbers that differ by a title bar, so
+        // it read as a shrink whatever happened.
+        let wide = CGRect(x: 100, y: 100, width: 960, height: 560)
+        if let wideResult = try? await coordinator.engine.capture(
+            .area(displayID: displayID, rectInAppKitGlobal: wide)),
+           let wideOutput = await OutputPipeline.shared.process(
+            wideResult, saveDirectoryOverride: directory) {
+            let wideEntry = await PreviewEntry(wideOutput)
+            viewer.show(wideEntry)
+            try await Task.sleep(for: .milliseconds(400))
+            if let window = viewer.windowForTest(wideEntry.url),
+               let editor = viewer.editorForTest(wideEntry.url) {
+                let before = window.frame
+                editor.addEditForTest(.crop(CGRect(x: 40, y: 30, width: 300, height: 180)))
+                await editor.flushForTest()
+                try await Task.sleep(for: .milliseconds(400))
+                let after = window.frame
+                let shrank = after.width < before.width - 10 || after.height < before.height - 10
+                // The centre, not the top left.
+                //
+                // The argument for the top left was that windows on this system
+                // resize downward and to the right. That is about a window being
+                // *dragged* by its corner; here nothing is under the pointer and
+                // the window shrinks by however much was cropped away, so holding
+                // the top left walks it off towards the corner of wherever it
+                // was. Reported as 裁剪后 window 没有居中.
+                let held = hypot(after.midX - before.midX, after.midY - before.midY)
+                // Unless the screen edge pushed it back, which is allowed.
+                let wanted = CGRect(x: before.midX - after.width / 2,
+                                    y: before.midY - after.height / 2,
+                                    width: after.width, height: after.height)
+                let clamped = !visible.insetBy(dx: -1, dy: -1).contains(wanted)
+                print(String(format: "  after a crop: %.0f×%.0f -> %.0f×%.0f, %@, "
+                             + "centre moved %.0f pt%@",
+                             before.width, before.height, after.width, after.height,
+                             (shrank ? "smaller" : "UNCHANGED") as NSString, held,
+                             (clamped ? " (screen edge)" : "") as NSString))
+                if !shrank { failures.append("the window did not shrink to the cropped picture") }
+                if held > 1 && !clamped {
+                    failures.append("the window did not keep its centre through a crop")
+                }
+                checkFits(window, "cropped")
+                let drift = editor.pictureFrameForTest.midY - editor.bounds.midY
+                if abs(drift) > 1 {
+                    failures.append("the cropped picture area is \(Int(drift)) pt off centre")
+                }
+                editor.undoForTest()
+                await editor.flushForTest()
+            } else {
+                failures.append("no viewer for the wide capture")
+            }
+            // This one only, not `closeAll` — the still's window is what every
+            // check after this one is holding, including the one that asserts a
+            // second `show` of the same file raises it rather than building
+            // another.
+            viewer.windowForTest(wideEntry.url)?.close()
+            try await Task.sleep(for: .milliseconds(200))
+        } else {
+            failures.append("could not take the wide capture the crop check needs")
         }
 
         // The whole picture has to be visible when it opens. A viewer that lands
@@ -4662,10 +4772,21 @@ enum SelfTest {
 
         // Through the real view, which is where the point size and the pixel
         // size are read off the file rather than passed in by a test.
+        // Sized the way the viewer sizes one — the picture plus the chrome, and
+        // never narrower than the toolbar — rather than to the picture alone.
+        //
+        // It was the picture alone, and every gesture check below quietly stopped
+        // working the day the chrome grew: the scroll view is what is left after
+        // the two bands, so at 600×400 with 244 points of chrome the canvas was
+        // taller than the hole it was being looked at through, and a click at
+        // canvas (200, 200) hit-tested to the toolbar. Ten checks failed at once
+        // with "nothing opened", none of which was about the toolbar.
+        let editorFrame = CGRect(origin: .zero, size: CGSize(
+            width: max(points.width, ImageEditor.minimumContentWidth),
+            height: points.height + ImageEditor.chromeHeight))
         guard let image = NSImage(contentsOf: file),
               let editor = ImageEditor(
-                url: file, image: image, menu: NSMenu(),
-                frame: CGRect(origin: .zero, size: points))
+                url: file, image: image, menu: NSMenu(), frame: editorFrame)
         else {
             print("result:        FAIL — the editor would not open the sample")
             return 1
@@ -4685,7 +4806,7 @@ enum SelfTest {
         // Every other check here passed while the button did nothing at all.
         do {
             let window = NSWindow(
-                contentRect: CGRect(origin: .zero, size: points),
+                contentRect: editorFrame,
                 styleMask: [.titled, .closable], backing: .buffered, defer: false)
             window.contentView = editor
             window.orderFrontRegardless()
@@ -4721,13 +4842,60 @@ enum SelfTest {
             check("clicking it arms the tool", editor.toolForTest == .redact,
                   "\(editor.toolForTest)")
 
+            // The bar has to fit in the window it opens in, with room either
+            // side. It did not: the window's floor was a number typed out beside
+            // the bar rather than measured from it, so when the bar grew a second
+            // row a small capture opened with the leftmost tool sliced off by the
+            // edge of its own window. `ImageEditor.minimumContentWidth` is now
+            // the bar's own answer, and this is the check that says so.
+            // Share Link is only there when there is something behind it.
+            //
+            // The first version gated it on `ShareService.canShare(fileAt:)`,
+            // which asks whether the *file* is a kind that could be uploaded —
+            // always yes for a PNG. So an install with no endpoint and no token
+            // got a Share Link button that could only fail. The gate is
+            // `isConfigured`, the same one the preview card's upload button uses.
+            //
+            // Written against whichever way this machine happens to be set up,
+            // because both answers are correct and only the agreement between
+            // them is being tested.
+            let configured = ShareService.shared.isConfigured
+            check("Share Link is in the footer only when sharing is set up",
+                  editor.shareButtonShownForTest == configured,
+                  "configured \(configured), button \(editor.shareButtonShownForTest)")
+            check("and the footer is sized to the buttons actually in it",
+                  editor.footerFrameForTest.width > 0
+                    && editor.footerFrameForTest.width == editor.footerFittingWidthForTest,
+                  "\(Int(editor.footerFrameForTest.width)) vs "
+                    + "\(Int(editor.footerFittingWidthForTest))")
+
+            // Asserted against the window's *floor* rather than against this
+            // test's window, which is deliberately the picture's own 600 pt so
+            // the point-to-pixel checks above mean something. What matters is
+            // that the narrowest window the viewer will ever open is wide enough
+            // for the bar and the footer both.
+            let floor = ViewerWindowController.minimumPicture.width
+            check("the narrowest viewer window still holds the whole bar",
+                  floor >= barTop.width + 16, "floor \(Int(floor)), bar \(Int(barTop.width))")
+            check("and the footer",
+                  floor >= editor.footerFrameForTest.width + 16,
+                  "floor \(Int(floor)), footer \(Int(editor.footerFrameForTest.width))")
+
             // Every pill in the bar, not only the one that was pressed: the bug
             // was one hidden pill covering one visible one, and there are nine
             // of them now.
+            //
+            // Both rows, sampled at each row's own centre. `barTop.midY` was the
+            // sample point while the bar was one row tall; it is the gap between
+            // the two rows now, and a sweep along it hits nothing at all — a
+            // check that passes because it is looking at empty space.
             var covered = 0
-            for x in stride(from: barTop.minX + 2, to: barTop.maxX - 2, by: 3) {
-                let pill = editor.hitTest(CGPoint(x: x, y: barTop.midY)) as? HUDPill
-                if pill?.isHidden == true { covered += 1 }
+            for row in [barTop.minY + EditMetrics.margin + EditMetrics.controlHeight / 2,
+                        barTop.maxY - EditMetrics.margin - EditMetrics.controlHeight / 2] {
+                for x in stride(from: barTop.minX + 2, to: barTop.maxX - 2, by: 3) {
+                    let pill = editor.hitTest(CGPoint(x: x, y: row)) as? HUDPill
+                    if pill?.isHidden == true { covered += 1 }
+                }
             }
             check("no hidden pill sits over the bar", covered == 0,
                   "\(covered) sampled points hit one")
@@ -4795,7 +4963,7 @@ enum SelfTest {
                 // letters rather than under them.
                 let lift = ImageEdit.textLineHeight() / 2
                 var landed = false
-                if case .text(let origin, let string, _) = editor.editsForTest.last {
+                if case .text(let origin, let string, _, _) = editor.editsForTest.last {
                     landed = string == "account number"
                         && abs(origin.x - spot.x) < 0.01
                         && abs(origin.y - (spot.y + lift)) < 0.01
@@ -5146,7 +5314,7 @@ enum SelfTest {
                     if let elsewhere { canvas.mouseDown(with: elsewhere) }
                     let committed = editor.editsForTest.last
                     var landed = false
-                    if case .text(_, let string, _) = committed { landed = string == "done" }
+                    if case .text(_, let string, _, _) = committed { landed = string == "done" }
                     check("clicking away commits what was being typed", landed,
                           committed.map { "\($0)" } ?? "nothing")
                     // The box that is gone is the point: the click was a full
@@ -5201,7 +5369,7 @@ enum SelfTest {
                 let steps = editor.editsForTest.count
                 drag(canvas, from: CGPoint(x: 210, y: 152),
                      to: CGPoint(x: 260, y: 122), in: window)
-                if case .text(let moved, let string, _) = editor.editsForTest.last {
+                if case .text(let moved, let string, _, _) = editor.editsForTest.last {
                     check("dragging text moves it",
                           string == "move me"
                             && abs(moved.x - 250) < 1 && abs(moved.y - 120) < 1,
@@ -5252,13 +5420,19 @@ enum SelfTest {
                                             on: canvas, in: window) {
                     check("clicking text opens it again", reopened.string == "typo",
                           reopened.string)
-                    check("and takes it out of the list while it is being edited",
-                          editor.editsForTest.count == held - 1,
-                          "\(held) -> \(editor.editsForTest.count)")
+                    // The entry stays in the list and is only hidden from the
+                    // picture, which is what makes cancelling free. It used to
+                    // be *removed*, and every way out of the box that was not a
+                    // commit left it removed — see `ImageEditor.takeText`.
+                    check("and leaves its entry in the list, suspended",
+                          editor.editsForTest.count == held
+                            && editor.suspendedForTest == held - 1,
+                          "\(held) -> \(editor.editsForTest.count), "
+                            + "suspended \(editor.suspendedForTest.map(String.init) ?? "none")")
                     reopened.setSelectedRange(NSRange(location: 4, length: 0))
                     reopened.insertText("!", replacementRange: reopened.selectedRange())
                     commitTyping(reopened, in: window)
-                    if case .text(let anchor, let string, _) = editor.editsForTest.last {
+                    if case .text(let anchor, let string, _, _) = editor.editsForTest.last {
                         check("the correction lands where the original was",
                               string == "typo!"
                                 && abs(anchor.x - 200) < 0.01 && abs(anchor.y - 150) < 0.01,
@@ -5270,11 +5444,121 @@ enum SelfTest {
                 } else {
                     check("clicking text opens it again", false, "nothing opened")
                 }
-                // Wound all the way back rather than a fixed number of times:
-                // re-opening a piece of text is two entries in the history — the
-                // removal and the retyping — and counting them here is how the
-                // checks after this one started reading someone else's list.
+                // Wound all the way back rather than a fixed number of times.
                 while !editor.editsForTest.isEmpty { editor.undoForTest() }
+                await editor.flushForTest()
+
+                // MARK: the two ways out of a re-opened box that are not a commit
+                //
+                // This is the bug that was reported as "Escape does a ⌘Z". A
+                // click on existing text used to *remove* its entry; only
+                // committing put it back, so Escape and switching tool both left
+                // the annotation deleted — and the preview did not re-render, so
+                // nothing said so until the next edit redrew the picture without
+                // it.
+                //
+                // Asserted on the list rather than on the pixels because the
+                // list is what Copy exports: the picture can be a render behind
+                // and still be right, but a list that has lost the note is a
+                // file that will lose it too.
+                press("t", on: editor, in: window)
+                editor.addEditForTest(.text(CGPoint(x: 200, y: 150), "keep me",
+                                            ImageEdit.textSize))
+                await editor.flushForTest()
+                if openField(at: CGPoint(x: 210, y: 152), on: canvas, in: window) != nil {
+                    editor.escapeForTest()
+                    check("Escape out of a re-opened note keeps it",
+                          editor.editsForTest.count == 1
+                            && editor.editsForTest.first == .text(
+                                CGPoint(x: 200, y: 150), "keep me", ImageEdit.textSize),
+                          "\(editor.editsForTest.count) edits: \(editor.editsForTest)")
+                    check("and leaves nothing suspended behind it",
+                          editor.suspendedForTest == nil,
+                          editor.suspendedForTest.map(String.init) ?? "none")
+                } else {
+                    check("Escape out of a re-opened note keeps it", false, "nothing opened")
+                }
+
+                if openField(at: CGPoint(x: 210, y: 152), on: canvas, in: window) != nil {
+                    // The other door out of the box, and the one the report
+                    // named: 切换工具. Through `choose`, which is what pressing a
+                    // pill does — *not* through the letter, which `keyDown`
+                    // rightly refuses to read while a box has the keyboard.
+                    editor.chooseForTest(.arrow)
+                    check("changing tool out of a re-opened note keeps it",
+                          editor.editsForTest.count == 1
+                            && editor.editsForTest.first == .text(
+                                CGPoint(x: 200, y: 150), "keep me", ImageEdit.textSize),
+                          "\(editor.editsForTest.count) edits: \(editor.editsForTest)")
+                } else {
+                    check("changing tool out of a re-opened note keeps it",
+                          false, "nothing opened")
+                }
+
+                // And re-editing is one step to undo, not two, and the note
+                // keeps its place in the list rather than jumping to the end.
+                press("t", on: editor, in: window)
+                editor.addEditForTest(.redact(CGRect(x: 0, y: 0, width: 10, height: 10)))
+                await editor.flushForTest()
+                let historyBefore = editor.editsForTest.count
+                if let again = openField(at: CGPoint(x: 210, y: 152), on: canvas, in: window) {
+                    again.setSelectedRange(NSRange(location: 7, length: 0))
+                    again.insertText("!", replacementRange: again.selectedRange())
+                    commitTyping(again, in: window)
+                    check("a corrected note stays in its own place in the list",
+                          editor.editsForTest.count == historyBefore
+                            && {
+                                if case .text(_, let string, _, _) = editor.editsForTest.first {
+                                    string == "keep me!"
+                                } else { false }
+                            }(),
+                          "\(editor.editsForTest)")
+                    editor.undoForTest()
+                    check("and one ⌘Z puts the original words back",
+                          {
+                              if case .text(_, let string, _, _) = editor.editsForTest.first {
+                                  string == "keep me"
+                              } else { false }
+                          }(),
+                          "\(editor.editsForTest)")
+                } else {
+                    check("a corrected note stays in its own place in the list",
+                          false, "nothing opened")
+                }
+                while !editor.editsForTest.isEmpty { editor.undoForTest() }
+                await editor.flushForTest()
+
+                // MARK: Copy with a note still in the box
+                //
+                // The box lives on the canvas and its words reach the list only
+                // on commit, so pressing Copy with a note half-typed exported the
+                // list without it. The one moment a note must not vanish.
+                press("t", on: editor, in: window)
+                if let box = openField(at: CGPoint(x: 300, y: 200), on: canvas, in: window) {
+                    box.insertText(
+                        "not yet committed", replacementRange: NSRange(location: 0, length: 0))
+                    // Where this copy's file will land, worked out before the
+                    // press so it can be taken away again afterwards: this is
+                    // the first thing in the run to claim "(edited).png", and
+                    // `exportURL` counts up rather than overwriting — so leaving
+                    // it behind renames the export the naming check further down
+                    // is about to make, and fails it for the wrong reason.
+                    let stray = ImageEdit.exportURL(besides: file)
+                    await editor.copyForTest()
+                    check("Copy takes the words still in the box with it",
+                          editor.editsForTest.contains {
+                              if case .text(_, let string, _, _) = $0 {
+                                  string == "not yet committed"
+                              } else { false }
+                          },
+                          "\(editor.editsForTest)")
+                    try? FileManager.default.removeItem(at: stray)
+                } else {
+                    check("Copy takes the words still in the box with it",
+                          false, "nothing opened")
+                }
+                while !editor.editsForTest.isEmpty { editor.undoForTest() }
+                await editor.flushForTest()
             } else {
                 check("clicking with the text tool opens a field", false, "no canvas")
             }
@@ -5300,9 +5584,118 @@ enum SelfTest {
                       editor.editsForTest.count == before + 1,
                       "\(before) -> \(editor.editsForTest.count)")
                 editor.undoForTest()
+                // Waited for, and not a formality: the crop took effect the
+                // moment the drag ended, so until the undo has been *rendered*
+                // the canvas is still the cropped size and still holds the frame
+                // — and the next drag would be measured in the wrong picture.
+                await editor.flushForTest()
+
+                // And the gesture everybody makes first: drag a rectangle
+                // around the part you want.
+                //
+                // This did nothing at all. With nothing cropped yet the frame is
+                // the whole picture, and a press inside a frame used to mean
+                // "slide it" — a frame already against all four edges, so the
+                // clamp put it back exactly where it was and the drag ended with
+                // no crop. The tool looked broken unless you guessed the corners
+                // were handles.
+                let beforeFresh = editor.editsForTest.count
+                drag(canvas, from: CGPoint(x: 150, y: 120),
+                     to: CGPoint(x: 450, y: 340), in: window)
+                let fresh = editor.editsForTest.last?.cropRect
+                check("dragging inside an uncropped picture draws a crop",
+                      fresh.map { abs($0.minX - 150) < 1 && abs($0.minY - 120) < 1
+                          && abs($0.width - 300) < 1 && abs($0.height - 220) < 1 } ?? false,
+                      fresh.map(rectString) ?? "no crop")
+                check("and it too is one entry on the stack",
+                      editor.editsForTest.count == beforeFresh + 1,
+                      "\(beforeFresh) -> \(editor.editsForTest.count)")
+                editor.undoForTest()
+                await editor.flushForTest()
             } else {
                 check("dragging a corner crops from that corner", false, "no canvas")
             }
+
+            // MARK: picking a mark up, recolouring it, and throwing it away
+            //
+            // Before this the pointer could only look. A mark drawn in the wrong
+            // place or the wrong colour cost a run of ⌘Z that took back
+            // everything drawn after it too, and there was no way to say "that
+            // one" at all.
+            press("a", on: editor, in: window)
+            if let canvas = editor.hitTest(CGPoint(x: 200, y: 200)) {
+                drag(canvas, from: CGPoint(x: 120, y: 120),
+                     to: CGPoint(x: 320, y: 260), in: window)
+                await editor.flushForTest()
+                press("v", on: editor, in: window)
+                // On the line itself, not in the corner of its bounding box:
+                // `ImageEdit.contains` measures the distance to the segment for
+                // exactly this reason.
+                editor.selectForTest(at: CGPoint(x: 220, y: 190))
+                check("the pointer picks the arrow out of the list",
+                      editor.selectionForTest == editor.editsForTest.count - 1,
+                      editor.selectionForTest.map(String.init) ?? "nothing")
+                check("and a corner of its bounding box is not the arrow",
+                      { editor.selectForTest(at: CGPoint(x: 130, y: 255))
+                        return editor.selectionForTest == nil }(),
+                      editor.selectionForTest.map(String.init) ?? "nothing")
+
+                editor.selectForTest(at: CGPoint(x: 220, y: 190))
+                editor.chooseColourForTest(.blue)
+                check("a swatch recolours what is picked",
+                      editor.editsForTest.last?.ink?.colour == .blue,
+                      "\(editor.editsForTest.last.map { "\($0)" } ?? "none")")
+                editor.chooseWeightForTest(.thick)
+                check("and a weight re-weights it",
+                      editor.editsForTest.last?.ink?.weight == .thick,
+                      "\(editor.editsForTest.last.map { "\($0)" } ?? "none")")
+
+                let held = editor.editsForTest.count
+                pressKey(51, on: editor, in: window)
+                check("⌫ deletes the picked mark and nothing else",
+                      editor.editsForTest.count == held - 1
+                        && editor.selectionForTest == nil,
+                      "\(held) -> \(editor.editsForTest.count)")
+                editor.undoForTest()
+
+                // Escape lets go of the selection before it reaches the window,
+                // and the window is the next thing it reaches — no tool-putting-
+                // down step in between any more.
+                editor.selectForTest(at: CGPoint(x: 220, y: 190))
+                editor.escapeForTest()
+                check("Escape lets go of the selection", editor.selectionForTest == nil,
+                      editor.selectionForTest.map(String.init) ?? "nothing")
+
+                // A selection is an index into the list, so anything that steps
+                // the list has to drop it — or the frame stays on screen around
+                // a different mark and ⌫ deletes that one.
+                editor.selectForTest(at: CGPoint(x: 220, y: 190))
+                editor.undoForTest()
+                check("⌘Z lets go of it too", editor.selectionForTest == nil,
+                      editor.selectionForTest.map(String.init) ?? "nothing")
+                editor.redoForTest()
+                await editor.flushForTest()
+            } else {
+                check("the pointer picks the arrow out of the list", false, "no canvas")
+            }
+
+            // And the frame is actually drawn in the state the viewer opens in.
+            //
+            // The layer the frame lives on used to be hidden whenever no tool was
+            // armed — and the viewer opens holding the pointer, so the frame
+            // around the mark you had just clicked did not appear at all. Every
+            // check above passed while it was invisible, because they all read
+            // the model. This one asks the view.
+            press("v", on: editor, in: window)
+            editor.addEditForTest(.rectangle(CGRect(x: 100, y: 100, width: 120, height: 80)))
+            await editor.flushForTest()
+            editor.selectForTest(at: CGPoint(x: 160, y: 140))
+            check("the selection frame is on a layer that is actually visible",
+                  editor.selectionFrameForTest != nil && editor.marksAreVisibleForTest,
+                  "frame \(editor.selectionFrameForTest.map(rectString) ?? "none"), "
+                    + "visible \(editor.marksAreVisibleForTest)")
+            while !editor.editsForTest.isEmpty { editor.undoForTest() }
+            await editor.flushForTest()
 
             // MARK: the highlighter, from the button to the list
             //
@@ -5327,7 +5720,7 @@ enum SelfTest {
                 let before = editor.editsForTest.count
                 drag(canvas, from: CGPoint(x: 100, y: 100),
                      to: CGPoint(x: 300, y: 180), in: window)
-                if case .highlight(let rect) = editor.editsForTest.last {
+                if case .highlight(let rect, _) = editor.editsForTest.last {
                     check("dragging leaves a highlight over what was dragged over",
                           abs(rect.minX - 100) < 1 && abs(rect.minY - 100) < 1
                             && abs(rect.width - 200) < 1 && abs(rect.height - 80) < 1,
@@ -5590,6 +5983,62 @@ enum SelfTest {
             check("the \(name) tool is flattened into the output",
                   rendered.map { !PixelCompare.compare($0, original).identical } == true)
         }
+
+        // MARK: the colour and the weight reach the pixels
+        //
+        // A palette that only ever changed a swatch in the toolbar would pass
+        // every check about the toolbar and none about the picture. The question
+        // this asks is the one that matters: is the arrow that came out of the
+        // renderer actually blue, and is the thick one actually thicker.
+        //
+        // Counted against the source rather than compared to a reference image:
+        // what is being asserted is a relation between two renders, which no
+        // golden file can go stale on.
+        let strokeLine = (CGPoint(x: 40, y: 200), CGPoint(x: 560, y: 200))
+        func inked(_ ink: Ink) -> (blue: Int, red: Int, covered: Int) {
+            guard let rendered = ImageEdit.render(
+                original, edits: [.line(strokeLine.0, strokeLine.1, ink)],
+                pointSize: points, cropping: true)
+            else { return (0, 0, 0) }
+            let after = rgba(of: rendered)
+            let base = rgba(of: original)
+            var blue = 0, red = 0, covered = 0
+            for i in stride(from: 0, to: min(after.count, base.count) - 3, by: 4) {
+                guard after[i] != base[i] || after[i + 1] != base[i + 1]
+                        || after[i + 2] != base[i + 2] else { continue }
+                covered += 1
+                let r = Int(after[i]), b = Int(after[i + 2])
+                if b > 150 && b > r + 60 { blue += 1 }
+                if r > 150 && r > b + 60 { red += 1 }
+            }
+            return (blue, red, covered)
+        }
+        let asRed = inked(Ink(colour: .red, weight: .medium))
+        let asBlue = inked(Ink(colour: .blue, weight: .medium))
+        check("a line drawn in blue comes out blue",
+              asBlue.blue > 500 && asBlue.red == 0,
+              "\(asBlue.blue) blue px, \(asBlue.red) red")
+        check("and the same line in red comes out red",
+              asRed.red > 500 && asRed.blue == 0,
+              "\(asRed.red) red px, \(asRed.blue) blue")
+        let thin = inked(Ink(colour: .red, weight: .thin))
+        let thick = inked(Ink(colour: .red, weight: .thick))
+        // Ordering and a real step between each, not the 0.55 / 1 / 1.75 ratio
+        // the stroke widths are in: the shadow is blurred by a fixed radius and
+        // the line is antialiased, and both add a margin that does not scale
+        // with the stroke — measured, they put the thick-to-thin ratio at about
+        // 1.7 rather than 3.2. A weight that did nothing would give three equal
+        // counts, which is what this catches.
+        check("a thick line covers more than a medium one, and that more than a thin",
+              thin.covered > 0
+                && Double(asRed.covered) / Double(thin.covered) > 1.1
+                && Double(thick.covered) / Double(asRed.covered) > 1.3,
+              "\(thin.covered) / \(asRed.covered) / \(thick.covered) px")
+        // The highlighter keeps its own colour: yellow is what a highlighter is,
+        // and picking blue for the pen must not turn it blue.
+        check("the highlighter's default is not the pen's",
+              Ink.highlighter.colour == .yellow && Ink.default.colour == .red,
+              "\(Ink.highlighter.colour) vs \(Ink.default.colour)")
 
         // MARK: the highlighter tints without hiding
         //
@@ -5968,8 +6417,12 @@ enum SelfTest {
         // down, and a scaled-down picture hides sub-pixel disagreements between
         // the box and the render behind its own resampling.
         let margin = ZoomingScrollView.fitPadding * 2
+        // Never narrower than the toolbar's own floor, which is what the viewer
+        // uses. It was the picture's width plus the margin, full stop — so the
+        // one artefact of this run a person actually looks at showed a bar
+        // running off both edges of a window no viewer would ever open.
         let box = CGSize(
-            width: pointSize.width + margin,
+            width: max(pointSize.width + margin, ImageEditor.minimumContentWidth),
             height: pointSize.height + margin + ImageEditor.chromeHeight)
         let window = NSWindow(
             contentRect: CGRect(origin: .zero, size: box),
@@ -6353,6 +6806,21 @@ enum SelfTest {
             windowNumber: window.windowNumber, context: nil,
             characters: character, charactersIgnoringModifiers: character,
             isARepeat: false, keyCode: 0)
+        else { return }
+        view.keyDown(with: event)
+    }
+
+    /// One keystroke by code rather than by character, for the two keys that
+    /// have no character worth naming: ⌫ is 51 and ⌦ is 117. `press` sends
+    /// keyCode 0 for everything, which is fine for the tool letters and useless
+    /// for these.
+    private static func pressKey(_ code: UInt16, on view: NSView, in window: NSWindow) {
+        guard let event = NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber, context: nil,
+            characters: "\u{8}", charactersIgnoringModifiers: "\u{8}",
+            isARepeat: false, keyCode: code)
         else { return }
         view.keyDown(with: event)
     }
