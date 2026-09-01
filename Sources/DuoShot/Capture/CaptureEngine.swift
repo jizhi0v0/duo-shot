@@ -524,6 +524,13 @@ final class CaptureEngine {
     private func captureIsolated(
         _ window: SCWindow, options: CaptureOptions
     ) async throws -> WindowShot {
+        // Anything the window's own app has stacked on top of it is thrown away
+        // by an isolated capture, so that case is answered before this one.
+        if !options.includeChildWindows,
+           let grouped = try await captureGroup(window, options: options) {
+            return grouped
+        }
+
         let filter = SCContentFilter(desktopIndependentWindow: window)
         let scale = CGFloat(filter.pointPixelScale)
         // `window.frame`, not `filter.contentRect`: the sizes agree, and only
@@ -552,6 +559,138 @@ final class CaptureEngine {
             return trimmed(captured, frame: frame, scale: scale)
         }
         return trimmed(image, frame: frame, scale: scale)
+    }
+
+    /// Captures a window together with whatever its own app has stacked on top
+    /// of it — a popover, an attached panel, a sheet.
+    ///
+    /// Reported as "popover 无法通过窗口截图保留这种堆叠的关系", against
+    /// DuoUpdater's runtime tag, which is a SwiftUI `.popover`. An isolated
+    /// filter holds one window and nothing else, so the bubble is simply not in
+    /// the picture. Measured on a replica of that app's shape — `MenuBarExtra`
+    /// with `.menuBarExtraStyle(.window)`, a `.popover` opened inside it — one
+    /// flag apart, same window and same instant:
+    ///
+    ///     includeChildWindows = false ->      0 px of the popover's colour
+    ///     includeChildWindows = true  -> 71854 px
+    ///
+    /// **Membership is ScreenCaptureKit's, never ours.** The group it composites
+    /// is the window server's own parent/child group, which is why an unrelated
+    /// window of the same app cannot arrive in it: measured on one ordinary
+    /// desktop, fourteen pairs of same-app windows overlapped each other — four
+    /// Finder windows, four Mail windows — and a rule of our own that said
+    /// "same app, in front, overlapping" would have dragged every one of them
+    /// into a capture of the window behind. `stacked` only decides whether to
+    /// *ask*.
+    ///
+    /// Returns nil when the group turns out to be the window alone, or when its
+    /// rect cannot be established — both of which leave the caller on the
+    /// ordinary isolated path.
+    private func captureGroup(
+        _ window: SCWindow, options: CaptureOptions
+    ) async throws -> WindowShot? {
+        let above = stacked(on: window.windowID, options: options)
+        guard !above.isEmpty else { return nil }
+
+        let filter = SCContentFilter(desktopIndependentWindow: window)
+        let scale = CGFloat(filter.pointPixelScale)
+        var grouped = options
+        grouped.includeChildWindows = true
+        // **The output size is left unset, and that is the whole of this path
+        // working.** ScreenCaptureKit grows the captured region to the group's
+        // own rect and then fits it into whatever size it was given — so asking
+        // for the picked window's size returns the group *squeezed* into it,
+        // scaled down with transparent margins, under a point size that claims
+        // to be the window's. Measured on the replica: a 420x300 pt panel with a
+        // popover overhanging it by 84 pt came back as the 504x300 pt group
+        // letterboxed into 840x600 px. Left alone, the header's documented
+        // default — "the width of the content being captured" — is the group's
+        // rect, and it came back 1008x600 px, exactly right.
+        let configuration = configuration(for: nil, scale: scale, options: grouped)
+
+        let output = try await SCKBridge.captureScreenshot(
+            filter: filter, configuration: configuration)
+        guard let image = output.image, !PixelCompare.isBlank(image) else { return nil }
+
+        let frame = window.frame
+        let size = CGSize(width: CGFloat(image.width) / scale,
+                          height: CGFloat(image.height) / scale)
+        // Something was in front of it, but nothing was *grouped* with it — an
+        // overlapping window of the same app, which is the common case. The
+        // image is the ordinary isolated capture and is framed as one.
+        guard abs(size.width - frame.width) > 1 || abs(size.height - frame.height) > 1 else {
+            return trimmed(image, frame: frame, scale: scale)
+        }
+
+        // Where that rect sits on the desktop is the one thing SCK does not
+        // report, and the fade recovery cannot work without it: it has to find
+        // the same region in a photograph of the whole screen. So it is computed
+        // from the candidates and then *checked* against the size SCK returned.
+        // A mismatch means the group is not the set we guessed at, and a shot
+        // placed at a rect we cannot vouch for is worse than no shot at all.
+        //
+        // A candidate that would push the rect past the size SCK reported cannot
+        // be in the group, whatever the z-order says — which is what keeps an
+        // unrelated window of the same app from stretching the frame. It is a
+        // filter and not the verdict: the size check below is still the verdict.
+        let members = above.filter {
+            let candidate = frame.union($0)
+            return candidate.width <= size.width + 1 && candidate.height <= size.height + 1
+        }
+        let union = members.reduce(frame) { $0.union($1) }
+        guard abs(union.width - size.width) <= 1, abs(union.height - size.height) <= 1 else {
+            Log.capture.notice("""
+                window \(window.windowID, privacy: .public) has a group of \
+                \(Int(size.width), privacy: .public)x\(Int(size.height), privacy: .public) pt \
+                and the windows over it account for \
+                \(Int(union.width), privacy: .public)x\(Int(union.height), privacy: .public); \
+                cannot place it, capturing the window alone
+                """)
+            return nil
+        }
+        Log.capture.notice("""
+            window \(window.windowID, privacy: .public) captured with \
+            \(members.count, privacy: .public) window(s) stacked on it, \
+            \(Int(union.width), privacy: .public)x\(Int(union.height), privacy: .public) pt
+            """)
+        return trimmed(image, frame: union, scale: scale)
+    }
+
+    /// Same-app windows drawn in front of this one and overlapping it, by frame.
+    ///
+    /// A trigger, not a selection. What ends up in the capture is decided by
+    /// ScreenCaptureKit (see `captureGroup`); this only answers "is it worth
+    /// asking for the group at all", and supplies the frames the group's rect is
+    /// checked against afterwards.
+    ///
+    /// Being in front is what keeps the old regression fixed. Turning
+    /// `includeChildWindows` on globally and then picking a *child* drags its
+    /// parent in behind it — WeChat's "Tip" alert, 2026-07-30, an alert-sized
+    /// file with the login window showing through around it, which is why the
+    /// preference is off (`CaptureOptions.includeChildWindows`). A parent is
+    /// *behind* its alert, so a pick on the alert finds nothing in front of it
+    /// and never leaves the isolated path.
+    ///
+    /// The z-order is re-read rather than taken from the cached list: that order
+    /// was established when the overlay opened, and `WindowZOrder.entries()`
+    /// needs no TCC and costs a single window-server call.
+    private func stacked(on windowID: CGWindowID, options: CaptureOptions) -> [CGRect] {
+        let ordered = WindowZOrder.sortedFrontToBack(content.windows)
+        guard let index = ordered.firstIndex(where: { $0.id == windowID }) else { return [] }
+        let picked = ordered[index]
+        guard let bundleID = picked.bundleID else { return [] }
+        return ordered[..<index].compactMap { above in
+            guard above.bundleID == bundleID,
+                  // A window can be on screen at zero opacity; it contributes no
+                  // pixels and must not stretch the rect. Same floor the picker
+                  // uses to decide a window cannot be pointed at.
+                  above.alpha >= 0.05,
+                  !options.excludedWindowIDs.contains(above.id),
+                  !above.frame.isEmpty,
+                  above.frame.intersects(picked.frame)
+            else { return nil }
+            return above.frame
+        }
     }
 
     /// Drops a border of pixels the window never drew.
@@ -666,13 +805,18 @@ final class CaptureEngine {
         return filter
     }
 
+    /// A nil `region` leaves `width`/`height` unset, which is not the same as
+    /// leaving them at the picked window's size — see `captureGroup`, which is
+    /// the only caller that wants it and says why.
     private func configuration(
-        for region: CGRect, scale: CGFloat, options: CaptureOptions
+        for region: CGRect?, scale: CGFloat, options: CaptureOptions
     ) -> SCScreenshotConfiguration {
         let configuration = SCScreenshotConfiguration()
-        let (width, height) = DisplayGeometry.pixelSize(of: region, scale: scale)
-        configuration.width = width
-        configuration.height = height
+        if let region {
+            let (width, height) = DisplayGeometry.pixelSize(of: region, scale: scale)
+            configuration.width = width
+            configuration.height = height
+        }
         configuration.showsCursor = options.showsCursor
         configuration.ignoreShadows = options.ignoreShadows
         configuration.includeChildWindows = options.includeChildWindows

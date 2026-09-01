@@ -2905,6 +2905,7 @@ enum SelfTest {
         try await photographSuggestion(coordinator, all, into: directory)
 
         let childOK = try await childWindowIsolation()
+        let stackedOK = try await stackedWindowsAreKept()
         let emptyParentOK = try await emptyParentCapturesItsChild()
         let trimOK = try await transparentBorderIsTrimmed()
         let popupSurvivalOK = try await overlayDoesNotDismissPopups(coordinator, all)
@@ -3003,7 +3004,7 @@ enum SelfTest {
         let pass = selfLeaked == 0 && hits == tested && tested > 0 && geometryOK && suppressionOK
             && clickAdoptsOK && dragOverridesOK && instantOK
             && inversions.isEmpty && frontmostOK && recoveredOK && appearedOK && paddingOK
-            && childOK && emptyParentOK && trimOK && popupSurvivalOK && frozenPickerOK && shadowHostOK
+            && childOK && stackedOK && emptyParentOK && trimOK && popupSurvivalOK && frozenPickerOK && shadowHostOK
             && shadowOK && ownWindowOK
             && cardOK
             && menuBarOK
@@ -4702,6 +4703,84 @@ enum SelfTest {
         let ok = alone == 0 && grouped > 0
         print("child window:  parent bleed \(alone) px on its own, "
             + "\(grouped) px with includeChildWindows -> \(ok ? "OK" : "FAIL")")
+        return ok
+    }
+
+    /// A window is captured with whatever is stacked on top of it.
+    ///
+    /// Reported against DuoUpdater: clicking its Qt runtime tag opens a SwiftUI
+    /// `.popover` over the menu-bar panel, and a window capture of the panel came
+    /// back without it. An isolated filter holds one window and nothing else.
+    ///
+    /// Three windows, built here rather than hunted for on screen so the result
+    /// does not depend on what the machine has open:
+    ///
+    ///   parent   opaque red, the pick
+    ///   child    solid blue, a real child window, **overhanging** the parent
+    ///   sibling  solid green, same app, in front of the parent and overlapping
+    ///            it, but not in its window group
+    ///
+    /// The overhang is not decoration. ScreenCaptureKit grows the captured
+    /// region to the whole group and fits it into whatever output size it is
+    /// given, so a capture that keeps asking for the parent's size comes back
+    /// with the group squeezed into it — the popover present, and every pixel in
+    /// the wrong place under a point size that lies. Only a child that sticks
+    /// out can tell the two apart, which is what the size assertion is for.
+    ///
+    /// The sibling is the negative control, and it is the one that guards the
+    /// bigger risk. Measured on one ordinary desktop: fourteen pairs of same-app
+    /// windows overlapped each other, four Finder windows and four Mail windows
+    /// among them. A rule that included "the same app's windows in front of this
+    /// one" would put a stranger's pixels in the file every time someone
+    /// screenshots the window behind — which is the one thing a selection UI
+    /// must never do.
+    private static func stackedWindowsAreKept() async throws -> Bool {
+        let engine = CaptureEngine()
+
+        func window(_ frame: CGRect, _ colour: NSColor) -> NSWindow {
+            let window = NSWindow(
+                contentRect: frame, styleMask: [.borderless],
+                backing: .buffered, defer: false)
+            window.backgroundColor = colour
+            window.isOpaque = true
+            // A shadow would put the group's rect a few points off the frames
+            // this test computes its expectations from.
+            window.hasShadow = false
+            window.level = .floating
+            return window
+        }
+
+        let parent = window(CGRect(x: 200, y: 200, width: 400, height: 300), .red)
+        // Overhangs the parent's left edge by 80 pt: union is 480x300, not 400x300.
+        let child = window(CGRect(x: 120, y: 250, width: 200, height: 120), .blue)
+        // In front of the parent and overlapping it, and far enough past its
+        // right edge that including it could not be mistaken for the group.
+        let sibling = window(CGRect(x: 500, y: 150, width: 300, height: 200), .green)
+
+        parent.orderFrontRegardless()
+        parent.addChildWindow(child, ordered: .above)
+        sibling.orderFrontRegardless()
+        defer {
+            parent.removeChildWindow(child)
+            for one in [child, sibling, parent] { one.orderOut(nil) }
+        }
+
+        try await Task.sleep(for: .milliseconds(400))
+        try await engine.refreshContent()
+
+        let result = try await engine.capture(
+            .window(CGWindowID(parent.windowNumber)), options: .default)
+        let blue = PixelCompare.count(result.image) { r, g, b in r < 90 && g < 90 && b > 180 }
+        let green = PixelCompare.count(result.image) { r, g, b in r < 90 && g > 180 && b < 90 }
+
+        let expected = parent.frame.union(child.frame).size
+        let framed = abs(result.pointSize.width - expected.width) <= 2
+            && abs(result.pointSize.height - expected.height) <= 2
+        let ok = blue > 0 && green == 0 && framed
+        print(String(format: "stacked:       child %d px, unrelated window %d px, "
+                   + "%.0fx%.0f pt (expected %.0fx%.0f) -> %@",
+                     blue, green, result.pointSize.width, result.pointSize.height,
+                     expected.width, expected.height, (ok ? "OK" : "FAIL") as NSString))
         return ok
     }
 
