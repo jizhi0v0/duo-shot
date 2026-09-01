@@ -105,6 +105,46 @@ in `make test`. Conventions that are load-bearing:
   and `--selftest-failure-notice-ui` are **not** in `make test`. Keep menu
   assertions out of the suite; put the coordinator-level contract in it instead.
 
+## Window capture
+
+- **Liquid glass cannot survive a window capture, and that is not a filter we
+  chose wrong.** A window rendered in isolation has no backdrop left to sample,
+  so a translucent surface falls back to its base tint. Measured 2026-09-01 on a
+  glass panel with an opaque red window parked directly behind it, counting
+  pixels of that red in the result:
+
+      desktopIndependentWindow, child=false            0
+      desktopIndependentWindow, child=true             0
+      screencapture -l<windowid>   (macOS's own)       0
+      SCContentFilter(display:including:)         432906
+      the same rect as a region of the display    432906
+
+  `screencapture -l` is the whole answer: **the platform's own window capture
+  does exactly what ours does**, confirmed the same day on the real DuoUpdater
+  popup — flat panel, nothing of the terminal behind it, while the same rectangle
+  taken as a region shows the terminal through the glass. Do not go looking for
+  the API that fixes this. The escape hatch is region capture, and it costs the
+  rounded corners and the transparent surround, and puts whatever is behind the
+  window into the file.
+- **A probe with nothing distinctive behind the window is blind to all of the
+  above.** Two captures of a dark panel over an ordinary desktop look the same
+  and are not; that reading is what put a wrong "no difference here" in front of
+  the maintainer for a round. Park something loud behind the window and count it.
+  `Scripts/glass-stack-probe.swift` is that fixture — a `MenuBarExtra` app that
+  opens its own panel by clicking its own status item, with a `.popover` inside
+  it and an opaque red window parked behind it. It prints every filter and
+  `screencapture -l` side by side.
+- **A window capture is framed to the window *group*, not the window**, so a
+  popover overhanging the edge makes the file larger than the outline the picker
+  drew. That is deliberate and it is what the platform does: `screencapture -l`
+  returned the identical 1008x600 union on the same fixture. The usual rule —
+  nothing in the file that was not inside the outline — is about *other windows'*
+  pixels, and does not reach a window's own attached panel.
+- Leaving `SCScreenshotConfiguration.width`/`height` **unset** is not the same as
+  setting them to the picked window's size. SCK grows the region to the group and
+  fits it into whatever size it is given, so asking for the window's size returns
+  the group squeezed into it under a point size that lies. See `captureGroup`.
+
 ## The image editor
 
 `ImageEdit` (model + renderer, `Output/`) and `ImageEditor` (UI, `Preview/`).
