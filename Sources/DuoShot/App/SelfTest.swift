@@ -3002,6 +3002,7 @@ enum SelfTest {
 
         let shadowOK = paddingCastsAShadow()
         let cardOK = paddingFollowsTheWindowCurve() && paddingMeasuresFromTheBody()
+            && paddingCanBeSquare()
 
         // Child windows (sheets) change the captured bounds when included.
         for includeChildren in [true, false] {
@@ -3775,6 +3776,40 @@ enum SelfTest {
         print("body padding:  body from row \(bodyTop), top margin \(top) px, label at "
             + "\(labelAt.map(String.init) ?? "none"), body at \(bodyAt.map(String.init) ?? "none") "
             + "(expected \(inset)), curve \(Int(curve)) px -> \(ok ? "OK" : "FAIL")")
+        return ok
+    }
+
+    /// With the rounded-card setting off, the card is square: its corner is
+    /// backdrop, not transparency.
+    ///
+    /// Asked for 2026-09-11: "因为大多数 preview 插件，都会把这个圆角显示出来，
+    /// 所以显得很丑" — a viewer paints the transparent corners in its own
+    /// colour. A synthetic rounded window, padded both ways: rounded, the card's
+    /// corner is clear; square, it is opaque.
+    private static func paddingCanBeSquare() -> Bool {
+        let side = 240
+        guard let context = CGContext(
+            data: nil, width: side, height: side, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return false }
+        context.setFillColor(CGColor(gray: 1, alpha: 1))
+        context.addPath(CGPath(
+            roundedRect: CGRect(x: 0, y: 0, width: side, height: side),
+            cornerWidth: 40, cornerHeight: 40, transform: nil))
+        context.fillPath()
+        let fill = CGColor(gray: 0.5, alpha: 1)
+        guard let window = context.makeImage(),
+              let rounded = ImagePadding.pad(
+                  window, by: 32, scale: 1, backdrop: nil, fallbackFill: fill),
+              let square = ImagePadding.pad(
+                  window, by: 32, scale: 1, backdrop: nil, fallbackFill: fill, roundsCorners: false)
+        else { return false }
+        let roundedCorner = Int(PixelCompare.alpha(rounded, atX: 0, y: 0) ?? 255)
+        let squareCorner = Int(PixelCompare.alpha(square, atX: 0, y: 0) ?? 0)
+        let ok = roundedCorner == 0 && squareCorner == 255
+        print("square card:   corner alpha rounded \(roundedCorner), square \(squareCorner) "
+            + "-> \(ok ? "OK" : "FAIL")")
         return ok
     }
 

@@ -493,13 +493,15 @@ struct CaptureSettingsView: View {
                             .frame(width: 34, alignment: .trailing)
                     }
                 }
+                Toggle("Rounded corners", isOn: $preferences.roundsPaddingCorners)
+                    .disabled(preferences.windowPadding == 0)
             } header: {
                 Text("Window captures")
             } footer: {
                 Text("""
                     Off, a window capture is exactly the window you picked. On, it is the whole window group — so picking an alert also brings in the window behind it.
 
-                    Padding adds a margin filled with the desktop wallpaper. Area and fullscreen captures are unaffected; they have a backdrop already.
+                    Padding adds a margin filled with the desktop wallpaper. Area and fullscreen captures are unaffected; they have a backdrop already. Rounded corners follows the window's own curve and leaves the file's corners transparent; turn it off for a plain rectangle, which is what most previews show best.
                     """)
                     .font(.caption)
                     .foregroundStyle(.secondary)

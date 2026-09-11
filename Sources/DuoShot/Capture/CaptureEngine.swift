@@ -1040,7 +1040,8 @@ final class CaptureEngine {
         let backdrop = await wallpaper.image(for: displayID)
         guard let result = await ImagePadding.padded(
             image, by: padding, scale: scale, backdrop: backdrop,
-            fallbackFill: NSColor.windowBackgroundColor.cgColor, bodyTop: bodyTop)
+            fallbackFill: NSColor.windowBackgroundColor.cgColor, bodyTop: bodyTop,
+            roundsCorners: options.roundsPaddingCorners)
         else {
             Log.capture.error("padding failed; falling back to the unpadded capture")
             return (image, size)

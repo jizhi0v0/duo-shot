@@ -40,6 +40,9 @@ nonisolated struct CaptureOptions: Sendable {
     /// Window captures only, deliberately: padding exists to give a window a
     /// backdrop, and an area or fullscreen shot already has one.
     var windowPadding: CGFloat = 0
+    /// Whether that margin's card is rounded to the window's own curve — see
+    /// `Preferences.roundsPaddingCorners`. Off, the default, is a plain rectangle.
+    var roundsPaddingCorners = false
     /// Windows to keep out of the shot — our own overlay panels, by CGWindowID.
     var excludedWindowIDs: Set<CGWindowID> = []
 

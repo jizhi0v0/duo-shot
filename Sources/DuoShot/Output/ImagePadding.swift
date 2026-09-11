@@ -37,10 +37,11 @@ nonisolated enum ImagePadding {
         scale: CGFloat,
         backdrop: CGImage?,
         fallbackFill: CGColor,
-        bodyTop: Int = 0
+        bodyTop: Int = 0,
+        roundsCorners: Bool = true
     ) async -> CGImage? {
         pad(image, by: padding, scale: scale, backdrop: backdrop, fallbackFill: fallbackFill,
-            bodyTop: bodyTop)
+            bodyTop: bodyTop, roundsCorners: roundsCorners)
     }
 
     /// The margin above the image, in pixels, when its top `bodyTop` rows are
@@ -66,7 +67,8 @@ nonisolated enum ImagePadding {
         scale: CGFloat,
         backdrop: CGImage?,
         fallbackFill: CGColor,
-        bodyTop: Int = 0
+        bodyTop: Int = 0,
+        roundsCorners: Bool = true
     ) -> CGImage? {
         let inset = Int((padding * scale).rounded())
         guard inset > 0 else { return image }
@@ -108,8 +110,11 @@ nonisolated enum ImagePadding {
         // a square card.
         // Read at the body's top row: with a label above it, the image's own top
         // row is transparent until the bubble, and the card would lose its curve.
-        let outerRadius = cornerRadius(of: image, atRow: bodyTop)
-            .map { $0 + CGFloat(inset) / 2 } ?? 0
+        // Square on request (`Preferences.roundsPaddingCorners`): a rounded card
+        // leaves the file's corners transparent, and most viewers paint them.
+        let outerRadius = roundsCorners
+            ? cornerRadius(of: image, atRow: bodyTop).map { $0 + CGFloat(inset) / 2 } ?? 0
+            : 0
         if outerRadius > 0 {
             context.addPath(CGPath(
                 roundedRect: canvas, cornerWidth: outerRadius, cornerHeight: outerRadius,

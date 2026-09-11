@@ -37,6 +37,7 @@ final class Preferences {
         static let includeMenuBar = "includeMenuBar"
         static let includeChildWindows = "includeChildWindows"
         static let windowPadding = "windowPadding"
+        static let roundsPaddingCorners = "roundsPaddingCorners"
         static let filenameTemplate = "filenameTemplate"
         static let recordingSystemAudio = "recordingSystemAudio"
         static let recordingMicrophone = "recordingMicrophone"
@@ -142,6 +143,16 @@ final class Preferences {
     /// labelled "Off", so turning it back off is one drag.
     var windowPadding: Double {
         didSet { defaults.set(windowPadding, forKey: Key.windowPadding) }
+    }
+    /// Whether the padded card is rounded to follow the window's own curve.
+    ///
+    /// Off by default: a plain rectangle with wallpaper in the corners. Asked
+    /// for 2026-09-11: "因为大多数 preview 插件，都会把这个圆角显示出来，所以显得
+    /// 很丑" — the rounded card's corners are transparent, and most viewers
+    /// paint them in their own colour — and then "默认关闭吧". On is how padding
+    /// looked before: the card follows the window's own curve.
+    var roundsPaddingCorners: Bool {
+        didSet { defaults.set(roundsPaddingCorners, forKey: Key.roundsPaddingCorners) }
     }
     var filenameTemplate: String {
         didSet { defaults.set(filenameTemplate, forKey: Key.filenameTemplate) }
@@ -277,6 +288,7 @@ final class Preferences {
             Key.includeMenuBar: true,
             Key.includeChildWindows: false,
             Key.windowPadding: 32.0,
+            Key.roundsPaddingCorners: false,
             Key.filenameTemplate: FilenameFormatter.defaultTemplate,
             Key.recordingSystemAudio: true,
             Key.recordingMicrophone: false,
@@ -311,6 +323,7 @@ final class Preferences {
         includeMenuBar = defaults.bool(forKey: Key.includeMenuBar)
         includeChildWindows = defaults.bool(forKey: Key.includeChildWindows)
         windowPadding = defaults.double(forKey: Key.windowPadding)
+        roundsPaddingCorners = defaults.bool(forKey: Key.roundsPaddingCorners)
         recordingSystemAudio = defaults.bool(forKey: Key.recordingSystemAudio)
         recordingMicrophone = defaults.bool(forKey: Key.recordingMicrophone)
         overlayVisibleToScreenSharing = defaults.bool(forKey: Key.overlayVisibleToScreenSharing)
@@ -389,6 +402,7 @@ final class Preferences {
         options.includeMenuBar = includeMenuBar
         options.includeChildWindows = includeChildWindows
         options.windowPadding = windowPadding
+        options.roundsPaddingCorners = roundsPaddingCorners
         return options
     }
 
