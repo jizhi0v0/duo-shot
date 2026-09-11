@@ -41,6 +41,15 @@ nonisolated struct RecordingOptions: Sendable {
     /// throttles the *fastest* rate the stream will deliver.
     var frameRate = 60
     var includeMenuBar = true
+    /// Off leaves the desktop icons out of the take and keeps the wallpaper.
+    ///
+    /// `SCContentFilter(display:excludingWindows:)` renders the desktop, and
+    /// the icons with it, unless the window that draws them is named in the
+    /// exclusion list — so off is `RecordingEngine` naming it. Measured
+    /// 2026-09-11 with every window above the icons excluded from both shots:
+    /// naming Finder's icon window changed 409,027 px of a 1728x1117 display,
+    /// against 0 px for the same filter twice, and left the wallpaper intact.
+    var showsDesktopIcons = true
     /// Our own windows to keep out of the recording — the HUD, and any preview
     /// left over from an earlier capture.
     var excludedWindowIDs: Set<CGWindowID> = []

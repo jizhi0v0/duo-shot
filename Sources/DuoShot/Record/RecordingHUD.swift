@@ -207,6 +207,7 @@ final class RecordingHUDView: NSView {
         guard !Self.debugFillsMagenta else { return }
         slowStartTimer?.invalidate()
         slowStartTimer = nil
+        discardButton?.toolTip = "Stop and discard"
         if animated {
             HUDMetrics.crossfade(timeLabel)
             if let discardButton { HUDMetrics.crossfade(discardButton) }
@@ -236,6 +237,30 @@ final class RecordingHUDView: NSView {
             discardButton?.contentTintColor = .secondaryLabelColor
             micOffIcon?.contentTintColor = .secondaryLabelColor
         }
+    }
+
+    /// The seconds before a delayed take, in the clock's slot.
+    ///
+    /// Otherwise this is the grey `starting` bar, with one difference: the
+    /// trash is live, because until the take begins it is the way to call it
+    /// off. Stop stays grey — there is nothing to stop yet.
+    ///
+    /// Whole seconds rounded up, as on the screenshot countdown: at 2.4 s left
+    /// the user is counting "3" along with it.
+    func showCountdown(remaining: TimeInterval) {
+        guard !Self.debugFillsMagenta else { return }
+        slowStartTimer?.invalidate()
+        slowStartTimer = nil
+        showTime("in \(max(1, Int(remaining.rounded(.up))))s")
+        timeLabel.textColor = .labelColor
+        discardButton?.isEnabled = true
+        discardButton?.contentTintColor = .secondaryLabelColor
+        discardButton?.toolTip = "Cancel the recording  ⎋"
+    }
+
+    /// What the clock's slot says, and whether all of it fits.
+    var clockForTest: (text: String, fits: Bool) {
+        (timeLabel.stringValue, timeLabel.intrinsicContentSize.width <= timeLabel.frame.width)
     }
 
     /// Says "Starting…" in the clock's place once a start has dragged on.
@@ -408,6 +433,18 @@ final class RecordingHUD {
         elapsedProvider = elapsed
         startTicker()
     }
+
+    /// The countdown before a delayed take, on the bar `showStarting` put up.
+    func showCountdown(remaining: TimeInterval) {
+        view?.showCountdown(remaining: remaining)
+    }
+
+    /// Back to the plain grey bar that the start is about to colour in.
+    func endCountdown() {
+        view?.setPhase(.starting, animated: true)
+    }
+
+    var clockForTest: (text: String, fits: Bool)? { view?.clockForTest }
 
     /// Where the bar belongs: under the recorded region when there is one, and
     /// otherwise centred on wherever it already sits.

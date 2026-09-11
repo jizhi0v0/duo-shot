@@ -45,6 +45,8 @@ final class Preferences {
         static let recordingShowsCursor = "recordingShowsCursor"
         static let recordingShowsClicks = "recordingShowsClicks"
         static let recordingFrameRate = "recordingFrameRate"
+        static let recordingDelaySeconds = "recordingDelaySeconds"
+        static let recordingShowsDesktopIcons = "recordingShowsDesktopIcons"
         static let hotkeys = "hotkeys.v1"
         static let seenHotkeyActions = "hotkeys.seenActions.v1"
     }
@@ -118,8 +120,8 @@ final class Preferences {
     /// nothing of ours is on screen for a few seconds while the user arranges
     /// whatever they wanted photographed, and the shot is taken live at the end.
     ///
-    /// Screenshots only. A recording has its own start moment and a delay before
-    /// it would be a different feature with a different bar.
+    /// Screenshots only. A recording has its own, `recordingDelaySeconds`,
+    /// counted down in the recording's own bar rather than in this one's.
     var captureDelaySeconds: Double {
         didSet { defaults.set(captureDelaySeconds, forKey: Key.captureDelaySeconds) }
     }
@@ -203,6 +205,19 @@ final class Preferences {
     var recordingFrameRate: Int {
         didSet { defaults.set(recordingFrameRate, forKey: Key.recordingFrameRate) }
     }
+    /// Seconds between choosing what to record and the take starting. 0 is off.
+    ///
+    /// Separate from `captureDelaySeconds` rather than shared with it: someone
+    /// who waits three seconds for a tooltip before a screenshot has not asked
+    /// for every recording to start three seconds late.
+    var recordingDelaySeconds: Double {
+        didSet { defaults.set(recordingDelaySeconds, forKey: Key.recordingDelaySeconds) }
+    }
+    /// On by default, which is what a recording has always done. Off keeps the
+    /// wallpaper and drops the icons — see `RecordingOptions.showsDesktopIcons`.
+    var recordingShowsDesktopIcons: Bool {
+        didSet { defaults.set(recordingShowsDesktopIcons, forKey: Key.recordingShowsDesktopIcons) }
+    }
     var hotkeys: [HotKeyAction: KeyCombo] {
         didSet {
             guard let data = try? JSONEncoder().encode(hotkeys) else { return }
@@ -269,6 +284,8 @@ final class Preferences {
             Key.recordingShowsCursor: true,
             Key.recordingShowsClicks: true,
             Key.recordingFrameRate: 60,
+            Key.recordingDelaySeconds: 0.0,
+            Key.recordingShowsDesktopIcons: true,
         ])
 
         let fallbackDirectory = FileManager.default
@@ -301,6 +318,8 @@ final class Preferences {
         recordingShowsCursor = defaults.bool(forKey: Key.recordingShowsCursor)
         recordingShowsClicks = defaults.bool(forKey: Key.recordingShowsClicks)
         recordingFrameRate = defaults.integer(forKey: Key.recordingFrameRate)
+        recordingDelaySeconds = defaults.double(forKey: Key.recordingDelaySeconds)
+        recordingShowsDesktopIcons = defaults.bool(forKey: Key.recordingShowsDesktopIcons)
         filenameTemplate = defaults.string(forKey: Key.filenameTemplate)
             .flatMap { $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0 }
             ?? FilenameFormatter.defaultTemplate
@@ -384,6 +403,7 @@ final class Preferences {
         options.showsCursor = recordingShowsCursor
         options.showsMouseClicks = recordingShowsClicks
         options.frameRate = max(1, recordingFrameRate)
+        options.showsDesktopIcons = recordingShowsDesktopIcons
         return options
     }
 

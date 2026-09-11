@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 
 /// Orchestrates a recording from trigger to file.
 ///
@@ -132,7 +133,9 @@ final class RecordingCoordinator {
         // using becomes the recording's bar, window and all.
         adoptedBar = overlay.takeHandedOverBar()
         retriesLeft = 1
-        await begin(.area(displayID: displayID, rectInAppKitGlobal: rect))
+        let request = RecordingRequest.area(displayID: displayID, rectInAppKitGlobal: rect)
+        guard await countDown(to: request) else { return }
+        await begin(request)
     }
 
     private func startFullscreen() async {
@@ -149,7 +152,9 @@ final class RecordingCoordinator {
         let displayID = ScreenIndex.screenUnderMouse().flatMap(ScreenIndex.displayID(of:))
             ?? CGMainDisplayID()
         retriesLeft = 1
-        await begin(.display(displayID))
+        let request = RecordingRequest.display(displayID)
+        guard await countDown(to: request) else { return }
+        await begin(request)
     }
 
     /// Reset for each trigger, so one bad take never uses up a later one's
@@ -158,26 +163,85 @@ final class RecordingCoordinator {
     /// The selection's bar, on its way to becoming the recording's. Consumed by
     /// the first `begin`, so a retry does not try to adopt it twice.
     private var adoptedBar: FloatingBarPanel?
+    private var isCountingDown = false
+    private var countdownCancelled = false
+    private var escapeID: UInt32?
 
-    private func begin(_ request: RecordingRequest) async {
-        var options = Preferences.shared.recordingOptions
+    /// Waits out `recordingDelaySeconds`. False if the take was called off.
+    ///
+    /// In the bar the take will run in, not in the screenshot countdown's. The
+    /// selection's bar is handed straight on to the recording so that the bar
+    /// Record was pressed on is the bar Stop is pressed on; a second bar coming
+    /// up for the wait and going away again is the "windows taking turns" that
+    /// hand-over exists to prevent. So the bar goes up grey now, counts in the
+    /// clock's slot, and `begin` finds it already standing.
+    ///
+    /// Escape is claimed the way `CaptureCountdown` claims it — a transient
+    /// Carbon binding, because focus is in another app for the whole wait — and
+    /// released on every way out.
+    private func countDown(to request: RecordingRequest) async -> Bool {
+        let delay = Preferences.shared.recordingDelaySeconds
+        guard delay > 0 else { return true }
+        showStartingChrome(for: request, options: Preferences.shared.recordingOptions)
+        countdownCancelled = false
+        isCountingDown = true
+        claimEscape()
+        defer {
+            isCountingDown = false
+            releaseEscape()
+        }
+
+        let deadline = ProcessInfo.processInfo.systemUptime + delay
+        while !countdownCancelled {
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            if remaining <= 0 { break }
+            hud.showCountdown(remaining: remaining)
+            // Polled, as the screenshot countdown is, so the trash and Escape
+            // are answered within a frame or two rather than at the deadline.
+            try? await Task.sleep(for: .milliseconds(80))
+        }
+        guard !countdownCancelled else {
+            hud.hide()
+            regionOutline.hide()
+            Log.record.notice("delayed recording cancelled")
+            return false
+        }
+        hud.endCountdown()
+        return true
+    }
+
+    private func claimEscape() {
+        do {
+            escapeID = try HotKeyManager.shared.registerTransient(
+                KeyCombo(keyCode: UInt16(kVK_Escape), modifiers: [])
+            ) { [weak self] in
+                self?.countdownCancelled = true
+            }
+        } catch {
+            // Survivable: the bar's trash still ends it.
+            Log.hotkeys.error("could not claim Esc for the recording countdown: \(error, privacy: .public)")
+        }
+    }
+
+    private func releaseEscape() {
+        guard let escapeID else { return }
+        HotKeyManager.shared.unregister(escapeID)
+        self.escapeID = nil
+    }
+
+    /// The bar in its grey starting state, and the lit edge round an area take.
+    ///
+    /// Safe to call again: a countdown puts both up before `begin` does, and a
+    /// retried start re-enters `begin` with both already standing.
+    private func showStartingChrome(for request: RecordingRequest, options: RecordingOptions) {
         // Visible to screen sharing only if the user asked. Unlike the overlay,
         // these two CAN be visible during a take without ending up in it: both
         // exist before `engine.start` builds the filter, so their window IDs go
-        // into `excludedWindowIDs` below and ScreenCaptureKit leaves them out.
-        // The overlay cannot use that route — it is gone by the time the filter
-        // is built, and an overlay raised later cannot be added to a fixed one.
+        // into `excludedWindowIDs` in `begin` and ScreenCaptureKit leaves them
+        // out. The overlay cannot use that route — it is gone by the time the
+        // filter is built, and an overlay raised later cannot be added to a
+        // fixed one.
         let hidden = !Preferences.shared.overlayVisibleToScreenSharing
-        let url = StagingStore.shared.reserve(fileExtension: options.fileExtension)
-
-        // Before the stream is built, not after: `SCContentFilter` is fixed at
-        // start, and a sharingType flipped underneath a running stream is not a
-        // documented way to change what it renders.
-        onCaptureChromeHidden?(true)
-        // Up before the stream, not after it. `startCapture` has been measured
-        // at 3.8–4.3 s on this machine, and showing the HUD only once it
-        // returned left the screen with the selection gone and nothing in its
-        // place for that whole time.
         // Anchored to the region for an area take, so the bar stays where the
         // toolbar just was instead of jumping to the bottom of the screen.
         let region: CGRect? = if case .area(_, let rect) = request { rect } else { nil }
@@ -194,6 +258,21 @@ final class RecordingCoordinator {
         // being recorded" is the whole screen, and a border round the edge of it
         // would be noise.
         if let region { regionOutline.show(around: region, hiddenFromCapture: hidden) }
+    }
+
+    private func begin(_ request: RecordingRequest) async {
+        var options = Preferences.shared.recordingOptions
+        let url = StagingStore.shared.reserve(fileExtension: options.fileExtension)
+
+        // Before the stream is built, not after: `SCContentFilter` is fixed at
+        // start, and a sharingType flipped underneath a running stream is not a
+        // documented way to change what it renders.
+        onCaptureChromeHidden?(true)
+        // Up before the stream, not after it. `startCapture` has been measured
+        // at 3.8–4.3 s on this machine, and showing the HUD only once it
+        // returned left the screen with the selection gone and nothing in its
+        // place for that whole time.
+        showStartingChrome(for: request, options: options)
 
         // Populated at last. The field has existed since the recorder was
         // written and was always empty, on the strength of M9's claim that a
@@ -269,6 +348,11 @@ final class RecordingCoordinator {
     }
 
     func discard() async {
+        // Before the take exists, the bar's trash is the countdown's Cancel.
+        if isCountingDown {
+            countdownCancelled = true
+            return
+        }
         guard state == .recording else { return }
         // Same reason as `stop`: `cancel` clears the engine's own handle before
         // it awaits the stream's stop, so `.idle` here would let the next
@@ -305,6 +389,10 @@ final class RecordingCoordinator {
 
     var hudIsVisibleForTest: Bool { hud.isVisible }
     var stagedURLForTest: URL? { engine.current?.url }
+    var isCountingDownForTest: Bool { isCountingDown }
+    var hudClockForTest: (text: String, fits: Bool)? { hud.clockForTest }
+    var regionOutlineIsVisibleForTest: Bool { regionOutline.isVisible }
+    var lastExcludedWindowIDsForTest: Set<CGWindowID> { engine.lastExcludedWindowIDsForTest }
 
     private func handleUnexpectedStop(_ error: any Error) async {
         // `.arming` counts. There is a window between `engine.start` returning

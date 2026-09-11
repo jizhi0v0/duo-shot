@@ -330,6 +330,24 @@ struct RecordingSettingsView: View {
             }
 
             Section {
+                Picker("Delay before recording", selection: $preferences.recordingDelaySeconds) {
+                    Text("Off").tag(0.0)
+                    Text("3 seconds").tag(3.0)
+                    Text("5 seconds").tag(5.0)
+                    Text("10 seconds").tag(10.0)
+                }
+                Toggle("Show desktop icons", isOn: $preferences.recordingShowsDesktopIcons)
+            } footer: {
+                Text("""
+                    A delay counts down in the recording bar once the area is chosen, so there is time to get to whatever you are about to show. Escape or the bar's trash button calls it off.
+
+                    Off, the desktop icons are left out of the recording and the wallpaper stays.
+                    """)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
                 Toggle("Record system audio", isOn: $preferences.recordingSystemAudio)
                 Toggle("Record microphone", isOn: $preferences.recordingMicrophone)
                     .onChange(of: preferences.recordingMicrophone) { _, isOn in

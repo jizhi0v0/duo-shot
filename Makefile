@@ -370,6 +370,7 @@ test-only:
 	run "card leaks unexcluded"  --selftest-preview-in-recording $(TEST_OUT) --seconds 3 --no-exclude; \
 	run "menu-bar item recorded" --selftest-record-hud $(TEST_OUT) --seconds 2 --status-item --hud-first; \
 	run "recording flow"         --selftest-record-flow $(TEST_OUT) --seconds 2; \
+	run "delayed recording"      --selftest-record-delay $(TEST_OUT); \
 	run "scroll stitcher"        --selftest-scroll-stitch $(TEST_OUT); \
 	run "scroll capture flow"    --selftest-scroll-flow $(TEST_OUT); \
 	printf '  %-26s ' "exclusion negative control"; \

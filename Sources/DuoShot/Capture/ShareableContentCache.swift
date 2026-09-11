@@ -98,6 +98,22 @@ final class ShareableContentCache {
         ownWindows = mine
         return mine.windows.filter { ids.contains($0.windowID) }
     }
+
+    /// The windows that draw the desktop icons, for a take that leaves them out.
+    ///
+    /// Its own enumeration, because `refresh` asks with
+    /// `excludingDesktopWindows: true` and the icons are exactly what that
+    /// drops: measured 2026-09-11, Finder's icon window is absent from that list
+    /// and present in this one. Picked by the documented level rather than by
+    /// Finder's bundle ID — the same line `DesktopWallpaper` draws, from the
+    /// other side.
+    func desktopIconWindows() async throws -> [SCWindow] {
+        let all = try await SCKBridge.shareableContent(
+            excludingDesktopWindows: false, onScreenWindowsOnly: true).value
+        return all.windows.filter { $0.windowLayer == Self.desktopIconLayer }
+    }
+
+    static let desktopIconLayer = Int(CGWindowLevelForKey(.desktopIconWindow))
 }
 
 extension WindowInfo {

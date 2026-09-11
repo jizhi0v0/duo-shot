@@ -97,6 +97,8 @@ final class RecordingEngine {
 
     var isRecording: Bool { active != nil }
     var current: ActiveRecording? { active }
+    /// What the last `start` actually put in its filter's exclusion list.
+    private(set) var lastExcludedWindowIDsForTest: Set<CGWindowID> = []
 
     func refreshContent() async throws {
         try await content.refresh()
@@ -147,7 +149,13 @@ final class RecordingEngine {
             options.microphoneDeviceID = nil
         }
 
-        let excluded = try await content.ownWindows(matching: options.excludedWindowIDs)
+        var excluded = try await content.ownWindows(matching: options.excludedWindowIDs)
+        // Thrown rather than degraded: a take that quietly shows the icons the
+        // user turned off is only discovered once it has been sent to someone.
+        if !options.showsDesktopIcons {
+            excluded += try await content.desktopIconWindows()
+        }
+        lastExcludedWindowIDsForTest = Set(excluded.map(\.windowID))
         let filter = SCContentFilter(display: display, excludingWindows: excluded)
         // Defaults to YES on this initialiser — same trap as the screenshot path.
         filter.includeMenuBar = options.includeMenuBar

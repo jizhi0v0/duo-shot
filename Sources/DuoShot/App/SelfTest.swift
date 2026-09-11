@@ -131,6 +131,9 @@ enum SelfTest {
         /// The whole recording flow through the coordinator: toggle semantics,
         /// the state machine, the HUD's lifetime, and the discard path.
         case recordFlow(directory: URL, seconds: Double)
+        /// The recording delay (the take starts when the countdown ends, and can
+        /// be called off from the bar) and the desktop-icon switch.
+        case recordDelay(directory: URL)
         /// Whether the recording HUD — a window that appears *after* the stream
         /// is already running — ends up inside the recording.
         /// The app-level share paths, against the real bucket.
@@ -311,6 +314,9 @@ enum SelfTest {
                 self = .recordFlow(
                     directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"),
                     seconds: value(for: "--seconds").flatMap(Double.init) ?? 2)
+            case "--selftest-record-delay":
+                self = .recordDelay(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-record-hud":
                 // NOTE the default: `.readOnly`, not the shipping `.none`.
                 //
@@ -478,6 +484,8 @@ enum SelfTest {
                 return try await scrollFlowCheck(into: directory)
             case .recordFlow(let directory, let seconds):
                 return try await recordFlow(into: directory, seconds: seconds)
+            case .recordDelay(let directory):
+                return try await recordDelayCheck(into: directory)
             case .recordHUD(let d, let seconds, let sharingNone, let hudFirst, let plain,
                             let status, let excludeIDs):
                 return try await recordHUD(
@@ -7828,6 +7836,12 @@ enum SelfTest {
         try await Task.sleep(for: .milliseconds(1000))
         try await shoot("hud-slow-start", frame: starting)
 
+        // The countdown before a delayed take, at its widest. "in 10s" has to
+        // fit the clock's slot for the same reason: the bar is already up.
+        hud.showCountdown(remaining: 10)
+        let countdownClock = hud.clockForTest
+        try await shoot("hud-countdown", frame: starting)
+
         hud.beginRecording(elapsed: { 754 })
         // Nothing about the window is supposed to move here — only the contents
         // colour in — but the colour transition is animated, so the shot still
@@ -7890,6 +7904,10 @@ enum SelfTest {
         }
         if micOffFrame.width <= running.width {
             failures.append("the mic-off bar made no room for the indicator")
+        }
+        if countdownClock?.fits != true {
+            failures.append("the countdown does not fit the clock's slot: "
+                + (countdownClock?.text ?? "no bar"))
         }
         print("placement:     anchor \(rectString(anchor))")
         print("               toolbar \(rectString(bar))")
@@ -12013,6 +12031,311 @@ enum SelfTest {
         check(outputs.count == 2, "the third take produced one more output (got \(outputs.count))")
 
         print("result:        \(failures.isEmpty ? "PASS" : "FAIL — " + failures.joined(separator: "; "))")
+        return failures.isEmpty ? 0 : 1
+    }
+
+    // MARK: - Delayed recording
+
+    /// The recording delay and the desktop-icon switch, through the shipping
+    /// path.
+    ///
+    /// The delay is the one worth a test that can fail: a window changes colour
+    /// while the bar counts, and the take's first frame has to hold the new
+    /// colour. The same flow with the delay off is the control — it must hold
+    /// the old one, or "the take waited" would be indistinguishable from
+    /// "nothing was timed at all".
+    ///
+    /// The icons are asserted in two halves, because neither can fail for the
+    /// right reason alone: the engine has to name the icon window in its
+    /// filter, and naming it has to take the icons out of what ScreenCaptureKit
+    /// renders. The second half excludes every window above the icons from
+    /// both shots, so whatever is open on screen cannot hide the answer. A Mac
+    /// with nothing on its desktop can run the first half only, and says so.
+    private static func recordDelayCheck(into directory: URL) async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+        if let hint = LoginSession.noDisplaysHint {
+            FileHandle.standardError.write(Data("error: \(hint)\n".utf8))
+            return 2
+        }
+        guard let screen = NSScreen.main, let displayID = ScreenIndex.displayID(of: screen)
+        else { throw CaptureError.noDisplays }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        var failures: [String] = []
+        func check(_ condition: Bool, _ description: String) {
+            print("  \(condition ? "ok  " : "FAIL") \(description)")
+            if !condition { failures.append(description) }
+        }
+
+        let preferences = Preferences.shared
+        let saved = (
+            clipboard: preferences.copyToClipboard, sound: preferences.playsSound,
+            audio: preferences.recordingSystemAudio, microphone: preferences.recordingMicrophone,
+            cursor: preferences.recordingShowsCursor, delay: preferences.recordingDelaySeconds,
+            icons: preferences.recordingShowsDesktopIcons)
+        preferences.copyToClipboard = false
+        preferences.playsSound = false
+        // None of these is under test, and a pointer drawn into the middle of
+        // the sampled frame would only make the colour reading noisier.
+        preferences.recordingSystemAudio = false
+        preferences.recordingMicrophone = false
+        preferences.recordingShowsCursor = false
+        defer {
+            preferences.copyToClipboard = saved.clipboard
+            preferences.playsSound = saved.sound
+            preferences.recordingSystemAudio = saved.audio
+            preferences.recordingMicrophone = saved.microphone
+            preferences.recordingShowsCursor = saved.cursor
+            preferences.recordingDelaySeconds = saved.delay
+            preferences.recordingShowsDesktopIcons = saved.icons
+        }
+
+        let overlay = OverlayController()
+        let recorder = RecordingCoordinator(overlay: overlay)
+        recorder.saveDirectoryOverride = directory
+        var outputs: [OutputPipeline.RecordingOutput] = []
+        recorder.onResult = { outputs.append($0) }
+
+        /// An area take started the way the hotkey starts one: select, arm,
+        /// Record. `duringCountdown` runs once the bar is counting — the only
+        /// moment the thing under test exists — and is awaited, so it finishes
+        /// while the countdown is still up. True once `perform` has returned.
+        func recordArea(
+            _ rect: CGRect, duringCountdown: @MainActor () async -> Void = {}
+        ) async -> Bool {
+            let done = CompletionFlag()
+            Task {
+                await recorder.perform(.recordArea)
+                done.markDone()
+            }
+            var waited = 0
+            while !overlay.isPresenting, waited < 5000 {
+                try? await Task.sleep(for: .milliseconds(25))
+                waited += 25
+            }
+            guard overlay.isPresenting else { return false }
+            overlay.forceSelection(rect, on: screen)
+            try? await Task.sleep(for: .milliseconds(80))
+            overlay.confirmForTest()      // arms the bar
+            try? await Task.sleep(for: .milliseconds(120))
+            overlay.confirmForTest()      // Record
+            if preferences.recordingDelaySeconds > 0 {
+                waited = 0
+                while !recorder.isCountingDownForTest, waited < 3000 {
+                    try? await Task.sleep(for: .milliseconds(20))
+                    waited += 20
+                }
+                check(recorder.isCountingDownForTest, "the recording bar is counting down")
+                await duringCountdown()
+            }
+            return await done.wait(upTo: .seconds(20))
+        }
+
+        func firstFrameColour(of url: URL?, saveAs name: String) async -> String {
+            guard let url else { return "no recording" }
+            let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+            generator.appliesPreferredTrackTransform = true
+            generator.requestedTimeToleranceBefore = .zero
+            generator.requestedTimeToleranceAfter = .zero
+            guard let frame = try? await generator.image(at: .zero).image,
+                  let mean = PixelCompare.meanColour(frame)
+            else { return "no frame" }
+            try? ImageEncoder.write(
+                frame, to: directory.appendingPathComponent(name), as: .png, scale: 1)
+            if mean.r > 128, mean.b < 128 { return "red" }
+            if mean.b > 128, mean.r < 128 { return "blue" }
+            return "neither (r\(Int(mean.r)) g\(Int(mean.g)) b\(Int(mean.b)))"
+        }
+
+        func findTrash(in view: NSView) -> NSButton? {
+            if let button = view as? NSButton,
+               button.action == NSSelectorFromString("discardTapped") { return button }
+            for sub in view.subviews {
+                if let found = findTrash(in: sub) { return found }
+            }
+            return nil
+        }
+
+        let red = NSColor(srgbRed: 1, green: 0, blue: 0, alpha: 1)
+        let blue = NSColor(srgbRed: 0, green: 0, blue: 1, alpha: 1)
+        let stageFrame = CGRect(
+            x: (screen.frame.midX - 150).rounded(), y: (screen.frame.midY - 100).rounded(),
+            width: 300, height: 200)
+        let region = stageFrame.insetBy(dx: 30, dy: 30)
+
+        // --- the take starts when the countdown ends ------------------------
+        var stage = plainWindow(colour: red, frame: stageFrame)
+        try await Task.sleep(for: .milliseconds(300))
+        preferences.recordingDelaySeconds = 1
+        var clock: (text: String, fits: Bool)?
+        var litWhileCounting = false
+        var liveWhileCounting = true
+        var produced = outputs.count
+        let delayedStarted = await recordArea(region) {
+            clock = recorder.hudClockForTest
+            litWhileCounting = recorder.regionOutlineIsVisibleForTest
+            liveWhileCounting = recorder.isRecording || recorder.stagedURLForTest != nil
+            stage.backgroundColor = blue
+            stage.displayIfNeeded()
+        }
+        check(delayedStarted && recorder.isRecording, "the take started once the countdown ran out")
+        check(!liveWhileCounting, "nothing was recording or staged while it counted")
+        check(clock?.text == "in 1s", "the bar's clock counted it (\(clock?.text ?? "no bar"))")
+        check(litWhileCounting, "the region was lit while it counted")
+        try await Task.sleep(for: .seconds(1))
+        await recorder.stop()
+        let delayedColour = await firstFrameColour(
+            of: outputs.count == produced + 1 ? outputs.last?.url : nil,
+            saveAs: "record-delay-first-frame.png")
+        check(delayedColour == "blue",
+              "the take's first frame holds what happened during the countdown — got \(delayedColour)")
+        stage.orderOut(nil)
+
+        // --- the control: no delay, so the take is running before the change -
+        stage = plainWindow(colour: red, frame: stageFrame)
+        try await Task.sleep(for: .milliseconds(300))
+        preferences.recordingDelaySeconds = 0
+        produced = outputs.count
+        let immediateStarted = await recordArea(region)
+        check(immediateStarted && recorder.isRecording, "with the delay off the take started at once")
+        stage.backgroundColor = blue
+        stage.displayIfNeeded()
+        try await Task.sleep(for: .seconds(1))
+        await recorder.stop()
+        let immediateColour = await firstFrameColour(
+            of: outputs.count == produced + 1 ? outputs.last?.url : nil,
+            saveAs: "record-nodelay-first-frame.png")
+        check(immediateColour == "red",
+              "and its first frame holds the old colour, so the check above can fail "
+                + "— got \(immediateColour)")
+        stage.orderOut(nil)
+
+        // --- called off from the bar's trash --------------------------------
+        preferences.recordingDelaySeconds = 3
+        produced = outputs.count
+        var clickedAt: ContinuousClock.Instant?
+        let cancelReturned = await recordArea(region) {
+            // Fired the way a user reaches it: hit-testing has to return the
+            // button at its centre, and `performClick` stands in for the click —
+            // `mouseDown` on an NSButton enters a tracking loop that no
+            // synthesized mouse-up ever reaches.
+            guard let panel = NSApp.windows.compactMap({ $0 as? FloatingBarPanel })
+                    .first(where: { $0.isVisible }),
+                  let root = panel.contentView,
+                  let trash = findTrash(in: root)
+            else {
+                check(false, "the counting bar has a trash button")
+                return
+            }
+            let centre = trash.convert(CGPoint(x: trash.bounds.midX, y: trash.bounds.midY), to: nil)
+            let hit = root.superview?.hitTest(centre) ?? root.hitTest(centre)
+            check(hit === trash, "the trash is what hit-testing returns "
+                + "(got \(hit.map { "\(type(of: $0))" } ?? "nothing"))")
+            clickedAt = .now
+            trash.performClick(nil)
+        }
+        let answeredIn = clickedAt.map { $0.duration(to: .now) } ?? .seconds(99)
+        check(cancelReturned && answeredIn < .seconds(1),
+              "the trash ended the countdown in \(answeredIn.milliseconds) ms, well before its 3 s")
+        check(!recorder.isRecording && recorder.state == .idle, "no take started and the recorder is idle")
+        check(!recorder.hudIsVisibleForTest && !recorder.regionOutlineIsVisibleForTest,
+              "the bar and the lit edge came down")
+        check(outputs.count == produced, "and nothing was produced")
+        if recorder.isRecording { await recorder.discard() }
+        // Released on the way out, or Escape stays eaten system-wide.
+        let escape = try? HotKeyManager.shared.registerTransient(
+            KeyCombo(keyCode: UInt16(kVK_Escape), modifiers: [])) {}
+        check(escape != nil, "Escape was given back")
+        if let escape { HotKeyManager.shared.unregister(escape) }
+
+        // --- desktop icons: the engine names the window that draws them -------
+        let iconLayer = ShareableContentCache.desktopIconLayer
+        let listed = (CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID)
+            as? [[String: Any]]) ?? []
+        let iconWindowIDs = Set(listed
+            .filter { ($0[kCGWindowLayer as String] as? Int) == iconLayer }
+            .compactMap { ($0[kCGWindowNumber as String] as? Int).map { CGWindowID($0) } })
+        var note = ""
+        if iconWindowIDs.isEmpty {
+            note = " (icons unmeasured: nothing draws desktop icons on this Mac)"
+            print("  --   nothing draws desktop icons here; the icon checks are skipped")
+        } else {
+            preferences.recordingDelaySeconds = 0
+            for shows in [false, true] {
+                preferences.recordingShowsDesktopIcons = shows
+                await recorder.perform(.recordFullscreen)
+                let named = recorder.lastExcludedWindowIDsForTest
+                check(recorder.isRecording,
+                      "a fullscreen take started with the icons \(shows ? "shown" : "hidden")")
+                if shows {
+                    check(named.isDisjoint(with: iconWindowIDs),
+                          "shown: the icon window is not in the filter's exclusion list")
+                } else {
+                    check(iconWindowIDs.isSubset(of: named),
+                          "hidden: icon window \(iconWindowIDs.sorted()) is in the filter's exclusion list")
+                }
+                await recorder.discard()
+            }
+
+            // --- and naming it takes the icons out of the picture ---------------
+            let content = try await SCKBridge.shareableContent(
+                excludingDesktopWindows: false, onScreenWindowsOnly: true).value
+            guard let display = content.displays.first(where: { $0.displayID == displayID })
+            else { throw CaptureError.noDisplays }
+            let above = content.windows.filter { $0.windowLayer > iconLayer }
+            // The shipping lookup, not this test's own list: the filter has to
+            // accept the windows the engine will actually hand it.
+            let icons = try await ShareableContentCache().desktopIconWindows()
+
+            func shot(excluding excluded: [SCWindow]) async throws -> CGImage? {
+                let filter = SCContentFilter(display: display, excludingWindows: excluded)
+                filter.includeMenuBar = false
+                let configuration = SCScreenshotConfiguration()
+                let (width, height) = DisplayGeometry.pixelSize(
+                    of: filter.contentRect, scale: CGFloat(filter.pointPixelScale))
+                configuration.width = width
+                configuration.height = height
+                configuration.showsCursor = false
+                return try await SCKBridge.captureScreenshot(
+                    filter: filter, configuration: configuration).image
+            }
+            func differing(_ a: CGImage?, _ b: CGImage?) -> Int {
+                guard let a, let b, a.width == b.width, a.height == b.height else { return -1 }
+                let x = rgba(of: a), y = rgba(of: b)
+                var count = 0
+                for p in stride(from: 0, to: min(x.count, y.count), by: 4) {
+                    let d = abs(Int(x[p]) - Int(y[p])) + abs(Int(x[p + 1]) - Int(y[p + 1]))
+                        + abs(Int(x[p + 2]) - Int(y[p + 2]))
+                    if d > 60 { count += 1 }
+                }
+                return count
+            }
+
+            let shown = try await shot(excluding: above)
+            let again = try await shot(excluding: above)
+            let hidden = try await shot(excluding: above + icons)
+            for (image, name) in [(shown, "record-icons-shown.png"), (hidden, "record-icons-hidden.png")] {
+                if let image {
+                    try? ImageEncoder.write(
+                        image, to: directory.appendingPathComponent(name), as: .png, scale: 1)
+                }
+            }
+            let changed = differing(shown, hidden)
+            let noise = differing(shown, again)
+            print("icons:         \(changed) px change when the icon window is excluded, "
+                + "\(noise) px between two identical shots")
+            let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+            let items = desktop.flatMap { try? FileManager.default.contentsOfDirectory(atPath: $0.path) }?
+                .filter { !$0.hasPrefix(".") }.count ?? 0
+            if items == 0 {
+                note = " (icon pixels unmeasured: the Desktop folder is empty)"
+            } else {
+                check(changed > 1000 && changed > max(noise, 1) * 20,
+                      "excluding the icon window removes the icons (\(items) items on the Desktop)")
+            }
+        }
+
+        print("result:        \(failures.isEmpty ? "PASS\(note)" : "FAIL — \(failures.count) of the above")")
         return failures.isEmpty ? 0 : 1
     }
 
