@@ -18,7 +18,7 @@ final class WindowPickerModel {
 
     /// Smaller than this and it is a shadow helper, a tooltip or a 1×1 spy
     /// window rather than something a user means to capture.
-    private let minimumSize = CGSize(width: 40, height: 40)
+    nonisolated static let minimumSize = CGSize(width: 40, height: 40)
 
     /// Whether the picker offers windows at this layer.
     ///
@@ -59,7 +59,10 @@ final class WindowPickerModel {
     /// plainly real, which is what lets the menu bar through: it is 1920×30, so
     /// a height rule excludes it, while Control Center's 32×30 status items —
     /// which must stay out — are two orders of magnitude smaller by area.
-    private func isPickable(size frame: CGRect) -> Bool {
+    ///
+    /// Also what makes a window raised over another something drawn *on* it
+    /// rather than a window of its own — see `CaptureEngine.adornments`.
+    nonisolated static func isPickable(size frame: CGRect) -> Bool {
         (frame.width >= minimumSize.width && frame.height >= minimumSize.height)
             || frame.width * frame.height >= 20_000
     }
@@ -99,8 +102,8 @@ final class WindowPickerModel {
         if window.layer == WindowInfo.dockLayer, window.visibleFrame == nil {
             return "dock strip unknown"
         }
-        if !isPickable(size: window.pickFrame) {
-            return "smaller than \(Int(minimumSize.width))×\(Int(minimumSize.height))"
+        if !Self.isPickable(size: window.pickFrame) {
+            return "smaller than \(Int(Self.minimumSize.width))×\(Int(Self.minimumSize.height))"
         }
         return nil
     }

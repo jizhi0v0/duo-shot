@@ -28,6 +28,15 @@ struct WindowRecovery {
     /// fallback runs, the window is half gone and its own z-order says nothing
     /// useful.
     let windowsFrontToBack: [WindowInfo]
+    /// Isolated captures, from that same instant, of the windows an app had
+    /// raised over one of its own — a tooltip over its panel. See
+    /// `CaptureEngine.adornments(of:in:excluding:)`.
+    ///
+    /// Taken before the overlay because the overlay is what dismisses them:
+    /// measured 2026-09-11 on DuoUpdater, its tooltip was gone within 0.75 s of
+    /// the overlay appearing, before the pick. At pick time there is nothing
+    /// left to capture.
+    var adornments: [CGWindowID: CaptureEngine.WindowShot] = [:]
 }
 
 /// Builds filters and configurations, and turns a `CaptureRequest` into a
@@ -275,6 +284,13 @@ final class CaptureEngine {
             }
         }
 
+        // After the fade recovery, which judges the window by its own pixels and
+        // would read a tooltip drawn over it as something occluding it. The Dock's
+        // region capture already holds everything on screen.
+        if info?.visibleFrame == nil {
+            shot = await withAdornments(shot, of: windowID, options: options, recovery: recovery)
+        }
+
         let (padded, pointSize) = await pad(
             shot.image, size: shot.pointSize, scale: shot.scale,
             on: displayID, options: options)
@@ -303,6 +319,9 @@ final class CaptureEngine {
         /// The window's whole frame, before `trimmed` dropped the border it never
         /// drew. Equal to `coversInCGGlobal` when nothing was trimmed.
         let frameInCGGlobal: CGRect
+        /// The windows `captureGroup` brought in with this one, so that
+        /// `withAdornments` does not draw any of them a second time.
+        var groupedWindowIDs: Set<CGWindowID> = []
     }
 
     /// The speculative capture taken while the window was merely hovered, if it
@@ -634,10 +653,10 @@ final class CaptureEngine {
         // unrelated window of the same app from stretching the frame. It is a
         // filter and not the verdict: the size check below is still the verdict.
         let members = above.filter {
-            let candidate = frame.union($0)
+            let candidate = frame.union($0.frame)
             return candidate.width <= size.width + 1 && candidate.height <= size.height + 1
         }
-        let union = members.reduce(frame) { $0.union($1) }
+        let union = members.reduce(frame) { $0.union($1.frame) }
         guard abs(union.width - size.width) <= 1, abs(union.height - size.height) <= 1 else {
             Log.capture.notice("""
                 window \(window.windowID, privacy: .public) has a group of \
@@ -653,7 +672,9 @@ final class CaptureEngine {
             \(members.count, privacy: .public) window(s) stacked on it, \
             \(Int(union.width), privacy: .public)x\(Int(union.height), privacy: .public) pt
             """)
-        return trimmed(image, frame: union, scale: scale)
+        var shot = trimmed(image, frame: union, scale: scale)
+        shot.groupedWindowIDs = Set(members.map(\.id))
+        return shot
     }
 
     /// Same-app windows drawn in front of this one and overlapping it, by frame.
@@ -674,7 +695,7 @@ final class CaptureEngine {
     /// The z-order is re-read rather than taken from the cached list: that order
     /// was established when the overlay opened, and `WindowZOrder.entries()`
     /// needs no TCC and costs a single window-server call.
-    private func stacked(on windowID: CGWindowID, options: CaptureOptions) -> [CGRect] {
+    private func stacked(on windowID: CGWindowID, options: CaptureOptions) -> [WindowInfo] {
         let ordered = WindowZOrder.sortedFrontToBack(content.windows)
         guard let index = ordered.firstIndex(where: { $0.id == windowID }) else { return [] }
         let picked = ordered[index]
@@ -689,8 +710,163 @@ final class CaptureEngine {
                   !above.frame.isEmpty,
                   above.frame.intersects(picked.frame)
             else { return nil }
-            return above.frame
+            return above
         }
+    }
+
+    /// Draws the picked window's adornments (`adornments(of:in:excluding:)`)
+    /// over it, overhang and all.
+    ///
+    /// Two sources, because there are two ways to get here. The instant window
+    /// shortcut opens no overlay, and the tooltip is still on screen: it is
+    /// captured now. A pick made through the overlay arrives after the overlay
+    /// has dismissed it, and what is left is `WindowRecovery.adornments`, taken
+    /// before it went up.
+    ///
+    /// "Still on screen" is the window server's answer, not the cached list's:
+    /// that list was made when the shortcut fired and still names a tooltip that
+    /// has since gone, and `sortedFrontToBack` sends a window it no longer lists
+    /// behind everything — which is what takes a dismissed tooltip out of the
+    /// live half.
+    private func withAdornments(
+        _ shot: WindowShot, of windowID: CGWindowID,
+        options: CaptureOptions, recovery: WindowRecovery?
+    ) async -> WindowShot {
+        let excluded = options.excludedWindowIDs.union(shot.groupedWindowIDs)
+        let onScreen = WindowZOrder.entries()
+        let live = WindowZOrder.sortedFrontToBack(content.windows, using: onScreen)
+        guard let picked = live.first(where: { $0.id == windowID }) else { return shot }
+
+        // Back to front: the order they are drawn in.
+        var layers: [WindowShot] = []
+
+        // Dismissed since the shortcut fired: over this window in that instant's
+        // list, and gone from the screen altogether. A tooltip that is still up
+        // is the live half's to judge — if it has moved off, it is not over this
+        // window any more, and putting it back would draw something that was not
+        // there.
+        if let recovery,
+           let then = recovery.windowsFrontToBack.first(where: { $0.id == windowID }) {
+            let dismissed = Self.adornments(
+                of: then, in: recovery.windowsFrontToBack, excluding: excluded)
+                .filter { onScreen[$0.id] == nil }
+            layers += dismissed.reversed().compactMap { recovery.adornments[$0.id] }
+        }
+
+        for above in Self.adornments(of: picked, in: live, excluding: excluded).reversed()
+        where onScreen[above.id] != nil {
+            guard let window = content.scWindow(for: above.id),
+                  let captured = try? await captureAlone(window, options: options)
+            else { continue }
+            layers.append(captured)
+        }
+        guard !layers.isEmpty else { return shot }
+
+        let canvas = layers.reduce(shot.coversInCGGlobal) { $0.union($1.coversInCGGlobal) }
+        guard let image = await WindowComposite.composited(
+            [(shot.image, shot.coversInCGGlobal)] + layers.map { ($0.image, $0.coversInCGGlobal) },
+            canvas: canvas, scale: shot.scale)
+        else {
+            Log.capture.error("""
+                window \(windowID, privacy: .public): compositing what was over it \
+                failed; keeping the window alone
+                """)
+            return shot
+        }
+        Log.capture.notice("""
+            window \(windowID, privacy: .public) captured with \
+            \(layers.count, privacy: .public) window(s) its app raised over it, \
+            \(Int(canvas.width), privacy: .public)x\(Int(canvas.height), privacy: .public) pt
+            """)
+        return WindowShot(
+            image: image, pointSize: canvas.size, scale: shot.scale,
+            coversInCGGlobal: canvas, frameInCGGlobal: shot.frameInCGGlobal,
+            groupedWindowIDs: shot.groupedWindowIDs)
+    }
+
+    /// Windows the picked window's own app has raised over it — DuoUpdater's
+    /// hover tooltip over its menu-bar panel — front to back.
+    ///
+    /// Reported as "对于 tips 悬浮，窗口截图并不会把它包含进去". A tooltip is a
+    /// window of its own and **not** in the window server's parent/child group,
+    /// so `captureGroup` cannot reach it. Measured 2026-09-11 on DuoUpdater,
+    /// panel at layer 101 and tooltip at 103: the panel captured with
+    /// `includeChildWindows` came back 370x562 pt, the panel alone, and macOS's
+    /// own `screencapture -l` returned the same panel-only picture with the
+    /// tooltip on screen before and after it. So this is a rule of ours and goes
+    /// past what the platform does, because a capture should be what was on
+    /// screen.
+    ///
+    /// Two conditions keep it from taking what it should not. **A strictly
+    /// higher layer**: `captureGroup` turned down "same app, in front,
+    /// overlapping" because of Finder and Mail windows piled on one another, all
+    /// at one layer. And **too small to be picked on its own**
+    /// (`WindowPickerModel.isPickable(size:)`, the same test that keeps the
+    /// picker from offering a tooltip): layer alone cannot tell a tooltip from a
+    /// panel, and `--selftest-occluded-recovery` proved it — its occluder, a
+    /// 420x150 panel at 103 over a window at 101, has a tooltip's layers
+    /// exactly, and was composited into the very capture it exists to stay out
+    /// of. The size also leaves out an inspector palette over a document window.
+    /// What it costs is a tooltip long enough to be a window in its own right.
+    ///
+    /// Run against every window on one (quiet, 14-window) desktop the day it was
+    /// written, the layer rule alone matched no pair.
+    nonisolated static func adornments(
+        of picked: WindowInfo, in frontToBack: [WindowInfo], excluding excluded: Set<CGWindowID>
+    ) -> [WindowInfo] {
+        guard let index = frontToBack.firstIndex(where: { $0.id == picked.id }),
+              let bundleID = picked.bundleID
+        else { return [] }
+        return frontToBack[..<index].filter { above in
+            above.bundleID == bundleID
+                && above.layer > picked.layer
+                // Same floor as `stacked` and the picker: on screen at zero
+                // opacity contributes no pixels.
+                && above.alpha >= 0.05
+                && !excluded.contains(above.id)
+                && !above.frame.isEmpty
+                && above.frame.intersects(picked.frame)
+                && !WindowPickerModel.isPickable(size: above.frame)
+        }
+    }
+
+    /// Isolated captures of every window that is an adornment of some window
+    /// behind it, for `WindowRecovery.adornments`.
+    ///
+    /// Every candidate rather than the picked window's, because it runs before
+    /// the overlay and nobody knows yet what will be picked. On most desktops
+    /// that is none, and this costs one pass over the list.
+    func captureAdornments(
+        among frontToBack: [WindowInfo], excluding excluded: Set<CGWindowID>
+    ) async -> [CGWindowID: WindowShot] {
+        let candidates = Set(frontToBack.flatMap {
+            Self.adornments(of: $0, in: frontToBack, excluding: excluded).map(\.id)
+        })
+        var shots: [CGWindowID: WindowShot] = [:]
+        for id in candidates {
+            guard let window = content.scWindow(for: id),
+                  let shot = try? await captureAlone(window, options: .default)
+            else { continue }
+            shots[id] = shot
+        }
+        return shots
+    }
+
+    /// One window by itself, for drawing over another. No group and no blank
+    /// retry: those are for the window that was picked, and it has already been
+    /// through `captureIsolated`.
+    private func captureAlone(
+        _ window: SCWindow, options: CaptureOptions
+    ) async throws -> WindowShot? {
+        let filter = SCContentFilter(desktopIndependentWindow: window)
+        let scale = CGFloat(filter.pointPixelScale)
+        var alone = options
+        alone.includeChildWindows = false
+        let output = try await SCKBridge.captureScreenshot(
+            filter: filter,
+            configuration: configuration(for: filter.contentRect, scale: scale, options: alone))
+        guard let image = output.image, !PixelCompare.isBlank(image) else { return nil }
+        return trimmed(image, frame: window.frame, scale: scale)
     }
 
     /// Drops a border of pixels the window never drew.

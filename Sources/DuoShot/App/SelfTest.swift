@@ -2914,6 +2914,7 @@ enum SelfTest {
 
         let childOK = try await childWindowIsolation()
         let stackedOK = try await stackedWindowsAreKept()
+        let adornedOK = try await adornmentsAreComposited()
         let emptyParentOK = try await emptyParentCapturesItsChild()
         let trimOK = try await transparentBorderIsTrimmed()
         let popupSurvivalOK = try await overlayDoesNotDismissPopups(coordinator, all)
@@ -3012,7 +3013,7 @@ enum SelfTest {
         let pass = selfLeaked == 0 && hits == tested && tested > 0 && geometryOK && suppressionOK
             && clickAdoptsOK && dragOverridesOK && instantOK
             && inversions.isEmpty && frontmostOK && recoveredOK && appearedOK && paddingOK
-            && childOK && stackedOK && emptyParentOK && trimOK && popupSurvivalOK && frozenPickerOK && shadowHostOK
+            && childOK && stackedOK && adornedOK && emptyParentOK && trimOK && popupSurvivalOK && frozenPickerOK && shadowHostOK
             && shadowOK && ownWindowOK
             && cardOK
             && menuBarOK
@@ -4789,6 +4790,93 @@ enum SelfTest {
                    + "%.0fx%.0f pt (expected %.0fx%.0f) -> %@",
                      blue, green, result.pointSize.width, result.pointSize.height,
                      expected.width, expected.height, (ok ? "OK" : "FAIL") as NSString))
+        return ok
+    }
+
+    /// A window is captured with what its own app has raised over it — a
+    /// tooltip — both live and after the overlay has dismissed it.
+    ///
+    /// Reported against DuoUpdater: hovering its TestFlight button shows a
+    /// tooltip, and a window capture of the panel came back without it. The
+    /// tooltip is a window of its own, layer 103 over a panel at 101, and not in
+    /// the panel's window group — so `stackedWindowsAreKept` cannot see it.
+    ///
+    ///   parent   opaque red, the pick
+    ///   tip      solid blue, two levels above the parent, **overhanging** it
+    ///   sibling  solid green, same app and same level, in front and overlapping
+    ///            — the Finder/Mail case, which must stay out
+    ///   far      solid yellow, tip-sized and two levels above, not touching the
+    ///            parent — must stay out
+    ///   palette  solid cyan, two levels above and overlapping the parent, but
+    ///            big enough to be a window in its own right — must stay out.
+    ///            It is `--selftest-occluded-recovery`'s occluder, and an
+    ///            inspector palette over a document window
+    ///
+    /// The second half orders the tip out between the pre-overlay capture and the
+    /// pick, which is what the overlay does to a real tooltip, and reads it both
+    /// ways: without the recovery the tip has to be missing — or the pass says
+    /// nothing about where the pixels came from — and with it, back.
+    private static func adornmentsAreComposited() async throws -> Bool {
+        let engine = CaptureEngine()
+
+        func window(_ frame: CGRect, _ colour: NSColor, levelsUp: Int) -> NSWindow {
+            let window = NSWindow(
+                contentRect: frame, styleMask: [.borderless],
+                backing: .buffered, defer: false)
+            window.backgroundColor = colour
+            window.isOpaque = true
+            window.hasShadow = false
+            window.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + levelsUp)
+            return window
+        }
+
+        let parent = window(CGRect(x: 200, y: 200, width: 400, height: 300), .red, levelsUp: 0)
+        // Overhangs the parent's right edge by 100 pt: union is 500x300.
+        let tip = window(CGRect(x: 450, y: 420, width: 250, height: 30), .blue, levelsUp: 2)
+        let sibling = window(CGRect(x: 120, y: 150, width: 200, height: 150), .green, levelsUp: 0)
+        let far = window(CGRect(x: 900, y: 600, width: 200, height: 30), .yellow, levelsUp: 2)
+        let palette = window(CGRect(x: 400, y: 210, width: 150, height: 150), .cyan, levelsUp: 2)
+        for one in [parent, sibling, tip, far, palette] { one.orderFrontRegardless() }
+        defer { for one in [palette, tip, far, sibling, parent] { one.orderOut(nil) } }
+
+        try await Task.sleep(for: .milliseconds(400))
+        try await engine.refreshContent()
+        let id = CGWindowID(parent.windowNumber)
+        let expected = parent.frame.union(tip.frame).size
+
+        func read(_ result: CaptureResult) -> (tip: Int, sibling: Int, far: Int, palette: Int, framed: Bool) {
+            (PixelCompare.count(result.image) { r, g, b in r < 90 && g < 90 && b > 180 },
+             PixelCompare.count(result.image) { r, g, b in r < 90 && g > 180 && b < 90 },
+             PixelCompare.count(result.image) { r, g, b in r > 180 && g > 180 && b < 90 },
+             PixelCompare.count(result.image) { r, g, b in r < 90 && g > 180 && b > 180 },
+             abs(result.pointSize.width - expected.width) <= 2
+                && abs(result.pointSize.height - expected.height) <= 2)
+        }
+
+        let live = read(try await engine.capture(.window(id), options: .default))
+
+        // The coordinator's order: the list and the adornments at trigger time,
+        // then the overlay dismisses the tip, then the pick — against a window
+        // list that was never refreshed and still names the tip.
+        let before = engine.shareableContent.windows
+        let recovery = WindowRecovery(
+            frames: [:], windowsFrontToBack: before,
+            adornments: await engine.captureAdornments(among: before, excluding: []))
+        tip.orderOut(nil)
+        try await Task.sleep(for: .milliseconds(300))
+        let without = read(try await engine.capture(.window(id), options: .default))
+        let recovered = read(try await engine.capture(
+            .window(id), options: .default, recovery: recovery))
+
+        let ok = live.tip > 0 && live.sibling == 0 && live.far == 0 && live.palette == 0 && live.framed
+            && without.tip == 0
+            && recovered.tip > 0 && recovered.sibling == 0 && recovered.far == 0
+            && recovered.palette == 0 && recovered.framed
+        print("adornments:    live tip \(live.tip) px, sibling \(live.sibling) px, "
+            + "far \(live.far) px, palette \(live.palette) px, framed=\(live.framed); tip dismissed: "
+            + "\(without.tip) px without recovery, \(recovered.tip) px with, "
+            + "framed=\(recovered.framed) (expected \(Int(expected.width))x\(Int(expected.height)) pt) "
+            + "-> \(ok ? "OK" : "FAIL")")
         return ok
     }
 

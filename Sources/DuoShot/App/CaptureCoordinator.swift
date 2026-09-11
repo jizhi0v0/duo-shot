@@ -147,8 +147,15 @@ final class CaptureCoordinator {
         let frozen = Preferences.shared.freezesScreen ? photographs : [:]
 
         let windowsAtPhotographTime = engine.shareableContent.windows
+        // Also before the overlay, for the same reason as the photograph: a
+        // tooltip is dismissed the moment the overlay covers the pointer, and a
+        // window capture is meant to hold what was on screen when you pressed
+        // the key. See `WindowRecovery.adornments`.
+        let adornments = await engine.captureAdornments(
+            among: windowsAtPhotographTime, excluding: additionalExcludedWindowIDs())
         let recovery = WindowRecovery(
-            frames: photographs, windowsFrontToBack: windowsAtPhotographTime)
+            frames: photographs, windowsFrontToBack: windowsAtPhotographTime,
+            adornments: adornments)
 
         let outcome = await overlay.present(windows: windowsAtPhotographTime, frozen: frozen)
         let delay = Preferences.shared.captureDelaySeconds
