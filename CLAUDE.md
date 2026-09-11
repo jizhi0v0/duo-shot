@@ -45,6 +45,13 @@ make install       # replace /Applications/DuoShot.app AND restart it
   tree (`NSGlassEffectView.effectIsInteractive`,
   `SCRecordingOutputConfiguration.mixesAudioWithMicrophone`) are written that
   way, and each says in a comment what is lost when the block is compiled out.
+- `make check-26` catches more than missing symbols. On 2026-09-11 it stopped a
+  push over a self-test helper that called a closure parameter from inside
+  another closure (`(0..<n).first { match(…) }`): Swift 6.3.3 on the 26 SDK
+  rejects that as "sending … risks causing data races", and the newer compiler
+  accepts it. From the newest-SDK machine, run it before every push, and on
+  every unpushed commit rather than only the tip — a fix folded in later still
+  leaves the commits before it uncompilable.
 
 ## Concurrency
 
@@ -72,6 +79,11 @@ in `make test`. Conventions that are load-bearing:
   BROKEN. Hold new checks to the same standard: before you believe a green one,
   revert the fix and watch it go red. This is the single highest-value habit in
   this repo, and skipping it is how eighty green checks came to prove nothing.
+- **Assert where, not only how big.** `PixelCompare.opaqueBounds` mirrored y for
+  as long as it existed, and `transparentBorderIsTrimmed`, which checked only the
+  size of the trimmed result, passed throughout — while `trimmed` kept 44640 of
+  its own fixture's 86400 ink pixels. A check on a crop, a rect or a composite
+  asserts position, or which pixels survived, and not just dimensions.
 - **UI wiring must be exercised, not inspected.** A hit-testing bug made the
   Redact button dead while every geometry assertion about it passed. Use the
   synthesized-event helpers (`click`, `drag`, `press`) and assert on the
@@ -89,11 +101,27 @@ in `make test`. Conventions that are load-bearing:
   `NSCell.trackMouse(…untilMouseUp:)` — it pulls from an event queue no
   synthesized mouse-up is ever posted to. Use `hitTest` to prove the button is
   reachable and `performClick(nil)` to fire it (`--selftest-delete` does).
+- A fixture that counts a colour builds it with `CGColor(srgbRed:…)`.
+  `CGColor(red:green:blue:alpha:)` is generic RGB, and its magenta lands in an
+  sRGB context as (255, 64, 255) — enough to fail a colour test for reasons that
+  have nothing to do with the code under it.
+- **Run the suite on the mini by default.** `make test` takes over the screen
+  for minutes, and the maintainer works at the newest-SDK machine; `make test-mini` builds
+  and signs there and runs on the mini. For a single check there is no target: `make verify` —
+  and confirm it *succeeded*, because a failed build leaves the previous bundle
+  in `build/` and shipping that tests the wrong code — then `ditto -c -k
+  --keepParent build/DuoShot.app`, scp, `ditto -x -k` and `codesign --verify
+  --strict` on the mini, and the flag over ssh. Only what needs the maintainer's real desktop
+  (their Dock, a real app's tooltip) belongs on their machine, done by them. The
+  mini's Dock is always visible, which makes it the only place the real
+  Dock-capture checks run.
 - **Some checks are red on the mini at pristine HEAD, and *which* ones drifts.**
   Measured three times: 2026-08-05 `rect pipeline` / `selection loupe` /
   `freeze mode` / `scroll capture flow`; 2026-08-09 only `sourceRect semantics`;
   2026-08-12 `faded window` / `occluded recovery` / `scroll capture flow`, plus
-  `edit menu (paste)` INCONCLUSIVE. Almost no overlap between the three.
+  `edit menu (paste)` INCONCLUSIVE. Almost no overlap between the three. On
+  2026-09-11 it drifted within one afternoon: `scroll capture flow` passed
+  several full runs, then failed 2/2 — and failed identically at HEAD.
   So **never attribute a red on the mini to your change, and never clear one
   either, without diffing against a detached-HEAD worktree in the same session**
   — `git worktree add <dir> --detach HEAD` then `make test-mini
@@ -125,7 +153,12 @@ in `make test`. Conventions that are load-bearing:
   taken as a region shows the terminal through the glass. Do not go looking for
   the API that fixes this. The escape hatch is region capture, and it costs the
   rounded corners and the transparent surround, and puts whatever is behind the
-  window into the file.
+  window into the file — unless the window's own shape is at hand. The Dock is
+  captured as a region and then cut to the alpha of its window captured alone
+  at the same instant (`CaptureEngine.shaped`), which keeps the real glass *and*
+  the outline. The check for it compares colour with the flat isolated capture:
+  59.2 apart on the mini's Dock (channel means, summed), 0 when the cut is fed
+  its own flat pixels.
 - **A probe with nothing distinctive behind the window is blind to all of the
   above.** Two captures of a dark panel over an ordinary desktop look the same
   and are not; that reading is what put a wrong "no difference here" in front of
@@ -144,6 +177,32 @@ in `make test`. Conventions that are load-bearing:
   setting them to the picked window's size. SCK grows the region to the group and
   fits it into whatever size it is given, so asking for the window's size returns
   the group squeezed into it under a point size that lies. See `captureGroup`.
+- **A window can have something stacked on it that is not in its group.** A
+  tooltip is its own window — Duo Updater's sits at layer 103 over a panel at
+  101 — and `includeChildWindows` and `screencapture -l` both leave it out. The
+  capture composites it anyway (`CaptureEngine.adornments`): same app, in
+  front, a *strictly higher* layer, overlapping, and too small for the picker to
+  offer on its own. Each condition is load-bearing. Same layer is Finder and
+  Mail windows piled on each other; the size test is what tells a tooltip from
+  `--selftest-occluded-recovery`'s occluder, which has a tooltip's layers
+  exactly and was composited into the capture it exists to stay out of. The
+  picker's outline grows by the same set, so it matches the file.
+- **The overlay dismisses things.** Duo Updater's tooltip was gone within 0.75 s
+  of the overlay appearing, and an auto-hidden Dock retracts once the pointer
+  leaves it — three of four Dock picks photographed whatever was behind it. The
+  file is what was on screen when the shortcut fired, so those are taken before
+  the overlay goes up: `WindowRecovery.adornments` for a tooltip, the pre-overlay
+  photograph for a region-captured window (`captureStrip`). The instant window
+  shortcut opens no overlay and stays live.
+- **An auto-hidden Dock reserves nothing out of `visibleFrame`**, hidden and
+  revealed alike, so the Dock is located from its own window's pixels
+  (`ShareableContentCache.dockShape`) for every Dock — the strip an
+  always-visible one reserves was 11 pt short of what it draws, and is only the
+  fallback now.
+- **`opaqueBounds` rounds out; `tightBounds` does not.** A cell or two of slack
+  on a downscale is the right error for trimming a window and the wrong one for
+  a rect that is also an outline on screen or the size of a file: it came out
+  as 12 pt of nothing around the Dock, in the outline and in the picture alike.
 
 ## The image editor
 
@@ -222,7 +281,11 @@ The rules that are easy to break from either side:
 
 The maintainer reports UI bugs in Chinese, with screenshots and screen recordings, saved
 in the folder named by the `saveDirectory` preference. Those files are evidence.
-Read their pixels.
+Read their pixels. DuoShot's own `Log.capture` lines are the other half — read
+them with `/usr/bin/log show --predicate 'subsystem == "com.boli.duoshot"'`. A
+bare `log` in zsh is a shell builtin and prints nothing useful, which reads
+exactly like "the app logged nothing"; it cost several rounds of empty reads
+before anyone looked.
 
 **The trigger: the second time the same symptom is reported, stop changing
 code.** "依旧如此" / "还是会" means the mechanism model is wrong, not that the fix
