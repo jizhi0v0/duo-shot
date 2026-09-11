@@ -9,6 +9,9 @@ import AppKit
 final class WindowPickerModel {
     private(set) var windows: [WindowInfo] = []
     private(set) var hovered: WindowInfo?
+    /// Everything `load` was given, pickable or not, front to back — the outline
+    /// needs the windows the picker turns away (`hoveredFrameInAppKitGlobal`).
+    private var candidates: [WindowInfo] = []
 
     var onChange: (() -> Void)?
 
@@ -167,6 +170,7 @@ final class WindowPickerModel {
     /// timer can skip the redraw — and the logging — when nothing moved.
     @discardableResult
     func load(_ candidates: [WindowInfo]) -> Bool {
+        self.candidates = candidates
         let previous = windows.map(\.id)
         let hosts = shadowHostIDs(among: candidates.filter { rejectionReason(for: $0) == nil })
         windows = candidates.filter {
@@ -247,9 +251,22 @@ final class WindowPickerModel {
         onChange?()
     }
 
-    /// The hovered window's frame in **AppKit global** points, for drawing.
+    /// The hovered window's frame in **AppKit global** points, for drawing —
+    /// grown by whatever its app has raised over it, because the capture
+    /// composites those in (`CaptureEngine.adornments`), and an outline smaller
+    /// than the file is a selection that misleads. Reported 2026-09-11 as
+    /// "是预览时的窗口范围，截图是有的": Duo Updater's tooltip was in the file and
+    /// not in the outline around the panel.
+    ///
+    /// Against the list the overlay opened with, not the pickable one: a tooltip
+    /// is exactly what the picker filters out, and by now the overlay may have
+    /// dismissed it — the capture takes it from before then too.
     var hoveredFrameInAppKitGlobal: CGRect? {
-        hovered.map { DisplayGeometry.flipped($0.pickFrame) }
+        hovered.map { window in
+            let over = CaptureEngine.adornments(
+                of: window, in: candidates, excluding: excludedWindowIDs)
+            return DisplayGeometry.flipped(over.reduce(window.pickFrame) { $0.union($1.frame) })
+        }
     }
 
     func reset() {

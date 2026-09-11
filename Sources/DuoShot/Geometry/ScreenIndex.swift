@@ -61,6 +61,32 @@ enum ScreenIndex {
         return nil
     }
 
+    /// The Dock's strip read off where its own window has pixels, for an
+    /// auto-hidden Dock that has been revealed: it reserves nothing out of
+    /// `visibleFrame`, so `dockStripInCGGlobal` cannot see it.
+    ///
+    /// Measured 2026-09-11, Dock at the bottom with auto-hide on:
+    /// `visibleFrame` was (0,0 1728x1083) hidden and revealed alike. An
+    /// isolated capture of the Dock's full-screen window, taken once the reveal
+    /// had settled, had pixels at (82,1022 1563x90) — the strip a display
+    /// capture of the same instant showed, to a couple of points. Taken the
+    /// instant the window appeared, the same capture put them at
+    /// (30,480 1667x203), mid-screen: the reveal is animated, and its first
+    /// frames are not where the Dock ends up.
+    ///
+    /// So the drawn rect is believed only against an edge a Dock can live on,
+    /// lying along it — wider than tall at the bottom, taller than wide at the
+    /// left or right. A Dock floats a few points off its edge (5 pt here),
+    /// hence the reach. Anything else is nil, which is what the picker already
+    /// does with a Dock it cannot place. All rects CG global.
+    nonisolated static func dockStrip(drawn: CGRect, in screen: CGRect) -> CGRect? {
+        let reach: CGFloat = 16
+        let bottom = drawn.width > drawn.height && screen.maxY - drawn.maxY <= reach
+        let left = drawn.height > drawn.width && drawn.minX - screen.minX <= reach
+        let right = drawn.height > drawn.width && screen.maxX - drawn.maxX <= reach
+        return bottom || left || right ? drawn : nil
+    }
+
     /// Describes a display for logging: both coordinate spaces plus the scale,
     /// because nearly every geometry bug is visible in this one line.
     static func describe(_ screen: NSScreen) -> String {

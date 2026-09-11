@@ -17,6 +17,34 @@ nonisolated enum WindowComposite {
         compose(layers, canvas: canvas, scale: scale)
     }
 
+    /// `image` kept only where `shape` has alpha — a region of the screen cut to
+    /// the outline of the window it holds (`CaptureEngine.shaped`). The shape is
+    /// drawn at the image's size, so a crop a pixel off still lines up.
+    @concurrent
+    static func masking(_ image: CGImage, to shape: CGImage) async -> CGImage? {
+        masked(image, to: shape)
+    }
+
+    static func masked(_ image: CGImage, to shape: CGImage) -> CGImage? {
+        let space = image.colorSpace.flatMap { $0.model == .rgb ? $0 : nil }
+            ?? CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil,
+            width: image.width,
+            height: image.height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: space,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        let rect = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        context.draw(shape, in: rect)
+        // Source-in: the image, scaled by the alpha already there — the shape's.
+        context.setBlendMode(.sourceIn)
+        context.draw(image, in: rect)
+        return context.makeImage()
+    }
+
     /// Returns nil only if the bitmap context cannot be created, which the caller
     /// treats as "keep the window without what was over it".
     static func compose(

@@ -36,9 +36,26 @@ nonisolated enum ImagePadding {
         by padding: CGFloat,
         scale: CGFloat,
         backdrop: CGImage?,
-        fallbackFill: CGColor
+        fallbackFill: CGColor,
+        bodyTop: Int = 0
     ) async -> CGImage? {
-        pad(image, by: padding, scale: scale, backdrop: backdrop, fallbackFill: fallbackFill)
+        pad(image, by: padding, scale: scale, backdrop: backdrop, fallbackFill: fallbackFill,
+            bodyTop: bodyTop)
+    }
+
+    /// The margin above the image, in pixels, when its top `bodyTop` rows are
+    /// something the window shows *above* its body — the Dock's name label —
+    /// rather than the body itself.
+    ///
+    /// Reported 2026-09-11 against a Dock capture with a label showing: "这个
+    /// tips 上方呢？这个空隙。我认为有点大". The margin was measured from the
+    /// label's top, which left 52 + 35 pt above the Dock beside the label
+    /// against 52 below it. So the margins are measured from the body, and the
+    /// label stands in the top one; a quarter of the margin is kept above it
+    /// whatever its height, so it never touches the edge of the card.
+    static func topInset(for inset: Int, bodyTop: Int) -> Int {
+        guard bodyTop > 0 else { return inset }
+        return max(inset - bodyTop, inset / 4)
     }
 
     /// Returns nil only if the bitmap context cannot be created, which the caller
@@ -48,13 +65,14 @@ nonisolated enum ImagePadding {
         by padding: CGFloat,
         scale: CGFloat,
         backdrop: CGImage?,
-        fallbackFill: CGColor
+        fallbackFill: CGColor,
+        bodyTop: Int = 0
     ) -> CGImage? {
         let inset = Int((padding * scale).rounded())
         guard inset > 0 else { return image }
 
         let width = image.width + inset * 2
-        let height = image.height + inset * 2
+        let height = image.height + inset + topInset(for: inset, bodyTop: bodyTop)
 
         // Fixed sRGB + premultipliedLast rather than deriving from the source:
         // a capture can arrive in a display P3 or an alpha-less layout, and
@@ -88,7 +106,10 @@ nonisolated enum ImagePadding {
         // narrower than along the sides — which is the price, and at half an
         // inset it is not a price anyone has noticed. A square window still gets
         // a square card.
-        let outerRadius = cornerRadius(of: image).map { $0 + CGFloat(inset) / 2 } ?? 0
+        // Read at the body's top row: with a label above it, the image's own top
+        // row is transparent until the bubble, and the card would lose its curve.
+        let outerRadius = cornerRadius(of: image, atRow: bodyTop)
+            .map { $0 + CGFloat(inset) / 2 } ?? 0
         if outerRadius > 0 {
             context.addPath(CGPath(
                 roundedRect: canvas, cornerWidth: outerRadius, cornerHeight: outerRadius,
@@ -142,7 +163,7 @@ nonisolated enum ImagePadding {
     /// Nil for a square window, and also for one whose top row stays transparent
     /// implausibly far in: a square card is a better answer than one wrapped
     /// around a radius that has nothing to do with the window.
-    static func cornerRadius(of image: CGImage) -> CGFloat? {
+    static func cornerRadius(of image: CGImage, atRow rowIndex: Int = 0) -> CGFloat? {
         let limit = min(image.width / 4, 256)
         guard limit > 1 else { return nil }
 
@@ -155,9 +176,10 @@ nonisolated enum ImagePadding {
                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
             ) else { return false }
             // One row tall, and the context is bottom-up, so the image is drawn
-            // with its top edge on that row and everything below it clipped away.
+            // with row `rowIndex` (from its top) on that row and the rest clipped
+            // away.
             context.draw(image, in: CGRect(
-                x: 0, y: 1 - CGFloat(image.height),
+                x: 0, y: 1 - CGFloat(image.height) + CGFloat(rowIndex),
                 width: CGFloat(image.width), height: CGFloat(image.height)))
             return true
         }

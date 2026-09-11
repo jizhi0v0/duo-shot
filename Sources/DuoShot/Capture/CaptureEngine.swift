@@ -248,7 +248,8 @@ final class CaptureEngine {
 
         var shot: WindowShot
         if let region = info?.visibleFrame {
-            shot = try await captureRegion(region, on: displayID, options: options)
+            shot = try await captureStrip(
+                region, of: windowID, on: displayID, options: options, recovery: recovery)
         } else {
             shot = try await captureIsolated(window, options: options)
         }
@@ -293,7 +294,7 @@ final class CaptureEngine {
 
         let (padded, pointSize) = await pad(
             shot.image, size: shot.pointSize, scale: shot.scale,
-            on: displayID, options: options)
+            on: displayID, options: options, bodyTop: shot.bodyTop)
         return CaptureResult(
             image: padded,
             pointSize: pointSize,
@@ -322,6 +323,10 @@ final class CaptureEngine {
         /// The windows `captureGroup` brought in with this one, so that
         /// `withAdornments` does not draw any of them a second time.
         var groupedWindowIDs: Set<CGWindowID> = []
+        /// Pixel rows at the top that the window shows above its body — the
+        /// Dock's name label — which the padding lets stand in its top margin
+        /// (`ImagePadding.topInset`). 0 for every ordinary window.
+        var bodyTop = 0
     }
 
     /// The speculative capture taken while the window was merely hovered, if it
@@ -893,7 +898,7 @@ final class CaptureEngine {
             \(Int(bounds.height / scale), privacy: .public) pt of drawn content
             """)
         // `opaqueBounds` is in image pixels with the origin at the **top** left
-        // (it flips on the way out, see its own comment), and so is a CG global
+        // (the same way round as the bitmap it scans), and so is a CG global
         // frame — so the offset carries across with no flip, only a divide.
         return WindowShot(
             image: cropped,
@@ -905,6 +910,82 @@ final class CaptureEngine {
                 width: bounds.width / scale,
                 height: bounds.height / scale),
             frameInCGGlobal: frame)
+    }
+
+    /// A window that is really a region of the screen — the Dock — as that
+    /// region: cut from the photograph taken when the shortcut fired, whenever
+    /// that photograph shows it, and live otherwise.
+    ///
+    /// Reported 2026-09-11 as "dock上面有一个进程名字的tip，然后截图不是dock本身了".
+    /// An auto-hidden Dock retracts once the pointer leaves it, and by the time
+    /// of the pick the pointer is over the overlay, often on the name label or
+    /// the slack around the strip rather than on the Dock. Measured the same
+    /// day: DuoShot's own hover captures of the Dock window came back blank from
+    /// 0.7 s after the overlay went up, and three of four picks photographed
+    /// whatever was behind the Dock. A window capture would at least come back
+    /// empty; a region capture cannot tell — the pixels are there, they are just
+    /// somebody else's.
+    ///
+    /// The photograph is from the instant the shortcut fired, which is also the
+    /// picture the user aimed at, and the Dock is taken from it whenever it was
+    /// on screen then. The instant window shortcut opens no overlay, has no
+    /// photograph and needs the pointer on the Dock to pick it, so it stays live
+    /// — and the Dock stays up for it.
+    func captureStrip(
+        _ region: CGRect, of windowID: CGWindowID, on displayID: CGDirectDisplayID,
+        options: CaptureOptions, recovery: WindowRecovery?
+    ) async throws -> WindowShot {
+        let shot: WindowShot
+        if let recovery, let frame = recovery.frames[displayID],
+           recovery.windowsFrontToBack.contains(where: { $0.id == windowID }),
+           let cut = frame.crop(toAppKitGlobal: DisplayGeometry.flipped(region)) {
+            Log.capture.notice("""
+                window \(windowID, privacy: .public) is a region of the screen; cut \
+                from the photograph taken when the shortcut fired
+                """)
+            shot = WindowShot(
+                image: cut.image, pointSize: cut.pointSize, scale: frame.scale,
+                coversInCGGlobal: region, frameInCGGlobal: region)
+        } else {
+            shot = try await captureRegion(region, on: displayID, options: options)
+        }
+        return await shaped(shot, of: windowID)
+    }
+
+    /// The strip cut to the outline of the window it holds, so a Dock capture
+    /// comes out as a Dock — rounded, with nothing around it — rather than as a
+    /// rectangle of whatever the Dock was standing in front of.
+    ///
+    /// Reported 2026-09-11 as "这个窗口截图，把背景截图进去了". The strip has to be
+    /// taken as a region or the glass goes flat (see `captureRegion`), and what
+    /// that cost was everything around the rounded platter and beside the name
+    /// label. The Dock's own window captured alone is flat but has exactly the
+    /// right shape — measured on one instant, 27% of its drawn box was alpha 0,
+    /// all of it outside the platter. So the region's pixels are kept where that
+    /// shape has alpha and nowhere else: the real glass, in the Dock's outline.
+    /// The shape is `ShareableContentCache.dockShape`, from the same refresh as
+    /// the photograph, so a label that has since come or gone leaves no outline
+    /// behind.
+    private func shaped(_ shot: WindowShot, of windowID: CGWindowID) async -> WindowShot {
+        guard let shape = content.dockShape, shape.id == windowID else { return shot }
+        let covers = shot.coversInCGGlobal
+        let pixels = CGRect(
+            x: (covers.minX - shape.frame.minX) * shape.scale,
+            y: (covers.minY - shape.frame.minY) * shape.scale,
+            width: covers.width * shape.scale, height: covers.height * shape.scale).integral
+        guard let cut = shape.image.cropping(to: pixels),
+              let image = await WindowComposite.masking(shot.image, to: cut)
+        else {
+            Log.capture.error("""
+                window \(windowID, privacy: .public): could not cut the strip to its \
+                outline; keeping the rectangle
+                """)
+            return shot
+        }
+        Log.capture.notice("window \(windowID, privacy: .public) cut to its own outline")
+        var outlined = trimmed(image, frame: covers, scale: shot.scale)
+        outlined.bodyTop = PixelCompare.bodyTop(outlined.image)
+        return outlined
     }
 
     /// Captures a window that is really a region of the screen, as that region.
@@ -951,7 +1032,7 @@ final class CaptureEngine {
     /// be a poor trade.
     private func pad(
         _ image: CGImage, size: CGSize, scale: CGFloat,
-        on displayID: CGDirectDisplayID, options: CaptureOptions
+        on displayID: CGDirectDisplayID, options: CaptureOptions, bodyTop: Int = 0
     ) async -> (CGImage, CGSize) {
         let padding = options.windowPadding
         guard padding > 0 else { return (image, size) }
@@ -959,13 +1040,17 @@ final class CaptureEngine {
         let backdrop = await wallpaper.image(for: displayID)
         guard let result = await ImagePadding.padded(
             image, by: padding, scale: scale, backdrop: backdrop,
-            fallbackFill: NSColor.windowBackgroundColor.cgColor)
+            fallbackFill: NSColor.windowBackgroundColor.cgColor, bodyTop: bodyTop)
         else {
             Log.capture.error("padding failed; falling back to the unpadded capture")
             return (image, size)
         }
+        // The top margin is its own number when a label stands in it — see
+        // `ImagePadding.topInset`. Equal to `padding` for every other window.
+        let inset = Int((padding * scale).rounded())
+        let top = CGFloat(ImagePadding.topInset(for: inset, bodyTop: bodyTop)) / scale
         return (result, CGSize(width: size.width + padding * 2,
-                               height: size.height + padding * 2))
+                               height: size.height + padding + top))
     }
 
     // MARK: - Filter / configuration

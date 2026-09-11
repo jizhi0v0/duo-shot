@@ -2906,6 +2906,10 @@ enum SelfTest {
         settings.close()
 
         let furnitureOK = try await systemFurnitureIsPickable(coordinator, all)
+        let dockPixelsOK = dockStripFromPixels()
+        let stripPhotoOK = try await stripComesFromThePhotograph()
+        let outlineOK = outlineCoversAdornments()
+        let maskOK = maskKeepsOnlyTheShape()
         let opacityOK = try await invisibleWindowsAreNotPickable(coordinator)
         let popupOK = try await popupPanelsArePickable(coordinator)
         let (clickAdoptsOK, dragOverridesOK) = try await mergedGestures(coordinator, all)
@@ -2917,6 +2921,7 @@ enum SelfTest {
         let adornedOK = try await adornmentsAreComposited()
         let emptyParentOK = try await emptyParentCapturesItsChild()
         let trimOK = try await transparentBorderIsTrimmed()
+        let boundsOK = opaqueBoundsIsWhereTheInkIs() && tightBoundsHugTheInk()
         let popupSurvivalOK = try await overlayDoesNotDismissPopups(coordinator, all)
         let frozenPickerOK = try await frozenPickerIgnoresLateWindows(coordinator)
         let shadowHostOK = try await shadowHostsAreNotOffered(coordinator)
@@ -2996,7 +3001,7 @@ enum SelfTest {
         menuBarOK = menuBarOK && wallpaperOK
 
         let shadowOK = paddingCastsAShadow()
-        let cardOK = paddingFollowsTheWindowCurve()
+        let cardOK = paddingFollowsTheWindowCurve() && paddingMeasuresFromTheBody()
 
         // Child windows (sheets) change the captured bounds when included.
         for includeChildren in [true, false] {
@@ -3013,11 +3018,11 @@ enum SelfTest {
         let pass = selfLeaked == 0 && hits == tested && tested > 0 && geometryOK && suppressionOK
             && clickAdoptsOK && dragOverridesOK && instantOK
             && inversions.isEmpty && frontmostOK && recoveredOK && appearedOK && paddingOK
-            && childOK && stackedOK && adornedOK && emptyParentOK && trimOK && popupSurvivalOK && frozenPickerOK && shadowHostOK
+            && childOK && stackedOK && adornedOK && emptyParentOK && trimOK && boundsOK && popupSurvivalOK && frozenPickerOK && shadowHostOK
             && shadowOK && ownWindowOK
             && cardOK
             && menuBarOK
-            && furnitureOK && opacityOK
+            && furnitureOK && dockPixelsOK && stripPhotoOK && outlineOK && maskOK && opacityOK
             && popupOK
         print("result:        \(pass ? "PASS" : "FAIL")")
         return pass ? 0 : 1
@@ -3441,6 +3446,168 @@ enum SelfTest {
         }
     }
 
+    /// The picker's outline covers what the capture will composite over the
+    /// window, and nothing it will not.
+    ///
+    /// Reported 2026-09-11 as "是预览时的窗口范围，截图是有的": Duo Updater's
+    /// tooltip was in the file and not in the outline drawn around the panel.
+    /// Pure: Duo Updater's two windows as measured, plus the two that must stay
+    /// out — each placed so that including it would move an edge.
+    private static func outlineCoversAdornments() -> Bool {
+        func info(
+            _ id: CGWindowID, _ frame: CGRect, layer: Int, bundle: String = "com.duoupdater.app"
+        ) -> WindowInfo {
+            WindowInfo(
+                id: id, frame: frame, title: nil, appName: bundle, bundleID: bundle,
+                layer: layer, isOnScreen: true, alpha: 1, visibleFrame: nil)
+        }
+        let panel = info(9001, CGRect(x: 1257, y: 35, width: 370, height: 562), layer: 101)
+        let tip = info(9002, CGRect(x: 1419, y: 181, width: 308, height: 21), layer: 103)
+        // Same app and layer, in front and overlapping, past the panel's left edge.
+        let sibling = info(9003, CGRect(x: 1100, y: 300, width: 300, height: 200), layer: 101)
+        // Tip-shaped and in front, but another app's, past the panel's bottom edge.
+        let stranger = info(
+            9004, CGRect(x: 1300, y: 590, width: 200, height: 20), layer: 103, bundle: "other.app")
+
+        let picker = WindowPickerModel()
+        picker.load([tip, stranger, sibling, panel])
+        picker.updateHover(atAppKitGlobal: DisplayGeometry.flipped(CGPoint(x: 1500, y: 100)))
+        let outline = picker.hoveredFrameInAppKitGlobal.map { DisplayGeometry.flipped($0) }
+        let expected = panel.frame.union(tip.frame)
+        let ok = picker.hovered?.id == panel.id && outline == expected
+        print("outline:       hovered \(picker.hovered.map { "\($0.id)" } ?? "nothing"), "
+            + "outline \(outline.map(rectString) ?? "nil") "
+            + "(expected \(rectString(expected))) -> \(ok ? "OK" : "FAIL")")
+        return ok
+    }
+
+    /// `WindowComposite.masked` keeps an image exactly where a shape has alpha.
+    /// Synthetic: a magenta field and a rounded rect, the Dock's outline in
+    /// miniature. The corner must come back transparent and the inside magenta.
+    private static func maskKeepsOnlyTheShape() -> Bool {
+        let w = 400, h = 200
+        func canvas(_ draw: (CGContext) -> Void) -> CGImage? {
+            guard let context = CGContext(
+                data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            else { return nil }
+            draw(context)
+            return context.makeImage()
+        }
+        guard let field = canvas({
+                  $0.setFillColor(CGColor(srgbRed: 1, green: 0, blue: 1, alpha: 1))
+                  $0.fill(CGRect(x: 0, y: 0, width: w, height: h))
+              }),
+              let shape = canvas({
+                  $0.setFillColor(CGColor(srgbRed: 0.2, green: 0.2, blue: 0.2, alpha: 1))
+                  $0.addPath(CGPath(
+                      roundedRect: CGRect(x: 0, y: 0, width: w, height: h),
+                      cornerWidth: 40, cornerHeight: 40, transform: nil))
+                  $0.fillPath()
+              }),
+              let out = WindowComposite.masked(field, to: shape)
+        else { return false }
+        let corner = PixelCompare.alpha(out, atX: 2, y: 2) ?? 255
+        let inside = PixelCompare.count(out) { r, g, b in r > 230 && g < 30 && b > 230 }
+        // The rounded rect's area; antialiased edge pixels come in a little under.
+        let area = Double(w * h) - (4 - Double.pi) * 40 * 40
+        let ok = corner == 0 && Double(inside) > area * 0.98 && Double(inside) <= area + 1
+        print("mask:          corner alpha \(corner), inside \(inside) px of ~\(Int(area)) "
+            + "-> \(ok ? "OK" : "FAIL")")
+        return ok
+    }
+
+    /// A window captured as a region of the screen — the Dock — comes from the
+    /// photograph taken when the shortcut fired, when there is one.
+    ///
+    /// An auto-hidden Dock retracts while the overlay is up, and a live region
+    /// capture at pick time then photographs whatever was behind it: three of
+    /// four picks on 2026-09-11. The Dock cannot be driven headless, so this
+    /// drives the branch — a fixture window stands in for it, a solid magenta
+    /// "photograph" for the screen. With the recovery the strip must be all
+    /// magenta and the region's size; without one, and for a window that
+    /// photograph never saw, it must be the live screen, with no magenta in it.
+    private static func stripComesFromThePhotograph() async throws -> Bool {
+        guard let screen = NSScreen.main, let displayID = ScreenIndex.displayID(of: screen) else {
+            print("region photo:  INCONCLUSIVE — no main display")
+            return true
+        }
+        let engine = CaptureEngine()
+        let stand = NSWindow(
+            contentRect: CGRect(x: 300, y: 300, width: 200, height: 120),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        stand.backgroundColor = .darkGray
+        stand.orderFrontRegardless()
+        defer { stand.orderOut(nil) }
+        try await Task.sleep(for: .milliseconds(300))
+        try await engine.refreshContent()
+
+        let scale = screen.backingScaleFactor
+        guard let context = CGContext(
+            data: nil, width: Int(screen.frame.width * scale), height: Int(screen.frame.height * scale),
+            bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return false }
+        // `srgbRed`, not `red:`: the latter is generic RGB, and its magenta lands
+        // in an sRGB context as (255, 64, 255) — measured, and enough to fail the
+        // colour test below for reasons that have nothing to do with the crop.
+        context.setFillColor(CGColor(srgbRed: 1, green: 0, blue: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: context.width, height: context.height))
+        guard let photo = context.makeImage() else { return false }
+        let recovery = WindowRecovery(
+            frames: [displayID: BackdropCache.Frame(image: photo, scale: scale, covers: screen.frame)],
+            windowsFrontToBack: engine.shareableContent.windows)
+
+        let region = CGRect(x: 100, y: 100, width: 300, height: 80)  // CG global
+        let id = CGWindowID(stand.windowNumber)
+        func magenta(_ shot: CaptureEngine.WindowShot) -> Int {
+            PixelCompare.count(shot.image) { r, g, b in r > 230 && g < 30 && b > 230 }
+        }
+        let photographed = try await engine.captureStrip(
+            region, of: id, on: displayID, options: .default, recovery: recovery)
+        let live = try await engine.captureStrip(
+            region, of: id, on: displayID, options: .default, recovery: nil)
+        let unseen = try await engine.captureStrip(
+            region, of: 0, on: displayID, options: .default, recovery: recovery)
+
+        let full = Int(region.width * region.height * scale * scale)
+        let ok = magenta(photographed) == full && photographed.pointSize == region.size
+            && magenta(live) == 0 && magenta(unseen) == 0
+        print("region photo:  from the photograph \(magenta(photographed))/\(full) px "
+            + "\(Int(photographed.pointSize.width))x\(Int(photographed.pointSize.height)) pt; "
+            + "live \(magenta(live)) px; window it never saw \(magenta(unseen)) px "
+            + "-> \(ok ? "OK" : "FAIL")")
+        return ok
+    }
+
+    /// Where an auto-hidden, revealed Dock is, read off its own pixels:
+    /// `ScreenIndex.dockStrip(drawn:in:)` against the rects measured on
+    /// 2026-09-11 (bottom Dock, 1728x1117 screen), plus what a side Dock and a
+    /// stray wide rect would give. Pure geometry — the reveal itself needs a
+    /// pointer at the screen edge, which no headless run has.
+    private static func dockStripFromPixels() -> Bool {
+        let screen = CGRect(x: 0, y: 0, width: 1728, height: 1117)
+        let cases: [(String, CGRect, Bool)] = [
+            ("settled", CGRect(x: 82, y: 1022, width: 1563, height: 90), true),
+            ("icon label shown", CGRect(x: 82, y: 987, width: 1563, height: 125), true),
+            ("mid-reveal", CGRect(x: 30, y: 480, width: 1667, height: 203), false),
+            ("left Dock", CGRect(x: 5, y: 200, width: 90, height: 700), true),
+            ("wide, mid-screen", CGRect(x: 0, y: 480, width: 1728, height: 90), false),
+        ]
+        var ok = true
+        for (name, drawn, accepted) in cases {
+            let got = ScreenIndex.dockStrip(drawn: drawn, in: screen) != nil
+            if got != accepted {
+                ok = false
+                print("dock pixels:   \(name) \(rectString(drawn)) accepted=\(got), "
+                    + "expected \(accepted)  MISMATCH")
+            }
+        }
+        print("dock pixels:   \(cases.count) drawn rects -> \(ok ? "OK" : "FAIL")")
+        return ok
+    }
+
     private static func systemFurnitureIsPickable(
         _ coordinator: CaptureCoordinator, _ all: [WindowInfo]
     ) async throws -> Bool {
@@ -3482,27 +3649,133 @@ enum SelfTest {
         let result = try await coordinator.engine.capture(.window(dock.id))
         let expected = CGSize(width: (dock.pickFrame.width * result.scale).rounded(),
                               height: (dock.pickFrame.height * result.scale).rounded())
-        let sizeOK = result.pixelSize == expected
+        // No bigger than the strip: cut to the Dock's outline, it can only shrink.
+        let sizeOK = result.pixelSize.width <= expected.width + 1
+            && result.pixelSize.height <= expected.height + 1
+            && result.pixelSize.width > 0 && result.pixelSize.height > 0
 
-        // And it must have been taken against the desktop, not in isolation. The
-        // Dock is a glass surface: with nothing behind it to sample it falls back
-        // to a flat tint, which is what "why did the dock background disappear"
-        // was. The tell is the corners — the strip runs the full width while the
-        // dock itself is centred, so in an isolated capture the ends are empty
-        // and transparent, and in a region capture they are wallpaper.
+        // And it must still be the screen's pixels, not the Dock window's own.
+        // The Dock is a glass surface: with nothing behind it to sample it falls
+        // back to a flat tint, which is what "why did the dock background
+        // disappear" was. The file is cut to the Dock's outline now (`shaped`),
+        // so the old tell — wallpaper in the corners of the strip — is gone on
+        // purpose, and the corners must instead be *clear*: that is the
+        // background staying out ("把背景截图进去了"). The glass is told apart by
+        // colour, against the flat capture the outline was cut from.
         let corners = [
             (1, 1), (Int(result.pixelSize.width) - 2, 1),
             (1, Int(result.pixelSize.height) - 2),
             (Int(result.pixelSize.width) - 2, Int(result.pixelSize.height) - 2),
         ]
-        let opaqueCorners = corners.filter {
-            (PixelCompare.alpha(result.image, atX: $0.0, y: $0.1) ?? 0) > 250
+        let clearCorners = corners.filter {
+            (PixelCompare.alpha(result.image, atX: $0.0, y: $0.1) ?? 255) < 5
         }.count
-        let glassOK = opaqueCorners == corners.count
+        func meanOpaqueColour(_ image: CGImage) -> (r: Double, g: Double, b: Double)? {
+            let w = image.width, h = image.height
+            var px = [UInt8](repeating: 0, count: w * h * 4)
+            let drawn = px.withUnsafeMutableBytes { raw -> Bool in
+                guard let context = CGContext(
+                    data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8,
+                    bytesPerRow: w * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                else { return false }
+                context.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+                return true
+            }
+            guard drawn else { return nil }
+            var sum = (0.0, 0.0, 0.0), n = 0.0
+            for i in stride(from: 0, to: px.count, by: 4) where px[i + 3] == 255 {
+                sum.0 += Double(px[i]); sum.1 += Double(px[i + 1]); sum.2 += Double(px[i + 2]); n += 1
+            }
+            return n > 0 ? (sum.0 / n, sum.1 / n, sum.2 / n) : nil
+        }
+        let distance: Double? = coordinator.engine.shareableContent.dockShape
+            .flatMap { meanOpaqueColour($0.image) }
+            .flatMap { flat in meanOpaqueColour(result.image).map {
+                abs($0.r - flat.r) + abs($0.g - flat.g) + abs($0.b - flat.b) } }
+        // Measured 2026-09-11 on the mini's Dock: 59.2 (the three channel
+        // differences summed, /255 each) for the glass, against 0 for the flat
+        // capture by construction. A quarter of that gap; a wallpaper matching
+        // the Dock's own tint would read low, and would say so here rather than
+        // pass unseen.
+        let glassOK = (distance ?? 0) > 15
+        let outlineOK = clearCorners == corners.count
+        try? ImageEncoder.write(
+            result.image, to: URL(fileURLWithPath: "/tmp/duoshot-dock-capture.png"),
+            as: .png, scale: result.scale)
         print("dock capture:  \(Int(result.pixelSize.width))x\(Int(result.pixelSize.height)) px "
-            + "(expected \(Int(expected.width))x\(Int(expected.height))), "
-            + "\(opaqueCorners)/4 corners opaque -> \(sizeOK && glassOK ? "OK" : "FAIL")")
-        return ok && sizeOK && glassOK
+            + "(strip \(Int(expected.width))x\(Int(expected.height))), "
+            + "\(clearCorners)/4 corners clear, glass vs flat "
+            + "\(distance.map { String(format: "%.1f", $0) } ?? "n/a") "
+            + "-> \(sizeOK && outlineOK && glassOK ? "OK" : "FAIL")")
+        return ok && sizeOK && outlineOK && glassOK
+    }
+
+    /// A window that shows something above its body — the Dock's name label —
+    /// is padded from its body, with that something standing in the top margin.
+    ///
+    /// Reported 2026-09-11 against a Dock capture with a label showing: "这个
+    /// tips 上方呢？这个空隙。我认为有点大" — the margin was measured from the
+    /// label's top. Synthetic: a rounded magenta body with a blue label above
+    /// it, on a green fill. The body must start exactly one margin down, the
+    /// label must start `topInset` down, and the card must keep the body's curve.
+    private static func paddingMeasuresFromTheBody() -> Bool {
+        let w = 400, bodyH = 100, labelH = 30, inset = 52
+        guard let context = CGContext(
+            data: nil, width: w, height: bodyH + labelH, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return false }
+        context.setFillColor(CGColor(srgbRed: 1, green: 0, blue: 1, alpha: 1))
+        context.addPath(CGPath(
+            roundedRect: CGRect(x: 0, y: 0, width: w, height: bodyH),
+            cornerWidth: 20, cornerHeight: 20, transform: nil))
+        context.fillPath()
+        // Bottom-up: the label sits above the body.
+        context.setFillColor(CGColor(srgbRed: 0, green: 0, blue: 1, alpha: 1))
+        context.fill(CGRect(x: 170, y: bodyH, width: 60, height: labelH))
+        guard let image = context.makeImage() else { return false }
+
+        let bodyTop = PixelCompare.bodyTop(image)
+        guard let card = ImagePadding.pad(
+            image, by: CGFloat(inset), scale: 1, backdrop: nil,
+            fallbackFill: CGColor(srgbRed: 0, green: 1, blue: 0, alpha: 1), bodyTop: bodyTop)
+        else { return false }
+
+        let cw = card.width, ch = card.height
+        var px = [UInt8](repeating: 0, count: cw * ch * 4)
+        let drawn = px.withUnsafeMutableBytes { raw -> Bool in
+            guard let c = CGContext(
+                data: raw.baseAddress, width: cw, height: ch, bitsPerComponent: 8,
+                bytesPerRow: cw * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            else { return false }
+            c.draw(card, in: CGRect(x: 0, y: 0, width: cw, height: ch))
+            return true
+        }
+        guard drawn else { return false }
+        // First row from the top, in one column, of a colour. Memory is top-down.
+        // A loop, not `first(where:)`: calling `match` from inside another
+        // closure is a "sending ... risks data races" error on the 26 SDK's
+        // compiler (Swift 6.3.3), though the newer one accepts it.
+        func firstRow(x: Int, _ match: (UInt8, UInt8, UInt8) -> Bool) -> Int? {
+            for y in 0..<ch {
+                let i = (y * cw + x) * 4
+                if match(px[i], px[i + 1], px[i + 2]) { return y }
+            }
+            return nil
+        }
+        let top = ImagePadding.topInset(for: inset, bodyTop: bodyTop)
+        let labelAt = firstRow(x: inset + 200) { r, g, b in r < 30 && g < 30 && b > 230 }
+        let bodyAt = firstRow(x: inset + 60) { r, g, b in r > 230 && g < 30 && b > 230 }
+        let curve = ImagePadding.cornerRadius(of: image, atRow: bodyTop) ?? 0
+        let ok = bodyTop == labelH && top == inset - labelH
+            && ch == bodyH + labelH + inset + top
+            && labelAt == top && bodyAt == inset && curve > 0
+        print("body padding:  body from row \(bodyTop), top margin \(top) px, label at "
+            + "\(labelAt.map(String.init) ?? "none"), body at \(bodyAt.map(String.init) ?? "none") "
+            + "(expected \(inset)), curve \(Int(curve)) px -> \(ok ? "OK" : "FAIL")")
+        return ok
     }
 
     /// The padded card's corner radius tracks the window's own.
@@ -4527,6 +4800,113 @@ enum SelfTest {
         return survived
     }
 
+    /// `PixelCompare.opaqueBounds` says where the ink is, not only how big it is.
+    ///
+    /// Measured 2026-09-11, it did neither well. It mirrored y — a band drawn at
+    /// the bottom of an image came back at the top — because it flipped rows
+    /// that a bitmap context already stores top-down. And it overshot the far
+    /// edges, by multiplying a cell index by a scale rounded up first: 145 px
+    /// past the right edge of a 1700 px band. `transparentBorderIsTrimmed`
+    /// checked only the size and passed throughout, while `trimmed` cropped that
+    /// test's own fixture to 44640 of its 86400 ink pixels. Found through the
+    /// Dock: a revealed auto-hide Dock at the bottom was placed at y 0 and
+    /// turned away.
+    ///
+    /// Synthetic images, so the answer is exact. Each result must contain the
+    /// ink, sit no more than two and a half cells off it on any side (the slack
+    /// is deliberate, see `opaqueBounds`), and a crop to it must keep every ink
+    /// pixel.
+    private static func opaqueBoundsIsWhereTheInkIs() -> Bool {
+        func inked(_ image: CGImage) -> Int {
+            let w = image.width, h = image.height
+            var px = [UInt8](repeating: 0, count: w * h * 4)
+            let drawn = px.withUnsafeMutableBytes { raw -> Bool in
+                guard let context = CGContext(
+                    data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8,
+                    bytesPerRow: w * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                else { return false }
+                context.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+                return true
+            }
+            return drawn ? stride(from: 3, to: px.count, by: 4).filter { px[$0] > 0 }.count : -1
+        }
+
+        // Ink rects in top-left image pixels, the space `opaqueBounds` answers in.
+        let cases: [(String, Int, Int, CGRect)] = [
+            ("bottom band (the Dock)", 3456, 2234, CGRect(x: 164, y: 2044, width: 3126, height: 180)),
+            ("top band", 3456, 2234, CGRect(x: 164, y: 10, width: 3126, height: 180)),
+            ("left half", 3456, 2234, CGRect(x: 0, y: 0, width: 1700, height: 2234)),
+            ("trim fixture", 800, 600, CGRect(x: 80, y: 240, width: 360, height: 240)),
+        ]
+        var ok = true
+        for (name, w, h, ink) in cases {
+            guard let context = CGContext(
+                data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            else { return false }
+            context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
+            // The context draws bottom-up.
+            context.fill(CGRect(x: ink.minX, y: CGFloat(h) - ink.maxY,
+                                width: ink.width, height: ink.height))
+            guard let image = context.makeImage() else { return false }
+
+            let slack = 2.5 * (Double(max(w, h)) / 256).rounded(.up)
+            let bounds = PixelCompare.opaqueBounds(image)
+            let kept = bounds.flatMap { image.cropping(to: $0) }.map(inked) ?? 0
+            let total = inked(image)
+            let placed = bounds.map { b in
+                b.contains(ink)
+                    && ink.minX - b.minX <= slack && b.maxX - ink.maxX <= slack
+                    && ink.minY - b.minY <= slack && b.maxY - ink.maxY <= slack
+            } ?? false
+            let good = placed && kept == total
+            ok = ok && good
+            print("ink bounds:    \(name): ink \(rectString(ink)) -> "
+                + "\(bounds.map(rectString) ?? "nil"), crop keeps \(kept)/\(total) px"
+                + (good ? "" : "  MISPLACED"))
+        }
+        return ok
+    }
+
+    /// `PixelCompare.tightBounds` hugs the ink exactly — no slack at all.
+    ///
+    /// It exists because `opaqueBounds`' deliberate slack, harmless when
+    /// trimming a window, became visible once a rect was both an outline on
+    /// screen and the size of a file: the Dock's strip came out 1588x105.5 pt
+    /// around a 1563x90 pt platter. Synthetic ink on pixel boundaries, so the
+    /// answer is exact, and an empty image must say nil.
+    private static func tightBoundsHugTheInk() -> Bool {
+        let cases: [(String, Int, Int, CGRect?)] = [
+            ("bottom band (the Dock)", 3456, 2234, CGRect(x: 165, y: 2044, width: 3126, height: 180)),
+            ("top band", 3456, 2234, CGRect(x: 164, y: 10, width: 3126, height: 180)),
+            ("trim fixture", 800, 600, CGRect(x: 80, y: 240, width: 360, height: 240)),
+            ("nothing drawn", 800, 600, nil),
+        ]
+        var ok = true
+        for (name, w, h, ink) in cases {
+            guard let context = CGContext(
+                data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            else { return false }
+            if let ink {
+                context.setFillColor(CGColor(srgbRed: 1, green: 0, blue: 0, alpha: 1))
+                // The context draws bottom-up; `ink` is top-left.
+                context.fill(CGRect(x: ink.minX, y: CGFloat(h) - ink.maxY,
+                                    width: ink.width, height: ink.height))
+            }
+            guard let image = context.makeImage() else { return false }
+            let got = PixelCompare.tightBounds(image)
+            let good = got == ink
+            ok = ok && good
+            print("tight bounds:  \(name): ink \(ink.map(rectString) ?? "none") -> "
+                + "\(got.map(rectString) ?? "nil")\(good ? "" : "  MISMATCH")")
+        }
+        return ok
+    }
+
     /// A window capture must not frame a border the window never drew.
     ///
     /// Measured 2026-08-04 on DuoUpdater's popup: a 360×217 pt window with a
@@ -4576,10 +4956,17 @@ enum SelfTest {
             .window(CGWindowID(window.windowNumber)), options: .default)
         let off = max(abs(result.pointSize.width - ink.width),
                       abs(result.pointSize.height - ink.height))
-        let ok = off <= 6
+        // And the ink has to be *in* it. The size alone passed for as long as
+        // `opaqueBounds` mirrored y, while the crop kept about half the ink —
+        // the ink sits off-centre vertically here, 120 pt of border above it and
+        // 60 below, which is what made the mirror cut into it.
+        let orange = PixelCompare.count(result.image) { r, g, b in r > 200 && g > 90 && g < 200 && b < 80 }
+        let expected = Int(ink.width * ink.height * result.scale * result.scale)
+        let ok = off <= 6 && orange >= expected * 97 / 100
         print("trimmed border: \(Int(frame.width))x\(Int(frame.height)) pt window, "
             + "\(Int(ink.width))x\(Int(ink.height)) pt drawn -> "
-            + "\(Int(result.pointSize.width))x\(Int(result.pointSize.height)) pt "
+            + "\(Int(result.pointSize.width))x\(Int(result.pointSize.height)) pt, "
+            + "ink kept \(orange)/\(expected) px "
             + "\(ok ? "OK" : "MISMATCH")")
         return ok
     }

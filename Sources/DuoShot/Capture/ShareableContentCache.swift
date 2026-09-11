@@ -45,6 +45,16 @@ nonisolated struct WindowInfo: Sendable, Identifiable, Hashable {
     }
 }
 
+/// The Dock's window captured by itself — see
+/// `ShareableContentCache.captureDockShape(among:)`.
+struct DockShape {
+    let id: CGWindowID
+    let image: CGImage
+    let scale: CGFloat
+    /// CG global points: the Dock window's frame, which is the whole screen.
+    let frame: CGRect
+}
+
 /// Holds the live, non-Sendable SCK objects and never lets them escape.
 ///
 /// The rule this type exists to enforce:
@@ -59,17 +69,82 @@ final class ShareableContentCache {
     private(set) var windows: [WindowInfo] = []
     private var content: SCShareableContent?
     private var ownWindows: SCShareableContent?
+    /// The Dock as it was at the last refresh, alone, when its window was on
+    /// screen. See `captureDockShape(among:)`.
+    private(set) var dockShape: DockShape?
 
     func refresh(onScreenOnly: Bool = true) async throws {
         let fetched = try await SCKBridge.shareableContent(
             excludingDesktopWindows: true, onScreenWindowsOnly: onScreenOnly
         ).value
         content = fetched
-        let dockStrip = ScreenIndex.dockStripInCGGlobal()
+        dockShape = await captureDockShape(among: fetched.windows)
+        // The Dock's own pixels first, the strip it reserves only as the
+        // fallback: that strip is the full width of the screen, and an outline
+        // wider than what ends up in the file is exactly the mismatch to avoid.
+        let dockStrip = dockShape.flatMap { drawnDockStrip(from: $0) }
+            ?? ScreenIndex.dockStripInCGGlobal()
         let entries = WindowZOrder.entries()
         windows = WindowZOrder.sortedFrontToBack(
             fetched.windows.map { WindowInfo($0, dockStrip: dockStrip, entries: entries) },
             using: entries)
+    }
+
+    /// The Dock's window captured by itself, at the moment of the refresh —
+    /// which, for an interactive capture, is the moment the shortcut fired.
+    ///
+    /// Isolated on purpose, and only for the *shape*: the glass comes out flat
+    /// in it. Two uses: where a revealed auto-hide Dock is
+    /// (`drawnDockStrip(from:)`), and the outline a Dock capture is cut to
+    /// (`CaptureEngine.shaped`) — taken at the same instant as the photograph
+    /// that capture is cut from, so shape and pixels agree even about an icon's
+    /// name label, which comes and goes. Costs one capture per refresh while the
+    /// Dock's window is on screen; a hidden auto-hide Dock is not listed at all.
+    private func captureDockShape(among windows: [SCWindow]) async -> DockShape? {
+        guard let dock = windows.first(where: {
+            $0.owningApplication?.bundleIdentifier == WindowInfo.dockBundleID
+                && $0.windowLayer == WindowInfo.dockLayer && $0.isOnScreen
+        }) else { return nil }
+        let filter = SCContentFilter(desktopIndependentWindow: dock)
+        let scale = CGFloat(filter.pointPixelScale)
+        let configuration = SCScreenshotConfiguration()
+        let (width, height) = DisplayGeometry.pixelSize(of: filter.contentRect, scale: scale)
+        configuration.width = width
+        configuration.height = height
+        configuration.showsCursor = false
+        configuration.ignoreShadows = true
+        guard let image = try? await SCKBridge.captureScreenshot(
+                  filter: filter, configuration: configuration).image,
+              !PixelCompare.isBlank(image)
+        else { return nil }
+        return DockShape(id: dock.windowID, image: image, scale: scale, frame: dock.frame)
+    }
+
+    /// Where the Dock is, from its own pixels — see
+    /// `ScreenIndex.dockStrip(drawn:in:)`. The only answer for a revealed
+    /// auto-hide Dock, which reserves no strip, and the better one for any Dock:
+    /// this rect is both the outline the picker draws and the size of the file.
+    ///
+    /// `tightBounds`, not `opaqueBounds`. Reported 2026-09-11 as "实际框的大小和
+    /// 图片的会有点不一致": `opaqueBounds` rounds out by a cell or two on a
+    /// downscale, and measured on the Dock that was 1588x105.5 pt around a
+    /// platter of 1563x90 — 12 pt of nothing on each side, in the outline and
+    /// in the file alike. The platter itself is the same at alpha > 0 as at
+    /// alpha > 200 (to a point), so there is no halo to allow for.
+    private func drawnDockStrip(from shape: DockShape) -> CGRect? {
+        guard let bounds = PixelCompare.tightBounds(shape.image) else { return nil }
+        let scale = shape.scale
+        // `tightBounds` is top-left pixels, like CG global — a divide, no flip.
+        let drawn = CGRect(
+            x: shape.frame.minX + bounds.minX / scale, y: shape.frame.minY + bounds.minY / scale,
+            width: bounds.width / scale, height: bounds.height / scale)
+        let strip = ScreenIndex.dockStrip(drawn: drawn, in: shape.frame)
+        Log.capture.notice("""
+            Dock drawn at \(Int(drawn.minX), privacy: .public),\(Int(drawn.minY), privacy: .public) \
+            \(Int(drawn.width), privacy: .public)x\(Int(drawn.height), privacy: .public) pt: \
+            \(strip == nil ? "not against an edge, not offered" : "offered as its strip", privacy: .public)
+            """)
+        return strip
     }
 
     func scWindow(for id: CGWindowID) -> SCWindow? {

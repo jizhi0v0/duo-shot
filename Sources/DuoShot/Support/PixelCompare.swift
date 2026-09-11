@@ -282,6 +282,79 @@ enum PixelCompare {
     /// Measured on a downscale, and rounded **outward** — a capture can be 15
     /// megapixels and this runs on the main thread. The error is therefore
     /// always a few leftover transparent pixels, never a cropped glyph.
+    /// The first row, from the top, at which an image is opaque across at least
+    /// half its width: where a window's body begins, below anything it shows
+    /// above itself — the Dock's name label. 0 when the first row already
+    /// qualifies, or when no row does, which is every ordinary window.
+    nonisolated static func bodyTop(_ image: CGImage) -> Int {
+        let width = image.width, height = image.height
+        guard width > 0, height > 0 else { return 0 }
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let drawn = pixels.withUnsafeMutableBytes { raw -> Bool in
+            guard let context = CGContext(
+                data: raw.baseAddress,
+                width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return false }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard drawn else { return 0 }
+        // Rows are top-down in memory, the same way round as the image.
+        for y in 0..<height {
+            var opaque = 0
+            for x in 0..<width where pixels[(y * width + x) * 4 + 3] > 200 { opaque += 1 }
+            if opaque * 2 >= width { return y }
+        }
+        return 0
+    }
+
+    /// `opaqueBounds`, made exact: its coarse rect is scanned again at full
+    /// resolution, so the result hugs the drawn pixels instead of carrying up to
+    /// two cells of slack on every side. In image pixels, origin top left; nil
+    /// when nothing is drawn.
+    ///
+    /// For a rect someone is shown and then compares with the file — the
+    /// Dock's strip, where `opaqueBounds`' slack came out as 12 pt of nothing
+    /// on each side of the outline and of the picture (2026-09-11). Only the
+    /// coarse rect is rescanned, so this is a few milliseconds, not a pass over
+    /// the whole screen.
+    nonisolated static func tightBounds(_ image: CGImage) -> CGRect? {
+        let coarse = opaqueBounds(image)
+            ?? CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        guard let crop = image.cropping(to: coarse) else { return nil }
+        let width = crop.width, height = crop.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let drawn = pixels.withUnsafeMutableBytes { raw -> Bool in
+            guard let context = CGContext(
+                data: raw.baseAddress,
+                width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return false }
+            context.draw(crop, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard drawn else { return nil }
+
+        var minX = width, maxX = -1, minY = height, maxY = -1
+        for y in 0..<height {
+            for x in 0..<width where pixels[(y * width + x) * 4 + 3] > 0 {
+                minX = min(minX, x); maxX = max(maxX, x)
+                minY = min(minY, y); maxY = max(maxY, y)
+            }
+        }
+        guard maxX >= 0 else { return nil }
+        // Rows are top-down in memory, the same way round as the image — see
+        // `opaqueBounds`.
+        return CGRect(
+            x: coarse.minX + CGFloat(minX), y: coarse.minY + CGFloat(minY),
+            width: CGFloat(maxX - minX + 1), height: CGFloat(maxY - minY + 1))
+    }
+
     nonisolated static func opaqueBounds(_ image: CGImage) -> CGRect? {
         let long = max(image.width, image.height)
         guard long > 0 else { return nil }
@@ -313,16 +386,23 @@ enum PixelCompare {
         }
         guard maxX >= 0 else { return nil }
 
-        // One cell of slack on every side, then back to image pixels. The
-        // context is bottom-up, so the y range flips on the way out.
+        // One cell of slack on every side, then back to image pixels.
+        //
+        // **No flip.** The context *draws* bottom-up, but its memory holds rows
+        // top-down — row 0 is the top of the image — which is the same way round
+        // as the result. This used to flip them anyway, and so mirrored y: a band
+        // at the bottom of an image came back at the top (2026-09-11, found
+        // through the Dock). And the far edges multiply the *product* up, not the
+        // scale: rounding a 14.05 scale to 15 before multiplying put the right
+        // edge of a 1700 px band 145 px out. `--selftest-window`'s "ink bounds"
+        // pins both.
         let scaleX = Double(image.width) / Double(width)
         let scaleY = Double(image.height) / Double(height)
         let left = max(0, Int((Double(minX) - 1) * scaleX))
-        let right = min(image.width, Int((Double(maxX) + 2) * scaleX.rounded(.up)))
-        let bottom = max(0, Int((Double(minY) - 1) * scaleY))
-        let top = min(image.height, Int((Double(maxY) + 2) * scaleY.rounded(.up)))
-        let rect = CGRect(x: left, y: image.height - top,
-                          width: right - left, height: top - bottom)
+        let right = min(image.width, Int(((Double(maxX) + 2) * scaleX).rounded(.up)))
+        let top = max(0, Int((Double(minY) - 1) * scaleY))
+        let bottom = min(image.height, Int(((Double(maxY) + 2) * scaleY).rounded(.up)))
+        let rect = CGRect(x: left, y: top, width: right - left, height: bottom - top)
         guard rect.width >= 1, rect.height >= 1,
               rect != CGRect(x: 0, y: 0, width: image.width, height: image.height)
         else { return nil }
