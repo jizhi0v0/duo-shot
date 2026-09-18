@@ -54,8 +54,12 @@ final class VideoTrimEditor: NSView {
         playerView.controlsStyle = .inline
         playerView.videoGravity = .resizeAspect
         playerView.showsFullScreenToggleButton = true
-        playerView.frame = bounds
-        playerView.autoresizingMask = [.width, .height]
+        // No autoresizing mask: the player is one of two bands now and `layout()`
+        // is the only thing entitled to say how tall it is. A `.height` mask
+        // would stretch it back over the band on the first window resize.
+        playerView.frame = CGRect(
+            x: 0, y: 0, width: frame.width,
+            height: max(0, frame.height - Self.chromeHeight))
         addSubview(playerView)
 
         bar.onTrim = { [weak self] in self?.beginTrimming() }
@@ -76,23 +80,72 @@ final class VideoTrimEditor: NSView {
     private static let barInset: CGFloat = 14
     private static let noticeGap: CGFloat = 8
 
-    /// The bar sits at the **top**, where the still viewer's sits at the bottom.
-    /// Not a stylistic difference: the bottom of a recording is the transport
-    /// controls, and a pill parked over the scrubber would be over the one part
-    /// of the window that has to stay clickable.
+    /// The band above the picture that the bar lives in, and the height the
+    /// window has to be built taller than the video because of it.
+    ///
+    /// The bar used to float over the top of the player, on the reasoning that
+    /// the *bottom* of a recording is the transport controls and a pill parked
+    /// over the scrubber would cover the one part of the window that has to stay
+    /// clickable. That reasoning was right and incomplete: since macOS 26 the
+    /// `.inline` controls are not one bottom strip but three pieces of glass,
+    /// and two of them are in the top corners. Measured on 27.0 with a 360x336
+    /// player, in the player's own coordinates:
+    ///
+    ///     transport            x   6..354   y   6..42
+    ///     full screen, AirPlay x   6.. 77   y 294..330
+    ///     volume               x 153..354   y 294..330
+    ///
+    /// A 163-point bar centred at `y = 282..322` therefore ran 109 points into
+    /// the volume glass and 28 points down through it — which is what
+    /// 播放控件和操作区域重叠 was. It only misses when the window is wider than
+    /// 577 points, so every arithmetic assertion taken on a full-size viewer was
+    /// green while a small recording was unusable.
+    ///
+    /// So the bar comes out of the player altogether, the same move
+    /// `ImageEditor` made for the same reason: a permanent bar over the content
+    /// is a permanent hole in the content. Unlike the editor there is no second
+    /// band below — nothing here ever leaves a small picture floating in a large
+    /// window, because the video is scaled to fill whatever the player is given.
+    static let chromeHeight: CGFloat = barInset * 2 + HUDMetrics.height
+
+    /// How wide the window has to be for the bar to fit inside the band.
+    ///
+    /// Measured from a real bar rather than typed out, for the reason
+    /// `ImageEditor.minimumContentWidth` gives: a number beside the bar goes
+    /// stale the first time the bar grows a control.
+    static let minimumContentWidth: CGFloat = TrimBar().fittingSize.width
+        + barInset * 2 + 24
+
+    /// How far into the player AVKit's own chrome reaches from either edge — the
+    /// 36-point glass plus the 6 points it is inset by, from the table above.
+    /// Only the notice needs it: the bar is out of the player now, but the
+    /// notice still hangs over the picture and would otherwise land on the
+    /// full-screen and volume controls it is meant to sit under.
+    private static let playerChromeInset: CGFloat = 42
+
+    /// Two bands, top to bottom: the bar, and the player.
     override func layout() {
         super.layout()
-        playerView.frame = bounds
+        playerView.frame = CGRect(
+            x: 0, y: 0, width: bounds.width,
+            height: max(0, bounds.height - Self.chromeHeight))
+
         let barSize = bar.fittingSize
         bar.frame = CGRect(
             x: ((bounds.width - barSize.width) / 2).rounded(),
             y: bounds.height - barSize.height - Self.barInset,
             width: barSize.width, height: barSize.height)
+
         guard !notice.isHidden else { return }
+        // Hung from the top of the picture rather than pushed into the band:
+        // a sentence that appears after a GIF export must not resize the window
+        // it appears in. Below AVKit's own top controls, so the two do not
+        // repeat the overlap this layout exists to end.
         let noticeSize = notice.fittingSize(inWidth: bounds.width - Self.barInset * 2)
         notice.frame = CGRect(
             x: ((bounds.width - noticeSize.width) / 2).rounded(),
-            y: bar.frame.minY - Self.noticeGap - noticeSize.height,
+            y: playerView.frame.maxY - Self.playerChromeInset
+                - Self.noticeGap - noticeSize.height,
             width: noticeSize.width, height: noticeSize.height)
     }
 

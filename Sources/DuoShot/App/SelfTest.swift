@@ -5919,14 +5919,19 @@ enum SelfTest {
                 + "\(Int(recording.pointSize.height)) pt -> content "
                 + "\(rectString(videoWindow.contentLayoutRect))")
             checkFits(videoWindow, "recording")
-            // Exactly the video's aspect. The first version of this padded the
-            // window for the transport controls and asserted the padding was
-            // there — which passed, while the window showed the clip with a black
-            // band above and below it. `.inline` controls are an auto-hiding
-            // overlay, so any allowance for them is pure letterboxing.
+            // Exactly the video's aspect, once the Trim band is taken off the
+            // top. The first version of this padded the window for the
+            // *transport* controls and asserted the padding was there — which
+            // passed, while the window showed the clip with a black band above
+            // and below it. `.inline` controls are an auto-hiding overlay, so
+            // any allowance for them is pure letterboxing. `chromeHeight` is a
+            // different thing: DuoShot's own bar, which is a fixture, and the
+            // picture below it still has to be the video's shape.
             let box = videoWindow.contentLayoutRect.size
+            let picture = CGSize(
+                width: box.width, height: box.height - VideoTrimEditor.chromeHeight)
             let wantedVideo = recording.pointSize.width / max(recording.pointSize.height, 1)
-            let gotVideo = box.width / max(box.height, 1)
+            let gotVideo = picture.width / max(picture.height, 1)
             let videoAspectOK = abs(wantedVideo - gotVideo) < 0.02
             print(String(format: "  aspect %.3f vs %.3f -> %@", gotVideo, wantedVideo,
                          (videoAspectOK ? "matches, no letterboxing" : "MISMATCH") as NSString))
@@ -5941,6 +5946,45 @@ enum SelfTest {
             }
             if !(videoWindow.initialFirstResponder is AVPlayerView) {
                 failures.append("recording window does not hand the keyboard to the player")
+            }
+
+            // MARK: the bar is not over the player
+            //
+            // 播放控件和操作区域重叠: since macOS 26 the `.inline` controls are
+            // three pieces of glass, not one bottom strip, and two of them are
+            // in the top corners — exactly where the Trim bar used to float.
+            // Measured on a 360x336 player: the volume glass runs x 153..354,
+            // y 294..330 and the bar sat at x 99..262, y 282..322.
+            //
+            // Asserted as "the bar does not touch the player at all" rather than
+            // against those numbers, because the numbers are AVKit's private
+            // chrome and will move. Disjoint frames cannot collide whatever the
+            // chrome does.
+            //
+            // Squeezed to the window's own `contentMinSize` first, and that is
+            // the point of the check: the old bar cleared the volume glass on
+            // any window wider than 577 points, so every measurement taken on a
+            // full-size viewer was green while a small recording was unusable.
+            // `setFrame` ignores `contentMinSize` — AppKit enforces it on a
+            // user's drag — so the floor has to be asked for and applied by hand.
+            if let editor = viewer.trimEditorForTest(video.url) {
+                func measureBar(_ label: String) {
+                    editor.layoutSubtreeIfNeeded()
+                    let bar = editor.barFrameForTest
+                    let player = editor.playerView.frame
+                    let clear = !bar.intersects(player)
+                    print("  trim bar \(label): bar \(rectString(bar)) "
+                        + "player \(rectString(player)) -> "
+                        + (clear ? "clear" : "OVERLAPS"))
+                    if !clear {
+                        failures.append("the Trim bar sits over the player (\(label))")
+                    }
+                }
+                measureBar("as opened")
+                videoWindow.setContentSize(videoWindow.contentMinSize)
+                measureBar("squeezed to its minimum")
+            } else {
+                failures.append("no trim editor to measure the bar against")
             }
         } else {
             failures.append("no window for the recording")

@@ -203,21 +203,34 @@ final class ViewerWindowController {
         let size = pointSize.width >= 1 && pointSize.height >= 1
             ? pointSize
             : CGSize(width: 960, height: 540)
+        // The picture keeps exactly the video's aspect, and the window is built
+        // that much taller than the picture for the Trim band above it.
+        //
+        // The distinction matters and has been got wrong once already in the
+        // other direction: reserving 40 pt for the *transport* controls was the
+        // obvious guess and it was wrong, because `.inline` controls are an
+        // auto-hiding overlay over the picture rather than a strip that takes
+        // layout space, so the allowance bought nothing but a black band above
+        // and below the video. `VideoTrimEditor.chromeHeight` is not that — it
+        // is DuoShot's own bar, which is a fixture and does occupy the window.
+        let picture = fitted(size, reserving: VideoTrimEditor.chromeHeight)
+        let content = CGSize(
+            width: picture.width, height: picture.height + VideoTrimEditor.chromeHeight)
         let editor = VideoTrimEditor(
-            url: url, frame: CGRect(origin: .zero, size: fitted(size)))
+            url: url, frame: CGRect(origin: .zero, size: content))
         editor.onTrimmed = { [weak self] poster in
             self?.onVideoTrimmed?(url, poster)
         }
 
-        // Exactly the video's aspect, with no allowance for the transport
-        // controls. Reserving 40 pt for them was the obvious guess and it was
-        // wrong: `.inline` controls are an auto-hiding overlay over the bottom of
-        // the picture, not a strip that takes layout space, so the extra height
-        // bought nothing but a black band above and below the video. Caught by
-        // looking at `--selftest-viewer`'s screenshot; every number in that test
-        // was green.
+        // Wide enough for the bar, for the reason the still's `minSize` gives:
+        // the bar does not reflow, it clips, and a window narrower than it loses
+        // the controls at both ends of the row.
         return Content(
-            view: editor, size: fitted(size), keyView: editor.playerView,
+            view: editor, size: content,
+            minSize: CGSize(
+                width: max(320, VideoTrimEditor.minimumContentWidth),
+                height: 240 + VideoTrimEditor.chromeHeight),
+            keyView: editor.playerView,
             onShown: { editor.play() })
     }
 
