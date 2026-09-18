@@ -352,6 +352,8 @@ test-only:
 	run "selection loupe"        --selftest-loupe $(TEST_OUT); \
 	run "freeze mode"            --selftest-freeze $(TEST_OUT); \
 	run "faded window"           --selftest-faded-window; \
+	run "picker resize"          --selftest-picker-resize; \
+	run "picker resize (panel)"  --selftest-picker-resize panel; \
 	run "occluded recovery"      --selftest-occluded-recovery; \
 	run "delayed capture"        --selftest-delay $(TEST_OUT); \
 	run "preview stack + scroll" --selftest-preview-stack $(TEST_OUT) --count 14; \

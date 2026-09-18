@@ -25,6 +25,7 @@ enum SelfTest {
         /// Captures a window the compositor is drawing at less than full
         /// opacity, which is what a dismissing menu-bar popup is.
         case fadedWindow
+        case pickerResize(panel: Bool)
         /// The photograph fallback's honesty check: does it refuse when the
         /// photograph holds somebody else's pixels, and accept when it does not?
         case occludedRecovery
@@ -189,6 +190,8 @@ enum SelfTest {
             case "--selftest-popup-capture":
                 guard let needle = positional() else { return nil }
                 self = .popupCapture(needle: needle, rounds: Int(positional() ?? "") ?? 4)
+            case "--selftest-picker-resize":
+                self = .pickerResize(panel: positional() == "panel")
             case "--selftest-faded-window":
                 self = .fadedWindow
             case "--selftest-occluded-recovery":
@@ -423,6 +426,7 @@ enum SelfTest {
             case .popupCapture(let needle, let rounds):
                 return try await popupCapture(needle: needle, rounds: rounds)
             case .fadedWindow: return try await fadedWindowCheck()
+            case .pickerResize(let panel): return try await pickerResizeCheck(asPanel: panel)
             case .occludedRecovery: return try await occludedRecoveryCheck()
             case .capture(let url, let index): return try await capture(to: url, displayIndex: index)
             case .rect(let rect, let index, let url):
@@ -4133,6 +4137,111 @@ enum SelfTest {
     /// assertion that matters is a *difference*. A check that only ever looked at
     /// the faded capture would pass on a machine where window captures are broken
     /// in some other way.
+    /// A window that changed size between two picks is outlined at its new size.
+    ///
+    /// Reported 2026-09-18 as "如果窗口变化了高度或者宽度，再次测量时仍然是上一次
+    /// 的范围". Two whole presentations, with the resize in between and the
+    /// overlay down while it happens.
+    ///
+    /// **Asserts on the hover, not on the list.** The first version of this
+    /// check read `picker.windows` and passed at the moment the real screen was
+    /// showing the old outline: the list was refreshed correctly every session
+    /// and the stale rect was in `hovered`, a `WindowInfo` *value* that survives
+    /// a teardown and was only replaced when the window under the pointer had a
+    /// different id. What is drawn is `hoveredFrameInAppKitGlobal`, so that is
+    /// what a check about an outline has to look at.
+    ///
+    /// Goes through the same two steps the coordinator does —
+    /// `refreshContent()` for the list and `WindowZOrder.placed` for the frames
+    /// — rather than asking ScreenCaptureKit directly, because either one of
+    /// them is a candidate for holding the old rect.
+    private static func pickerResizeCheck(asPanel: Bool = false) async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return permissionHint() }
+
+        // Two shapes, because the report came from DuoTranslator's panel: an
+        // ordinary titled window, and a borderless one at the layer that panel
+        // uses (`popUpMenu + 1`), which is also how it resizes itself.
+        let window = asPanel
+            ? NSPanel(
+                contentRect: CGRect(x: 200, y: 300, width: 400, height: 300),
+                styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            : NSWindow(
+                contentRect: CGRect(x: 200, y: 300, width: 400, height: 300),
+                styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        if asPanel {
+            window.level = .init(rawValue: NSWindow.Level.popUpMenu.rawValue + 1)
+        }
+        window.backgroundColor = .magenta
+        window.orderFrontRegardless()
+        defer { window.orderOut(nil) }
+        let id = CGWindowID(window.windowNumber)
+
+        // Inside the window at both sizes: a grown window keeps its top-left,
+        // so a point near the bottom-left of the *small* frame stays covered.
+        let pointer = CGPoint(x: window.frame.minX + 30, y: window.frame.minY + 30)
+        // Where the pointer was, so the checks after this one in `make test`
+        // photograph the screen they would have had. This one has to move the
+        // real cursor (see `pickedFrame`), and it is the only one that does.
+        let cursorBefore = DisplayGeometry.flipped(NSEvent.mouseLocation)
+        defer { CGWarpMouseCursorPosition(cursorBefore) }
+
+        let coordinator = CaptureCoordinator()
+        // (what the picker's list says, what the overlay would outline).
+        func pickedFrame() async throws -> (listed: CGRect?, hovered: CGRect?) {
+            // The real cursor, parked on the fixture, because that is the whole
+            // situation: `present` seeds the hover from `NSEvent.mouseLocation`,
+            // so a pointer sitting anywhere else clears the previous session's
+            // hover for us and the stale rect can never show. A user who just
+            // dragged a window's edge has the pointer on that window.
+            CGWarpMouseCursorPosition(DisplayGeometry.flipped(pointer))
+            try await Task.sleep(for: .milliseconds(100))
+            try await coordinator.engine.refreshContent()
+            let placed = WindowZOrder.placed(coordinator.engine.shareableContent.windows)
+            let presentation = Task { await coordinator.overlay.present(windows: placed) }
+            try await Task.sleep(for: .milliseconds(400))
+            coordinator.overlay.forceHover(atAppKitGlobal: pointer)
+            try await Task.sleep(for: .milliseconds(100))
+            let listed = coordinator.overlay.pickFrameForTest(id)
+            let hovered = coordinator.overlay.hoveredWindow.flatMap {
+                $0.id == id ? $0.pickFrame : nil
+            }
+            coordinator.overlay.tearDown()
+            presentation.cancel()
+            try await Task.sleep(for: .milliseconds(200))
+            return (listed, hovered)
+        }
+
+        try await Task.sleep(for: .milliseconds(500))
+        let first = try await pickedFrame()
+        guard let before = first.hovered else {
+            print("result:        INCONCLUSIVE — the fixture was not hovered at its first size")
+            return 0
+        }
+
+        window.setContentSize(NSSize(width: 700, height: 550))
+        window.displayIfNeeded()
+        try await Task.sleep(for: .milliseconds(500))
+        // What the window server says, which is what the outline has to match.
+        let truth = WindowZOrder.entries()[id]?.bounds
+        let second = try await pickedFrame()
+        guard let after = second.hovered, let listed = second.listed, let truth else {
+            print("result:        INCONCLUSIVE — the fixture was not hovered after the resize")
+            return 0
+        }
+
+        func fits(_ rect: CGRect) -> Bool {
+            abs(rect.width - truth.width) <= 1 && abs(rect.height - truth.height) <= 1
+        }
+        print("picker resize: outline before \(Int(before.width))x\(Int(before.height)) pt, "
+            + "after \(Int(after.width))x\(Int(after.height)) pt; "
+            + "list says \(Int(listed.width))x\(Int(listed.height)) pt, "
+            + "window server says \(Int(truth.width))x\(Int(truth.height)) pt")
+        let moved = abs(after.width - before.width) > 1 || abs(after.height - before.height) > 1
+        let ok = fits(after) && fits(listed) && moved
+        print("result:        \(ok ? "PASS" : "FAIL")")
+        return ok ? 0 : 1
+    }
+
     private static func fadedWindowCheck() async throws -> Int32 {
         guard ScreenPermission.isGranted else { return permissionHint() }
         guard let screen = NSScreen.main,

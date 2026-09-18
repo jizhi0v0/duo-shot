@@ -711,6 +711,11 @@ final class OverlayController {
     var hoveredWindow: WindowInfo? { picker.hovered }
     var pickableWindowCount: Int { picker.windows.count }
     var pickableWindowIDs: Set<CGWindowID> { Set(picker.windows.map(\.id)) }
+    /// The frame the picker would outline for this window, for
+    /// `--selftest-picker-resize`.
+    func pickFrameForTest(_ id: CGWindowID) -> CGRect? {
+        picker.windows.first { $0.id == id }?.pickFrame
+    }
 
     /// Drives the selection without mouse input, for `--selftest-overlay`.
     func forceSelection(_ rectInAppKitGlobal: CGRect, on screen: NSScreen) {

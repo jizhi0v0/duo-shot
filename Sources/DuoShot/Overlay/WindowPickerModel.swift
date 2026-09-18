@@ -263,7 +263,17 @@ final class WindowPickerModel {
     func updateHover(atAppKitGlobal point: CGPoint) {
         let pointInCGGlobal = DisplayGeometry.flipped(point)
         let match = windows.first { $0.pickFrame.contains(pointInCGGlobal) }
-        guard match?.id != hovered?.id else { return }
+        // The whole window, not its id. `hovered` is a *value*, it is what the
+        // outline is drawn from (`hoveredFrameInAppKitGlobal`), and it outlives
+        // a teardown — so an id comparison kept the frame the window had the
+        // last time the pointer was on it. Reported 2026-09-18 as "如果窗口变化了
+        // 高度或者宽度，再次测量时仍然是上一次的范围": resize a window, press the
+        // shortcut again with the pointer still on it, and the highlight is the
+        // rect from the previous session. `present` refreshes the list and even
+        // the picker's own `windows` held the new size; only this snapshot was
+        // stale. The same guard froze the outline on a panel that resizes itself
+        // while the picker is up — a translation arriving, a popup growing.
+        guard match != hovered else { return }
         hovered = match
         Log.overlay.debug("""
             hover \(pointInCGGlobal.x, privacy: .public),\(pointInCGGlobal.y, privacy: .public) \
