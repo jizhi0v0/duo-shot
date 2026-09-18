@@ -278,7 +278,12 @@ final class CaptureCoordinator {
     /// could not place because the window server no longer listed them while
     /// their old frame is still on the display. For the occasional mid-swipe
     /// offset still reported after that fix ("少数情况仍然会偏移，往左滑更容易").
-    private func logPlacement(
+    ///
+    /// Not `private` so `--selftest-log-redaction` can drive the real line rather
+    /// than a copy of its format string. Asserting on a re-typed format string
+    /// would leave the only thing under test — what this call site interpolates
+    /// as `.public` — untested.
+    func logPlacement(
         listed: [WindowInfo], placed: [WindowInfo], entries: [CGWindowID: WindowZOrder.Entry],
         readWithPhotograph: Bool
     ) {
@@ -291,9 +296,12 @@ final class CaptureCoordinator {
             entries[$0.id]?.bounds == nil && (0...WindowInfo.topAppLayer).contains($0.layer)
                 && $0.frame.intersects(display)
         }
+        // `logName`, not `displayName`: this whole line is `.public`, and a
+        // window title in the persisted log store is the leak `WindowInfo.logName`
+        // describes. App name and id answer "which window moved" on their own.
         func describe(_ window: WindowInfo) -> String {
             let f = window.frame
-            return "\(window.displayName) #\(window.id) (\(Int(f.minX)),\(Int(f.minY)) \(Int(f.width))x\(Int(f.height)))"
+            return "\(window.logName) #\(window.id) (\(Int(f.minX)),\(Int(f.minY)) \(Int(f.width))x\(Int(f.height)))"
         }
         // `.notice`, not `.debug`: debug is not persisted to the log store, so
         // between 2026-09-12 and 2026-09-18 this line produced nothing at all
@@ -402,8 +410,15 @@ final class CaptureCoordinator {
             NSSound.beep()
             return nil
         }
+        // The title stays, at the default privacy, because which of five Chrome
+        // windows was under the pointer is the one thing this line is read for —
+        // but it is redacted to `<private>` in the store, so it answers that
+        // question only for someone at the machine it happened on. The app name
+        // and the id are public, which is what makes the line worth having after
+        // the fact at all. See `WindowInfo.logName`.
         Log.capture.notice("""
-            instant window capture: \(target.displayName, privacy: .public)
+            instant window capture: \(target.logName, privacy: .public) \
+            #\(target.id, privacy: .public) — \(target.displayName)
             """)
 
         guard await countdown.wait(

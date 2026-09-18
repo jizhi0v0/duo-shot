@@ -95,9 +95,17 @@ public actor LinkdropUploader {
             ? try await direct(plan, to: endpoint, onProgress: onProgress)
             : try await presigned(plan, size: size, to: endpoint, onProgress: onProgress)
 
+        // The key is not public. It is the whole of the share URL that is not the
+        // endpoint — anyone holding it can fetch the capture — so a `.public`
+        // interpolation puts a working handle to every screenshot this user ever
+        // uploaded into the persisted log store, where sysdiagnose collects it.
+        // The extension and the size are what this line is read for (did the
+        // re-encode happen, did the presigned path get taken); the key is kept at
+        // the default privacy so it is still there for someone debugging on their
+        // own machine.
         LinkdropLog.upload.notice("""
             \(plan.descriptor.ext, privacy: .public) \(size, privacy: .public) bytes \
-            -> \(link.key, privacy: .public)
+            -> \(link.key)
             """)
         return link
     }

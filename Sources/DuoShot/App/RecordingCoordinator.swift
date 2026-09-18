@@ -450,8 +450,15 @@ final class RecordingCoordinator {
             // The file is left where it is on purpose. It is the only sample of
             // a failure we cannot reproduce on demand, and deleting it is how
             // the last one was lost.
+            // The filename public and the path private, which is what every
+            // other line in this file already did — this one logged `url.path`,
+            // and a path under Application Support carries the user's home
+            // directory name into the persisted log store for no diagnostic gain.
+            // The name is what identifies the file; whoever needs the directory
+            // is standing at the machine that has it.
             Log.record.error("""
-                recording lost, staged file left at \(url.path, privacy: .public): \
+                recording lost, staged file left at \
+                \(url.lastPathComponent, privacy: .public) (in \(url.path)): \
                 \((failure ?? stopError)?.localizedDescription ?? "unknown", privacy: .public)
                 """)
             NSSound.beep()

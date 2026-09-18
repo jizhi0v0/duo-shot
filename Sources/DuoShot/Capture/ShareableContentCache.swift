@@ -43,6 +43,32 @@ nonisolated struct WindowInfo: Sendable, Identifiable, Hashable {
         default: "Window \(id)"
         }
     }
+
+    /// The only identity for this window that may be interpolated as
+    /// `privacy: .public`.
+    ///
+    /// `displayName` must never be: a `.public` interpolation is written to the
+    /// **persisted** log store in clear and swept up by `sysdiagnose`, so a
+    /// window title — a browser tab, a document name, a chat thread — leaves the
+    /// machine with any diagnostic the user shares. For a screenshot app that is
+    /// the worst line in the tree to widen, and it was widened: up to 2026-09-18
+    /// `instant window capture:` and the `placed N windows` notice both put
+    /// `displayName` in public.
+    ///
+    /// The app name is enough to read every one of those lines, and it is what
+    /// the picker's own rules are written in terms of (bundle, layer, app). Where
+    /// the title genuinely decides which of five windows was picked, log
+    /// `displayName` *beside* this with no privacy specifier: `.auto` redacts a
+    /// runtime string to `<private>`, and anyone debugging their own machine can
+    /// turn it back on for this subsystem alone.
+    ///
+    /// Deliberately does not fall back to `title` the way `displayName` does. A
+    /// window with no app name is rare and its id is a better answer than its
+    /// title is — a fallback that leaks is not a fallback.
+    var logName: String {
+        if let appName, !appName.isEmpty { return appName }
+        return "Window \(id)"
+    }
 }
 
 /// The Dock's window captured by itself — see

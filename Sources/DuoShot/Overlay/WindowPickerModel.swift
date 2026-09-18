@@ -165,7 +165,8 @@ final class WindowPickerModel {
                 else { continue }
                 hosts.insert(outer.id)
                 Log.overlay.debug("""
-                    picker dropped \(outer.displayName, privacy: .public) \
+                    picker dropped \(outer.logName, privacy: .public) \
+                    #\(outer.id, privacy: .public) \
                     as a shadow host around window \(inner.id, privacy: .public)
                     """)
                 break
@@ -224,7 +225,7 @@ final class WindowPickerModel {
         windows = reordered
         Log.overlay.debug("""
             picker re-ranked, now fronted by \
-            \(reordered.first?.displayName ?? "nothing", privacy: .public)
+            \(reordered.first?.logName ?? "nothing", privacy: .public)
             """)
         return true
     }
@@ -238,19 +239,27 @@ final class WindowPickerModel {
     /// writes anything down, and "it highlighted the wrong window" is otherwise
     /// indistinguishable from "it highlighted the right window, which happens to
     /// be maximized".
+    ///
+    /// `logName` throughout rather than `displayName`, for the reason
+    /// `WindowInfo.logName` gives. Debug is not written to the persisted store,
+    /// so these were a smaller leak than the `.notice` lines — but a
+    /// `log stream` transcript pasted into a bug report is the same titles in the
+    /// same clear, and every rule the picker drops a window by is written in
+    /// apps, layers and frames, never in titles.
     private func logRejectionsInFront(of candidates: [WindowInfo]) {
         Log.overlay.debug("""
             picker loaded \(self.windows.count, privacy: .public) of \
             \(candidates.count, privacy: .public): \
-            \(self.windows.prefix(5).map(\.displayName).joined(separator: " | "), privacy: .public)
+            \(self.windows.prefix(5).map(\.logName).joined(separator: " | "), privacy: .public)
             """)
         guard let firstKept = windows.first,
               let cut = candidates.firstIndex(where: { $0.id == firstKept.id }), cut > 0
         else { return }
         for window in candidates[..<cut] {
             Log.overlay.debug("""
-                picker dropped (in front of \(firstKept.displayName, privacy: .public)): \
-                \(window.displayName, privacy: .public) \
+                picker dropped (in front of \(firstKept.logName, privacy: .public)): \
+                \(window.logName, privacy: .public) \
+                #\(window.id, privacy: .public) \
                 \(self.rejectionReason(for: window) ?? "?", privacy: .public)
                 """)
         }
@@ -277,7 +286,7 @@ final class WindowPickerModel {
         hovered = match
         Log.overlay.debug("""
             hover \(pointInCGGlobal.x, privacy: .public),\(pointInCGGlobal.y, privacy: .public) \
-            -> \(match?.displayName ?? "nothing", privacy: .public)\
+            -> \(match?.logName ?? "nothing", privacy: .public)\
             \(match.map { " #\($0.id) (\(Int($0.pickFrame.minX)),\(Int($0.pickFrame.minY)) \(Int($0.pickFrame.width))x\(Int($0.pickFrame.height)))" } ?? "", privacy: .public)
             """)
         onChange?()
