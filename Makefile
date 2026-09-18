@@ -357,6 +357,8 @@ test-only:
 	run "edit menu (paste)"      --selftest-edit-menu; \
 	run "copy text (OCR)"        --selftest-copy-text $(TEST_OUT); \
 	run "sensitive text"         --selftest-sensitive $(TEST_OUT); \
+	run "index file mode"        --selftest-index-permissions $(TEST_OUT); \
+	run "log redaction"          --selftest-log-redaction; \
 	run "selection zones"        --selftest-selection-zones; \
 	run "size readout placement" --selftest-badge-placement; \
 	run "pixel mapping"          --selftest-pixel-mapping; \

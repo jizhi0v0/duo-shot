@@ -3,6 +3,7 @@ import AppKit
 import Carbon.HIToolbox
 import Darwin
 import Linkdrop
+import OSLog
 import ScreenCaptureKit
 import ServiceManagement
 import UniformTypeIdentifiers
@@ -66,6 +67,12 @@ enum SelfTest {
         case windowMode(directory: URL)
         /// Fullscreen capture with `includeMenuBar` both ways.
         case fullscreen(directory: URL)
+        /// The OCR index's file mode, on first write and on every rewrite after
+        /// it. Headless and pure filesystem.
+        case indexPermissions(directory: URL)
+        /// What the window-placement notice actually puts in the log store,
+        /// read back out of it. Headless: no screen, no capture.
+        case logRedaction
         /// Settings persistence, key-combo encoding and the system-shortcut probe.
         case preferences
         /// Pure geometry of the armed selection's grab zones. Headless: no screen,
@@ -243,6 +250,11 @@ enum SelfTest {
             case "--selftest-history":
                 self = .history(
                     directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
+            case "--selftest-index-permissions":
+                self = .indexPermissions(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
+            case "--selftest-log-redaction":
+                self = .logRedaction
             case "--selftest-share":
                 let configured = rest.contains("--configured")
                 let endpoint = value(for: "--endpoint")
@@ -458,6 +470,8 @@ enum SelfTest {
             case .sensitiveText(let d): return try await sensitiveTextCheck(into: d)
             case .gif(let d): return try await gifCheck(into: d)
             case .history(let d): return try await historyCheck(into: d)
+            case .indexPermissions(let d): return try await indexPermissionsCheck(into: d)
+            case .logRedaction: return try logRedactionCheck()
             case .shareCard(let d): return try await shareCardStates(into: d)
             case .shareCredentials: return await ShareSelfTest.credentials()
             case .shareFlow: return await ShareFlowSelfTest.run()
@@ -1690,6 +1704,195 @@ enum SelfTest {
             try await Task.sleep(for: .milliseconds(50))
         }
         check("closing it lets go of the window", !search.isOpen)
+
+        print("result:        \(failures == 0 ? "PASS" : "FAIL (\(failures))")")
+        return failures == 0 ? 0 : 1
+    }
+
+    /// `--selftest-index-permissions`
+    ///
+    /// The OCR index is a plaintext transcript of every capture — measured on
+    /// 2026-09-18 at mode `0644` in the real Application Support
+    /// directory, which is to say readable by every process running as this user.
+    /// `CaptureIndex.save()` closes it; this asks the filesystem whether it did.
+    ///
+    /// **Asserted on a rewrite, not only on first creation.** That is the whole
+    /// point of the check. `Data.write(options: .atomic)` renames a fresh temp
+    /// file into place, so any approach that sets the mode on the existing file —
+    /// or `chmod`s after the write — is correct exactly once and silently reverts
+    /// to `0644` on the next capture. A check that recorded one entry and stopped
+    /// would pass against that bug.
+    private static func indexPermissionsCheck(into directory: URL) async throws -> Int32 {
+        var failures = 0
+        func check(_ label: String, _ passed: Bool, _ detail: String = "") {
+            print("  \(passed ? "PASS" : "FAIL") \(label)\(detail.isEmpty ? "" : " — \(detail)")")
+            if !passed { failures += 1 }
+        }
+        // Its own subdirectory, because the directory's mode is under test too and
+        // the shared output directory is used by twenty other checks.
+        let root = directory.appendingPathComponent("index-permissions", isDirectory: true)
+        try? FileManager.default.removeItem(at: root)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let store = root.appendingPathComponent("capture-index.json")
+        func mode(of url: URL) -> Int? {
+            (try? FileManager.default.attributesOfItem(atPath: url.path))
+                .flatMap { $0[.posixPermissions] as? NSNumber }?.intValue
+        }
+        func octal(_ mode: Int?) -> String {
+            mode.map { "0o" + String($0, radix: 8) } ?? "absent"
+        }
+
+        let index = CaptureIndex(location: store)
+        await index.record(
+            root.appendingPathComponent("one.png"), text: "hunter2", capturedAt: .now)
+
+        check("the index exists after the first capture",
+              FileManager.default.fileExists(atPath: store.path))
+        check("and is 0600, not 0644", mode(of: store) == 0o600, octal(mode(of: store)))
+        check("its directory is 0700", mode(of: root) == 0o700, octal(mode(of: root)))
+
+        // The rewrite. Nine more, because `save()` runs per capture and the bug
+        // this guards against reappears on whichever write stops being the first.
+        for n in 2...10 {
+            await index.record(
+                root.appendingPathComponent("\(n).png"), text: "token-\(n)", capturedAt: .now)
+        }
+        check("still 0600 after ten rewrites", mode(of: store) == 0o600, octal(mode(of: store)))
+        check("and the rewrites landed", await index.count == 10, "\(await index.count)")
+
+        // A `rename(2)` leaves nothing behind on a clean run. A stray temp file
+        // would be a second copy of the transcript at whatever mode it was created
+        // with, which is the bug in a different place.
+        let leftovers = (try? FileManager.default.contentsOfDirectory(atPath: root.path))?
+            .filter { $0.hasPrefix(".") && $0.contains("capture-index") } ?? []
+        check("and no temp copy is left beside it", leftovers.isEmpty, "\(leftovers)")
+
+        // An index inherited from a build that wrote 0644. `load()` has to close
+        // it, because an install that is never captured into again never reaches
+        // `save()` at all.
+        let inherited = root.appendingPathComponent("inherited-index.json")
+        FileManager.default.createFile(
+            atPath: inherited.path, contents: Data("[]".utf8),
+            attributes: [.posixPermissions: 0o644])
+        check("a 0644 index is the fixture this needs",
+              mode(of: inherited) == 0o644, octal(mode(of: inherited)))
+        // `count` is the cheapest thing that forces `load()`.
+        _ = await CaptureIndex(location: inherited).count
+        check("opening an inherited 0644 index tightens it",
+              mode(of: inherited) == 0o600, octal(mode(of: inherited)))
+
+        print("result:        \(failures == 0 ? "PASS" : "FAIL (\(failures))")")
+        return failures == 0 ? 0 : 1
+    }
+
+    /// `--selftest-log-redaction`
+    ///
+    /// Reads the process's own entries back out of the unified log and asserts
+    /// that the window-placement notice carries no window title. Measured
+    /// 2026-09-18 in the persisted store:
+    ///
+    ///     instant window capture: DuoTranslator
+    ///
+    /// — a `.public` interpolation of `WindowInfo.displayName`, which for a
+    /// browser or an editor is `App — <whatever the user was reading>`. `.public`
+    /// is written to the persisted store in clear and collected by sysdiagnose,
+    /// so those titles left the machine with any diagnostic that was shared.
+    ///
+    /// Three things make this a check rather than a gesture:
+    ///
+    /// 1. **It drives the real call site.** `CaptureCoordinator.logPlacement` is
+    ///    called with fixtures shaped to reach both of its `describe(_:)` branches
+    ///    — `largest … on` needs a window whose frame moved, `not listed now but
+    ///    on the display` needs one absent from the z-order entries. Re-typing the
+    ///    format string here would test the copy.
+    /// 2. **The title is runtime-derived.** Measured 2026-09-18 with a standalone
+    ///    probe: `OSLogPrivacy.auto` — the default — shows *static* strings and
+    ///    redacts *dynamic* ones, and at `-O` a `let` holding a literal is folded
+    ///    into a static string and comes back in clear. A fixture title written as
+    ///    a literal would therefore leak in the test and not in the app, failing
+    ///    for a reason that has nothing to do with the code. It is assembled from
+    ///    the pid instead.
+    /// 3. **It carries its own negative control.** The same runtime title is also
+    ///    logged with an explicit `privacy: .public`, and that one *must* come
+    ///    back in clear. Without it, a readback that silently returned nothing —
+    ///    which is what `OSLogStore` does from a `swift`-interpreted binary, also
+    ///    measured — would make every "the title is absent" assertion pass while
+    ///    proving nothing.
+    private static func logRedactionCheck() throws -> Int32 {
+        var failures = 0
+        func check(_ label: String, _ passed: Bool, _ detail: String = "") {
+            print("  \(passed ? "PASS" : "FAIL") \(label)\(detail.isEmpty ? "" : " — \(detail)")")
+            if !passed { failures += 1 }
+        }
+
+        // Runtime-derived, for reason 2 above. Distinctive enough that finding it
+        // anywhere in the log is unambiguous.
+        let secret = "Zqxj-Secret-Title-\(ProcessInfo.processInfo.processIdentifier)"
+        let appName = "Zqxj-Probe-App"
+        let windowID: CGWindowID = 424_242
+        func probe(_ frame: CGRect) -> WindowInfo {
+            WindowInfo(
+                id: windowID, frame: frame, title: secret, appName: appName,
+                bundleID: "zz.example.zqxj", layer: 0, isOnScreen: true, alpha: 1,
+                visibleFrame: nil)
+        }
+
+        let sample = probe(.zero)
+        check("logName drops the title displayName carries",
+              !sample.logName.contains(secret) && sample.displayName.contains(secret),
+              "logName=\(sample.logName)")
+
+        let since = Date()
+        let display = CGDisplayBounds(CGMainDisplayID())
+        // Inside the main display and inside `0...topAppLayer`, or `logPlacement`
+        // would filter it out of `stale` and `describe` would never run.
+        let frame = CGRect(x: display.midX, y: display.midY, width: 400, height: 300)
+        let listed = probe(frame)
+        // A different frame, so `moves` is non-empty and the `largest … on` branch
+        // runs as well.
+        let placed = probe(frame.offsetBy(dx: 37, dy: 0))
+
+        CaptureCoordinator().logPlacement(
+            listed: [listed], placed: [placed], entries: [:], readWithPhotograph: true)
+        // The negative control, deliberately leaking the same string.
+        Log.capture.notice("log-redaction control: \(secret, privacy: .public)")
+
+        // The store is written asynchronously, so this polls rather than sleeping
+        // once. An empty read is not a pass: the control below is what decides
+        // whether the readback worked at all.
+        var messages: [String] = []
+        for _ in 0..<40 {
+            let store = try OSLogStore(scope: .currentProcessIdentifier)
+            messages = try store
+                .getEntries(at: store.position(date: since))
+                .compactMap { ($0 as? OSLogEntryLog)?.composedMessage }
+            if messages.contains(where: { $0.contains("log-redaction control") }) { break }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+
+        let control = messages.first { $0.contains("log-redaction control") }
+        check("the log can be read back at all (negative control)",
+              control?.contains(secret) == true, control ?? "no control entry")
+
+        let placement = messages.first { $0.contains("placed 1 windows") }
+        check("the placement notice was emitted",
+              placement != nil, placement ?? "\(messages.count) entries, none matching")
+        guard let placement else {
+            print("result:        FAIL (\(failures))")
+            return 1
+        }
+        // The two `describe(_:)` branches. Asserted by name, because a fixture
+        // that reached neither would leave the check asserting only that a string
+        // it never printed is absent.
+        check("it reached the `largest` branch", placement.contains("largest 37 pt on"),
+              placement)
+        check("and the `not listed now` branch",
+              placement.contains("not listed now but on the display: Zqxj"), placement)
+        check("the app name survives, so the line is still worth reading",
+              placement.contains(appName), placement)
+        check("the window id survives", placement.contains("#\(windowID)"), placement)
+        check("and the title is nowhere in it", !placement.contains(secret), placement)
 
         print("result:        \(failures == 0 ? "PASS" : "FAIL (\(failures))")")
         return failures == 0 ? 0 : 1
