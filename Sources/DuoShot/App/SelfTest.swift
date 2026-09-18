@@ -1251,7 +1251,7 @@ enum SelfTest {
         // MARK: the patterns, exactly
 
         let table: [(line: String, expected: [SensitiveText.Kind])] = [
-            ("write to bobby.li+dev@example.co.uk about it", [.email]),
+            ("write to robin.lee+dev@example.co.uk about it", [.email]),
             ("the box answers on 192.168.1.14 today", [.ipAddress]),
             ("OPENAI_API_KEY=sk-abcdefghijklmnop0123456789", [.secret]),
             ("token ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5", [.secret]),
@@ -1293,7 +1293,7 @@ enum SelfTest {
 
         // MARK: through Vision, onto the pixels
 
-        let secrets = ["Email bobby@example.com", "Host 192.168.1.14", "Card 4111 1111 1111 1111"]
+        let secrets = ["Email robin@example.com", "Host 192.168.1.14", "Card 4111 1111 1111 1111"]
         let sample = directory.appendingPathComponent("sensitive-sample.png")
         try ImageEncoder.write(wordsImage(secrets), to: sample)
 
@@ -1385,7 +1385,7 @@ enum SelfTest {
         try ImageEncoder.write(redacted, to: scrubbed, scale: 1)
         let reread = await TextRecognition.text(inFileAt: scrubbed) ?? ""
         print("re-read:       \(reread.replacingOccurrences(of: "\n", with: " / "))")
-        for secret in ["bobby@example.com", "192.168.1.14", "4111"] {
+        for secret in ["robin@example.com", "192.168.1.14", "4111"] {
             check("\"\(secret)\" cannot be read back out", !reread.contains(secret))
         }
         // ...and the control that gives those their meaning. If OCR simply
@@ -4259,7 +4259,7 @@ enum SelfTest {
         // check used an opaque panel filling its whole frame, which makes
         // `opaqueBounds` return nil and skips that code path entirely. It passed
         // while the trim was cutting the wrong rectangle out of the photograph,
-        // and Bobby's screenshot came back with the left third of the panel
+        // and the screenshot came back with the left third of the panel
         // missing.
         //
         // So: a transparent margin, and the drawn part deliberately off-centre,
