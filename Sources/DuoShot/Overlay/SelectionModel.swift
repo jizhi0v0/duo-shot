@@ -141,9 +141,10 @@ final class SelectionModel {
         onChange?()
     }
 
-    /// Sets a selection outright, bypassing the drag gestures. Used by
-    /// `--selftest-overlay`, which must exercise the real overlay without a
-    /// human at the mouse.
+    /// Sets a selection outright, bypassing the drag gestures. Used by a click on
+    /// bare desktop, which takes the whole screen (`OverlayView.confirmScreen`),
+    /// and by `--selftest-overlay`, which must exercise the real overlay without
+    /// a human at the mouse.
     func setSelection(_ rect: CGRect, on screen: NSScreen) {
         anchor = CGPoint(x: rect.minX, y: rect.minY)
         current = CGPoint(x: rect.maxX, y: rect.maxY)

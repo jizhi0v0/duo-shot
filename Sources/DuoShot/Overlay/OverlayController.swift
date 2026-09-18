@@ -312,6 +312,10 @@ final class OverlayController {
                 tearDown()
                 return .cancelled
             }
+            // Out of the desktops and into a space of the overlay's own, so a
+            // shortcut pressed mid-swipe puts it on screen now rather than on
+            // the desktop sliding away. See `OverlaySpace`.
+            OverlaySpace.adopt(panel)
         }
 
         bindKeys()
@@ -771,6 +775,16 @@ final class OverlayController {
     /// suggestion is suppressed mid-drag and once armed, and that suppression is
     /// the interesting half of the merge.
     var suggestedWindowForTest: WindowInfo? { views.first?.suggestedWindowForTest }
+
+    /// Whether some screen is offering itself, which it does over bare desktop.
+    var suggestsScreenForTest: Bool { views.contains { $0.suggestsScreenForTest } }
+
+    /// For each panel, whether the window server has it on screen and on none
+    /// of the desktops, which is what joining the overlay's space does to it
+    /// (`OverlaySpace.isOutsideTheDesktops`).
+    var panelsOutsideTheDesktopsForTest: [Bool] {
+        panels.map { OverlaySpace.isOutsideTheDesktops($0) }
+    }
 
     /// Drives the confirm path without a mouse-up, for `--selftest-lifecycle`.
     func confirmForTest() {

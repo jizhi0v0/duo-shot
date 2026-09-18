@@ -35,6 +35,20 @@ final class CaptureCoordinator {
     /// Extra windows to keep out of the shot — the floating previews, which are
     /// on screen from a previous capture and would otherwise be photographed.
     var additionalExcludedWindowIDs: () -> Set<CGWindowID> = { [] }
+
+    /// Whether the last freeze photograph came from `LegacyDisplayCapture`, for
+    /// `--selftest-freeze`, which would otherwise pass on the fallback.
+    private(set) var frozeWithLegacyCallForTest = false
+
+    /// Where the window server had every window the moment the freeze
+    /// photograph came back, when `LegacyDisplayCapture` took it — the positions
+    /// the picker's outlines are placed at. With more than one display, the
+    /// snapshot after the last display's photograph.
+    private var windowsAtFreeze: [CGWindowID: WindowZOrder.Entry]?
+
+    /// For `--selftest-freeze`.
+    var placementReadWithPhotographForTest: Bool { windowsAtFreeze != nil }
+
     /// Fired when ScreenCaptureKit reports the Screen Recording grant has lapsed.
     var onAuthorisationLost: (() -> Void)?
     /// Fired once per capture that finally failed, with the sentence describing
@@ -146,7 +160,17 @@ final class CaptureCoordinator {
         let photographs = await freezeEveryDisplay()
         let frozen = Preferences.shared.freezesScreen ? photographs : [:]
 
-        let windowsAtPhotographTime = engine.shareableContent.windows
+        // Where the windows are in the photograph, not where they were when the
+        // list was read: the same thing while nothing moves, and 10–40 pt apart
+        // while a desktop slides. See `WindowZOrder.placed`.
+        let listed = engine.shareableContent.windows
+        // Read with the photograph when `LegacyDisplayCapture` took it; only the
+        // ScreenCaptureKit fallback has them read here, after the fact.
+        let placement = windowsAtFreeze ?? WindowZOrder.entries()
+        let windowsAtPhotographTime = WindowZOrder.placed(listed, using: placement)
+        logPlacement(
+            listed: listed, placed: windowsAtPhotographTime, entries: placement,
+            readWithPhotograph: windowsAtFreeze != nil)
         // Also before the overlay, for the same reason as the photograph: a
         // tooltip is dismissed the moment the overlay covers the pointer, and a
         // window capture is meant to hold what was on screen when you pressed
@@ -248,6 +272,41 @@ final class CaptureCoordinator {
                 .window(windowID), options: options, recovery: recovery,
                 intent: intent, afterCapture: { [overlay] in overlay.tearDown() })
         }
+    }
+
+    /// Debug: how far `WindowZOrder.placed` moved the list, and which windows it
+    /// could not place because the window server no longer listed them while
+    /// their old frame is still on the display. For the occasional mid-swipe
+    /// offset still reported after that fix ("少数情况仍然会偏移，往左滑更容易").
+    private func logPlacement(
+        listed: [WindowInfo], placed: [WindowInfo], entries: [CGWindowID: WindowZOrder.Entry],
+        readWithPhotograph: Bool
+    ) {
+        let display = CGDisplayBounds(CGMainDisplayID())
+        let moves = zip(listed, placed).compactMap { old, new -> (WindowInfo, CGFloat)? in
+            old.frame == new.frame ? nil : (new, new.frame.minX - old.frame.minX)
+        }
+        let largest = moves.max { abs($0.1) < abs($1.1) }
+        let stale = listed.filter {
+            entries[$0.id]?.bounds == nil && (0...WindowInfo.topAppLayer).contains($0.layer)
+                && $0.frame.intersects(display)
+        }
+        func describe(_ window: WindowInfo) -> String {
+            let f = window.frame
+            return "\(window.displayName) #\(window.id) (\(Int(f.minX)),\(Int(f.minY)) \(Int(f.width))x\(Int(f.height)))"
+        }
+        // `.notice`, not `.debug`: debug is not persisted to the log store, so
+        // between 2026-09-12 and 2026-09-18 this line produced nothing at all
+        // while the `froze display` notice beside it recorded every capture.
+        Log.capture.notice("""
+            placed \(listed.count, privacy: .public) windows \
+            (positions read \(readWithPhotograph ? "with the photograph" : "after it", privacy: .public)): \
+            \(moves.count, privacy: .public) moved\
+            \(largest.map { ", largest \(Int($0.1)) pt on \(describe($0.0))" } ?? "", privacy: .public); \
+            swipe windows up: \(listed.contains(where: \.isDesktopSwipeWindow), privacy: .public); \
+            not listed now but on the display: \
+            \(stale.isEmpty ? "none" : stale.map(describe).joined(separator: " | "), privacy: .public)
+            """)
     }
 
     /// Repeats the last region with no overlay at all.
@@ -389,8 +448,33 @@ final class CaptureCoordinator {
         options.excludedWindowIDs = additionalExcludedWindowIDs()
 
         var frames: [CGDirectDisplayID: BackdropCache.Frame] = [:]
+        frozeWithLegacyCallForTest = false
+        windowsAtFreeze = nil
         for screen in NSScreen.screens {
             guard let displayID = ScreenIndex.displayID(of: screen) else { continue }
+            // Freeze on: the retired call first, whose frame is 18–24 ms fresher
+            // by the time it can be shown (`LegacyDisplayCapture`). It keeps our
+            // own excluded windows out by having them decline capture for the
+            // moment, and declines only when something to exclude is not ours —
+            // then ScreenCaptureKit takes over below.
+            if Preferences.shared.freezesScreen {
+                let clock = ContinuousClock()
+                let started = clock.now
+                if let photo = await LegacyDisplayCapture.photograph(
+                    display: displayID, excluding: options.excludedWindowIDs
+                ) {
+                    frames[displayID] = BackdropCache.Frame(
+                        image: photo.image, scale: CGFloat(photo.image.width) / screen.frame.width,
+                        covers: screen.frame)
+                    windowsAtFreeze = photo.windows
+                    frozeWithLegacyCallForTest = true
+                    Log.capture.notice("""
+                        froze display \(displayID, privacy: .public) with CGWindowListCreateImage \
+                        in \((clock.now - started).milliseconds, privacy: .public) ms
+                        """)
+                    continue
+                }
+            }
             do {
                 let shot = try await engine.capture(.display(displayID), options: options)
                 frames[displayID] = BackdropCache.Frame(

@@ -199,6 +199,14 @@ extension WindowInfo {
     /// The top of the range ordinary app windows use.
     static let topAppLayer = Int(CGWindowLevelForKey(.modalPanelWindow))
     static let dockLayer = Int(CGWindowLevelForKey(.dockWindow))
+    /// `NSWindow.Level.floating`, 3: an app's palette or inspector.
+    static let floatingLayer = Int(CGWindowLevelForKey(.floatingWindow))
+
+    /// One of the pair the Dock raises while a swipe between desktops is
+    /// landing, and draws nothing in — see `WindowPickerModel.rejectionReason`.
+    var isDesktopSwipeWindow: Bool {
+        bundleID == Self.dockBundleID && layer == Self.floatingLayer
+    }
     static let menuBarLayer = Int(CGWindowLevelForKey(.mainMenuWindow))
     /// Where a menu-bar app's popup panel sits — and `NSMenu`, and tooltips.
     /// 101, the same number as `NSWindow.Level.popUpMenu`.

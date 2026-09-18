@@ -2909,10 +2909,14 @@ enum SelfTest {
         let dockPixelsOK = dockStripFromPixels()
         let stripPhotoOK = try await stripComesFromThePhotograph()
         let outlineOK = outlineCoversAdornments()
+        let dockSwipeOK = dockSwipeWindowIsNotOffered()
+        let placedOK = windowsArePlacedWhereThePhotoIs()
         let maskOK = maskKeepsOnlyTheShape()
         let opacityOK = try await invisibleWindowsAreNotPickable(coordinator)
         let popupOK = try await popupPanelsArePickable(coordinator)
         let (clickAdoptsOK, dragOverridesOK) = try await mergedGestures(coordinator, all)
+        let bareDesktopOK = try await bareDesktopOffersTheScreen(coordinator)
+        let overlaySpaceOK = try await overlayPanelsJoinTheirSpace(coordinator)
         let instantOK = try await instantWindowCapture(coordinator)
         try await photographSuggestion(coordinator, all, into: directory)
 
@@ -3017,13 +3021,15 @@ enum SelfTest {
             $0.width > 0 && $0.height > 0
         } ?? false
         let pass = selfLeaked == 0 && hits == tested && tested > 0 && geometryOK && suppressionOK
-            && clickAdoptsOK && dragOverridesOK && instantOK
+            && clickAdoptsOK && dragOverridesOK && bareDesktopOK && overlaySpaceOK && instantOK
             && inversions.isEmpty && frontmostOK && recoveredOK && appearedOK && paddingOK
             && childOK && stackedOK && adornedOK && emptyParentOK && trimOK && boundsOK && popupSurvivalOK && frozenPickerOK && shadowHostOK
             && shadowOK && ownWindowOK
             && cardOK
             && menuBarOK
-            && furnitureOK && dockPixelsOK && stripPhotoOK && outlineOK && maskOK && opacityOK
+            && furnitureOK && dockPixelsOK && stripPhotoOK && outlineOK && dockSwipeOK && placedOK
+            && maskOK
+            && opacityOK
             && popupOK
         print("result:        \(pass ? "PASS" : "FAIL")")
         return pass ? 0 : 1
@@ -3254,12 +3260,17 @@ enum SelfTest {
             print("click:         over \(offered.displayName) -> "
                 + "\(describe(clickBox.outcome)) \(clickOK ? "" : "MISMATCH")")
         } else {
-            // Bare desktop under the anchor. The click must then do *nothing* —
-            // committing a 1×1 area is exactly what the old code did with a
-            // press that carried one point of hand-shake.
-            clickOK = clickBox.outcome == nil
-            print("click:         nothing offered -> \(describe(clickBox.outcome)) "
-                + "\(clickOK ? "" : "MISMATCH — a click with no suggestion must not commit")")
+            // Bare desktop under the anchor. The click takes the whole screen
+            // (`bareDesktopOffersTheScreen`) — and above all not a 1×1 area,
+            // which is what the old code did with a press that carried one point
+            // of hand-shake.
+            if case .area(_, let rect) = clickBox.outcome {
+                clickOK = rect == screen.frame
+            } else {
+                clickOK = false
+            }
+            print("click:         no window offered -> \(describe(clickBox.outcome)) "
+                + "\(clickOK ? "" : "MISMATCH — bare desktop must take the whole screen")")
         }
 
         // MARK: drag
@@ -3291,6 +3302,53 @@ enum SelfTest {
             + "\(describe(dragBox.outcome)) \(dragOK ? "" : "MISMATCH")")
 
         return (clickOK, dragOK)
+    }
+
+    /// A click on bare desktop takes the whole screen it is on, as an area.
+    ///
+    /// Reported 2026-09-11 as "在第二个桌面，进行截图，无法识别到桌面": on a new,
+    /// empty Space the picker offered nothing but the menu bar and a click did
+    /// nothing. `mergedGestures` reaches that branch only when the middle of the
+    /// screen happens to be empty, which on a machine with anything open it is
+    /// not. So this presents *no* windows, with re-enumeration off — the list
+    /// an empty Space would give, whatever this machine has open — and clicks
+    /// through the real mouse handlers.
+    private static func bareDesktopOffersTheScreen(
+        _ coordinator: CaptureCoordinator
+    ) async throws -> Bool {
+        guard let screen = NSScreen.main, let displayID = ScreenIndex.displayID(of: screen) else {
+            print("bare desktop:  no main screen — not exercised")
+            return true
+        }
+        let enumerate = coordinator.overlay.refreshWindows
+        coordinator.overlay.refreshWindows = nil
+        defer { coordinator.overlay.refreshWindows = enumerate }
+
+        let box = OutcomeBox()
+        let flag = CompletionFlag()
+        Task {
+            box.outcome = await coordinator.overlay.present(windows: [])
+            flag.markDone()
+        }
+        try await Task.sleep(for: .milliseconds(400))
+        let point = CGPoint(x: screen.frame.midX.rounded(), y: screen.frame.midY.rounded())
+        coordinator.overlay.forcePointerForTest(at: point)
+        coordinator.overlay.forceHover(atAppKitGlobal: point)
+        let offered = coordinator.overlay.suggestsScreenForTest
+        // Zero travel — the gesture is a click.
+        coordinator.overlay.dragForTest(from: point, to: point)
+        _ = await flag.wait(upTo: .milliseconds(600))
+        coordinator.overlay.tearDown()
+        try await Task.sleep(for: .milliseconds(200))
+
+        var tookScreen = false
+        if case .area(let id, let rect) = box.outcome {
+            tookScreen = id == displayID && rect == screen.frame
+        }
+        let ok = offered && tookScreen
+        print("bare desktop:  offered the screen=\(offered), click -> \(describe(box.outcome)) "
+            + "(expected area \(rectString(screen.frame))) -> \(ok ? "OK" : "FAIL")")
+        return ok
     }
 
     /// Photographs the overlay while it is offering a window, so the suggestion
@@ -3479,6 +3537,116 @@ enum SelfTest {
         print("outline:       hovered \(picker.hovered.map { "\($0.id)" } ?? "nothing"), "
             + "outline \(outline.map(rectString) ?? "nil") "
             + "(expected \(rectString(expected))) -> \(ok ? "OK" : "FAIL")")
+        return ok
+    }
+
+    /// The Dock process's desktop-swipe window is not offered, and the Dock is.
+    ///
+    /// Reported 2026-09-11 as "滑动桌面的时候，截图看见一个不存在的 window": a
+    /// shortcut pressed within a second of a swipe outlined a window that draws
+    /// nothing. Pure: that window as measured (9721, at the frame the picker
+    /// loaded it with), over the maximised window it hid, plus the Dock itself
+    /// at its measured strip, which must stay pickable.
+    private static func dockSwipeWindowIsNotOffered() -> Bool {
+        func info(
+            _ id: CGWindowID, _ frame: CGRect, layer: Int, bundle: String,
+            visibleFrame: CGRect? = nil
+        ) -> WindowInfo {
+            WindowInfo(
+                id: id, frame: frame, title: nil, appName: bundle, bundleID: bundle,
+                layer: layer, isOnScreen: true, alpha: 1, visibleFrame: visibleFrame)
+        }
+        let dock = info(
+            20, CGRect(x: 0, y: 0, width: 1728, height: 1117), layer: WindowInfo.dockLayer,
+            bundle: WindowInfo.dockBundleID,
+            visibleFrame: CGRect(x: 82, y: 1022, width: 1563, height: 90))
+        let swipe = info(
+            9721, CGRect(x: 245, y: 395, width: 997, height: 377), layer: 3,
+            bundle: WindowInfo.dockBundleID)
+        let behind = info(
+            452, CGRect(x: 0, y: 34, width: 1728, height: 1083), layer: 0,
+            bundle: "com.anthropic.claudefordesktop")
+
+        let picker = WindowPickerModel()
+        picker.load([dock, swipe, behind])
+        // Where the reported hover landed, and a point on the Dock's strip.
+        picker.updateHover(atAppKitGlobal: DisplayGeometry.flipped(CGPoint(x: 975, y: 624)))
+        let overSwipe = picker.hovered?.id
+        picker.updateHover(atAppKitGlobal: DisplayGeometry.flipped(CGPoint(x: 800, y: 1060)))
+        let overDock = picker.hovered?.id
+        let ok = overSwipe == behind.id && overDock == dock.id
+        print("dock swipe:    over the swipe window -> \(overSwipe.map { "\($0)" } ?? "nothing") "
+            + "(expected \(behind.id)), over the Dock -> \(overDock.map { "\($0)" } ?? "nothing") "
+            + "(expected \(dock.id)) -> \(ok ? "OK" : "FAIL")")
+        return ok
+    }
+
+    /// Every overlay panel, once on screen, is in the overlay's own window-server
+    /// space — the one thing that keeps it on screen through a swipe between
+    /// desktops (`OverlaySpace`).
+    ///
+    /// Reported 2026-09-11 as "按下的瞬间应该冻结": raised mid-swipe, the overlay
+    /// rode the desktop being left and turned up only once the swipe had landed.
+    /// A swipe cannot be made headless, so this asserts the wiring, which the
+    /// swipe probe showed is enough: a panel in that space stayed put through
+    /// four real swipes and appeared at its place every time it was ordered in
+    /// mid-swipe.
+    private static func overlayPanelsJoinTheirSpace(
+        _ coordinator: CaptureCoordinator
+    ) async throws -> Bool {
+        let presentation = Task { await coordinator.overlay.present(windows: []) }
+        try await Task.sleep(for: .milliseconds(400))
+        // Asked as "on screen and on no desktop": the window server will not
+        // name a space of our own, only confirm a window has left the desktops
+        // (`OverlaySpace.isOutsideTheDesktops`). A panel that was never added
+        // reports desktop 1 there.
+        let outside = coordinator.overlay.panelsOutsideTheDesktopsForTest
+        coordinator.overlay.tearDown()
+        presentation.cancel()
+        try await Task.sleep(for: .milliseconds(200))
+        let ok = !outside.isEmpty && !outside.contains(false)
+        print("overlay space: \(outside.filter { $0 }.count) of \(outside.count) panels "
+            + "on screen and off the desktops -> \(ok ? "OK" : "FAIL")")
+        return ok
+    }
+
+    /// The list the freeze photograph is drawn against is moved to where the
+    /// window server has each window now (`WindowZOrder.placed`).
+    ///
+    /// Reported 2026-09-11 as "在 swipe 时会有偏移": mid-swipe, the outlines came
+    /// from a list read ~40 ms before the photograph. Pure: the probe's window at
+    /// the position ScreenCaptureKit gave and the one the photograph showed, a
+    /// window the window server did not list, and the Dock, whose strip is its
+    /// own business.
+    private static func windowsArePlacedWhereThePhotoIs() -> Bool {
+        func info(
+            _ id: CGWindowID, _ frame: CGRect, layer: Int = 0, bundle: String = "com.example.app",
+            visibleFrame: CGRect? = nil
+        ) -> WindowInfo {
+            WindowInfo(
+                id: id, frame: frame, title: nil, appName: bundle, bundleID: bundle,
+                layer: layer, isOnScreen: true, alpha: 1, visibleFrame: visibleFrame)
+        }
+        let sliding = info(11785, CGRect(x: 331, y: 458, width: 700, height: 201))
+        let unlisted = info(7, CGRect(x: 10, y: 40, width: 300, height: 300))
+        let dockStrip = CGRect(x: 82, y: 1022, width: 1563, height: 90)
+        let dock = info(
+            20, CGRect(x: 0, y: 0, width: 1728, height: 1117), layer: WindowInfo.dockLayer,
+            bundle: WindowInfo.dockBundleID, visibleFrame: dockStrip)
+        let whereItIs = CGRect(x: 301, y: 458, width: 700, height: 201)
+        let entries: [CGWindowID: WindowZOrder.Entry] = [
+            sliding.id: .init(depth: 1, alpha: 1, bounds: whereItIs),
+            dock.id: .init(depth: 0, alpha: 1, bounds: dock.frame),
+        ]
+        let placed = WindowZOrder.placed([dock, sliding, unlisted], using: entries)
+        let ok = placed.map(\.id) == [dock.id, sliding.id, unlisted.id]
+            && placed[1].frame == whereItIs
+            && placed[2].frame == unlisted.frame
+            && placed[0].pickFrame == dockStrip
+        print("placed:        sliding window \(rectString(sliding.frame)) -> "
+            + "\(placed.count > 1 ? rectString(placed[1].frame) : "missing") "
+            + "(expected \(rectString(whereItIs))), unlisted kept, Dock strip kept "
+            + "-> \(ok ? "OK" : "FAIL")")
         return ok
     }
 
@@ -9002,6 +9170,48 @@ enum SelfTest {
 
         Preferences.shared.freezesScreen = true
         let frozen = await captureViaOverlay(target)
+        // Everything below is only about the retired call if it was the one used.
+        check(coordinator.frozeWithLegacyCallForTest,
+              "the frozen frame came from CGWindowListCreateImage, not the ScreenCaptureKit fallback")
+        // Read ~20 ms later, once the caller had resumed, the outlines landed
+        // 53–56 pt from their windows mid-swipe; see `LegacyDisplayCapture`.
+        check(coordinator.placementReadWithPhotographForTest,
+              "the window positions came back with the photograph, not read after the caller resumed")
+        // It cannot leave a window out by ID, so for the length of the
+        // photograph it has our excluded windows decline capture — these patches
+        // ship the default sharing type, as preview cards do with "Show the
+        // selection UI to screen sharing" on — and puts them back after.
+        if let displayID = ScreenIndex.displayID(of: screen), let patch = patches.first {
+            let excluded: Set<CGWindowID> = [CGWindowID(patch.windowNumber)]
+            let photo = await LegacyDisplayCapture.photograph(
+                display: displayID, excluding: excluded)?.image
+            let scale = photo.map { CGFloat($0.width) / screen.frame.width } ?? 1
+            // Image rows run downwards; the patch is the red top-left one.
+            let centre = CGRect(
+                x: (patch.frame.midX - screen.frame.minX) * scale - 10,
+                y: (screen.frame.maxY - patch.frame.midY) * scale - 10, width: 20, height: 20)
+            let there = photo.flatMap { PixelCompare.meanColour($0, in: centre) }
+            let showsPatch = there.map { $0.r > 200 && $0.g < 60 && $0.b < 60 } ?? true
+            check(photo != nil && !showsPatch && patch.sharingType == .readOnly,
+                  "an excluded window of ours is left out of the photograph and put back after "
+                    + "(where the red patch is: r\(Int(there?.r ?? -1)) g\(Int(there?.g ?? -1)) "
+                    + "b\(Int(there?.b ?? -1)), sharing type now \(patch.sharingType.rawValue))")
+
+            // A window that never reached the screen reports windowNumber -1
+            // (measured: `defer: true`, never shown) and still sits in
+            // NSApp.windows. Converting that to a CGWindowID traps — ⇧⌘A with a
+            // preview card up crashed DuoShot on 2026-09-12 00:12. Excluding an
+            // ID that is none of ours makes the lookup walk every window, this
+            // one included.
+            let neverShown = NSWindow(
+                contentRect: CGRect(x: 0, y: 0, width: 10, height: 10),
+                styleMask: [.borderless], backing: .buffered, defer: true)
+            let foreign = await LegacyDisplayCapture.photograph(
+                display: displayID, excluding: [CGWindowID(UInt32.max - 7)])
+            check(neverShown.windowNumber < 0 && foreign == nil,
+                  "it walks past a window with no window-server number "
+                    + "(\(neverShown.windowNumber)), and still declines one that is not ours")
+        }
         patches.forEach { $0.orderOut(nil) }
         patches = []
 
@@ -9487,6 +9697,12 @@ enum SelfTest {
         let atBottom = CGRect(x: 400, y: 10, width: 300, height: 200)
         check(frame(atBottom, nil).minY >= atBottom.maxY,
               "a rect against the bottom of the screen puts its readout above")
+
+        // No room either side: the whole screen, which is what bare desktop
+        // offers. `above` would put the readout past the top edge, out of sight.
+        let whole = frame(bounds, nil)
+        check(bounds.contains(whole) && abs(whole.midY - bounds.midY) < 1,
+              "a rect filling the screen puts its readout inside it (\(rectString(whole)))")
 
         // Both bands under the glass. A short rect against the screen bottom:
         // below does not fit at all, and the loupe — flipped upwards, because

@@ -98,6 +98,17 @@ final class WindowPickerModel {
         // You cannot be pointing at something you cannot see.
         if window.alpha < 0.05 { return "invisible (alpha \(window.alpha))" }
         if !isPickable(layer: window.layer) { return "layer \(window.layer)" }
+        // The Dock process's floating windows, which are not the Dock. A swipe
+        // between desktops makes it raise a pair at layer 3, 997×377 in the
+        // middle of the screen, that slide with the animation and are gone a
+        // second later. Measured 2026-09-11 with a 50 ms window-list sampler,
+        // four swipes, eight windows, all the same. Pressed inside that second
+        // the picker listed one and the hover landed on it, and captured alone
+        // it was blank (windows 9667, 9721) — an outline around nothing,
+        // reported as "滑动桌面的时候，截图看见一个不存在的 window". Freeze mode
+        // then keeps it for as long as the overlay is up, since a frozen picker
+        // does not re-enumerate. Layer 3 only, as asked: the Dock itself is 20.
+        if window.isDesktopSwipeWindow { return "the Dock's desktop-swipe window" }
         // The Dock's window is the whole screen, so it is only usable once
         // `ScreenIndex` has told us where the dock itself actually is. An
         // auto-hidden Dock reserves nothing, and offering a full-screen window
@@ -246,7 +257,8 @@ final class WindowPickerModel {
         hovered = match
         Log.overlay.debug("""
             hover \(pointInCGGlobal.x, privacy: .public),\(pointInCGGlobal.y, privacy: .public) \
-            -> \(match?.displayName ?? "nothing", privacy: .public)
+            -> \(match?.displayName ?? "nothing", privacy: .public)\
+            \(match.map { " #\($0.id) (\(Int($0.pickFrame.minX)),\(Int($0.pickFrame.minY)) \(Int($0.pickFrame.width))x\(Int($0.pickFrame.height)))" } ?? "", privacy: .public)
             """)
         onChange?()
     }

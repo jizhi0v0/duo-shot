@@ -234,6 +234,38 @@ final class OverlayView: NSView {
     /// The same answer, for `--selftest-window`.
     var suggestedWindowForTest: WindowInfo? { suggestedWindow }
 
+    /// Whether a click at this point would take the whole of this screen: no
+    /// window under it, so it is bare desktop.
+    ///
+    /// Reported 2026-09-11 as "在第二个桌面，进行截图，无法识别到桌面，可以识别到
+    /// menubar". A new Space has nothing on it but the menu bar, and the picker
+    /// offered nothing else, so a click did nothing. Space 1 only seemed to work:
+    /// the log put its "desktop" hover on Claude, maximised under every point.
+    /// The screen is taken as an area, so it holds what was on screen, menu bar
+    /// and all — what the outline covered.
+    private func offersScreen(at pointInAppKitGlobal: CGPoint?) -> Bool {
+        guard isSuggesting, picker.hovered == nil, let pointInAppKitGlobal else { return false }
+        return screenFrame.contains(pointInAppKitGlobal)
+    }
+
+    private var suggestsScreen: Bool { offersScreen(at: model.pointerInAppKitGlobal) }
+
+    /// The same answer, for `--selftest-window`.
+    var suggestsScreenForTest: Bool { suggestsScreen }
+
+    /// What the badge calls whatever a click would take.
+    private var suggestionName: String? {
+        suggestedWindow?.displayName ?? (suggestsScreen ? "Full Screen" : nil)
+    }
+
+    /// Takes this screen through the same door a drag uses, so freeze mode, the
+    /// delay and the confirmation step treat it exactly as they treat a rect.
+    private func confirmScreen() {
+        guard let screen = window?.screen else { return }
+        model.setSelection(screen.frame, on: screen)
+        callbacks.confirmArea()
+    }
+
     /// Where a press landed, until it either travels far enough to be a drag or
     /// is released as a plain click.
     ///
@@ -341,16 +373,20 @@ final class OverlayView: NSView {
         }
 
         // A press that never travelled far enough to be a drag, so it is a
-        // click: it takes the suggested window, or it does nothing at all.
+        // click: it takes the suggested window, or the screen when there is no
+        // window under it (`offersScreen`), or while armed nothing at all.
         //
-        // Doing nothing is the right answer for a click on bare desktop, and for
-        // any click while armed. Dismissing on it would be a second,
-        // undiscoverable way to lose a selection that Escape already handles
-        // visibly.
+        // Doing nothing is the right answer for any click while armed.
+        // Dismissing on it would be a second, undiscoverable way to lose a
+        // selection that Escape already handles visibly.
         if pressOrigin != nil {
             pressOrigin = nil
             if isSuggesting { picker.updateHover(atAppKitGlobal: point) }
-            if let suggested = suggestedWindow { callbacks.confirmWindow(suggested.id) }
+            if let suggested = suggestedWindow {
+                callbacks.confirmWindow(suggested.id)
+            } else if offersScreen(at: point) {
+                confirmScreen()
+            }
             return
         }
 
@@ -416,6 +452,8 @@ final class OverlayView: NSView {
             callbacks.confirmArea()
         } else if let suggested = suggestedWindow {
             callbacks.confirmWindow(suggested.id)
+        } else if suggestsScreen {
+            confirmScreen()
         } else {
             NSSound.beep()
         }
@@ -454,7 +492,7 @@ final class OverlayView: NSView {
         // is only a suggestion. Never both, and never nothing while something is
         // highlighted.
         let badge = highlight.map { "\(Int($0.width)) × \(Int($0.height))" }
-            ?? suggestedWindow?.displayName
+            ?? suggestionName
         return DrawInputs(
             highlight: highlight,
             suggestion: suggestionRect,
@@ -531,10 +569,11 @@ final class OverlayView: NSView {
         model.rectInAppKitGlobal.map(toLocal)
     }
 
-    /// The suggested window's frame in this view's coordinates, or nil.
+    /// The suggested window's frame in this view's coordinates — or all of it,
+    /// when the suggestion is the screen — or nil.
     private var suggestionRect: CGRect? {
-        guard suggestedWindow != nil else { return nil }
-        return picker.hoveredFrameInAppKitGlobal.map(toLocal)
+        if suggestedWindow != nil { return picker.hoveredFrameInAppKitGlobal.map(toLocal) }
+        return suggestsScreen ? bounds : nil
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -560,9 +599,9 @@ final class OverlayView: NSView {
             if let pointer = model.pointerInAppKitGlobal, model.phase == .dragging {
                 drawCrosshair(at: toLocal(CGRect(origin: pointer, size: .zero)).origin)
             }
-            if let suggestion, let suggested = suggestedWindow {
+            if let suggestion, let name = suggestionName {
                 drawSuggestion(suggestion)
-                drawBadge(suggested.displayName, near: suggestion)
+                drawBadge(name, near: suggestion)
             }
             drawHint()
             return
@@ -808,9 +847,14 @@ final class OverlayView: NSView {
         let belowFits = below.minY >= bounds.minY + margin
         let aboveFits = above.maxY <= bounds.maxY - margin
 
+        // Neither band fits: a rect as tall as the screen, which is what a bare
+        // desktop offers — the screen itself. `above` would be off the top edge,
+        // so inside, in the middle.
+        let inside = at(x: centred, y: highlight.midY - boxSize.height / 2)
+
         // Below unless there is no room for it, exactly as before the loupe was
         // ever consulted: the fallback must not become the common case.
-        let preferred = belowFits ? below : above
+        let preferred = belowFits ? below : aboveFits ? above : inside
         let alternate = belowFits ? above : below
         let alternateFits = belowFits ? aboveFits : belowFits
         if isClear(preferred) { return preferred }
@@ -836,7 +880,7 @@ final class OverlayView: NSView {
             return badgeLayout("\(Int(highlight.width)) × \(Int(highlight.height))",
                                near: highlight).box
         }
-        guard let suggestion = suggestionRect, let name = suggestedWindow?.displayName
+        guard let suggestion = suggestionRect, let name = suggestionName
         else { return nil }
         return badgeLayout(name, near: suggestion).box
     }
