@@ -10885,7 +10885,7 @@ enum SelfTest {
         }
 
         // The monthly re-authorisation path. The whole flow needs
-        // `tccutil reset ScreenCapture com.boli.duoshot` and a human, but the
+        // `tccutil reset ScreenCapture com.jizhiovo.duoshot` and a human, but the
         // classification that gates it can be checked here — if userDeclined is
         // not recognised, DuoShot silently stops working once a month with no
         // prompt and no explanation.

@@ -24,7 +24,7 @@ OUT="${TMPDIR:-/tmp}/popup-pick-probe"
 mkdir -p "$OUT"
 
 log stream --style compact --level debug \
-    --predicate 'subsystem == "com.boli.duoshot" AND category == "overlay"' \
+    --predicate 'subsystem == "com.jizhiovo.duoshot" AND category == "overlay"' \
     > "$OUT/overlay.log" 2>&1 &
 LOG_PID=$!
 trap 'kill $LOG_PID 2>/dev/null' EXIT

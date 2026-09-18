@@ -212,7 +212,7 @@ nonisolated enum ShareSelfTest {
         let secret = "probe-\(UUID().uuidString.prefix(8))"
         for synchronizable in [true, false] {
             let store = LinkdropCredentials(
-                service: "com.boli.duoshot.share", account: "selftest-probe",
+                service: "com.jizhiovo.duoshot.share", account: "selftest-probe",
                 synchronizable: synchronizable)
             store.delete()
             let wrote = store.save(secret)
@@ -231,7 +231,7 @@ nonisolated enum ShareSelfTest {
         // answer means anything — entitlements are a property of the signature.
         let probeQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "com.boli.duoshot.share",
+            kSecAttrService as String: "com.jizhiovo.duoshot.share",
             kSecAttrAccount as String: "selftest-sync-probe",
             kSecAttrSynchronizable as String: kCFBooleanTrue as Any,
         ]

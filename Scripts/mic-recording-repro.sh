@@ -40,7 +40,7 @@ SECONDS_PER_TAKE="${2:-5}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/build/DuoShot.app"
 OUT="$ROOT/build/mic-repro"
-BUNDLE_ID="com.boli.duoshot"
+BUNDLE_ID="com.jizhiovo.duoshot"
 EXEC_NAME="DuoShot.app/Contents/MacOS/DuoShot"
 
 test -x "$APP/Contents/MacOS/DuoShot" || { echo "build it first: make sign"; exit 1; }

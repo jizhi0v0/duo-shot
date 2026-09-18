@@ -282,7 +282,7 @@ The rules that are easy to break from either side:
 The maintainer reports UI bugs in Chinese, with screenshots and screen recordings, saved
 in the folder named by the `saveDirectory` preference. Those files are evidence.
 Read their pixels. DuoShot's own `Log.capture` lines are the other half — read
-them with `/usr/bin/log show --predicate 'subsystem == "com.boli.duoshot"'`. A
+them with `/usr/bin/log show --predicate 'subsystem == "com.jizhiovo.duoshot"'`. A
 bare `log` in zsh is a shell builtin and prints nothing useful, which reads
 exactly like "the app logged nothing"; it cost several rounds of empty reads
 before anyone looked.

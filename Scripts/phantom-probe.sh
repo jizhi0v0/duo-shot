@@ -26,7 +26,7 @@ OUT="${TMPDIR:-/tmp}/phantom-probe"
 mkdir -p "$OUT"
 
 log stream --style compact --level debug \
-    --predicate 'subsystem == "com.boli.duoshot" AND category == "overlay"' \
+    --predicate 'subsystem == "com.jizhiovo.duoshot" AND category == "overlay"' \
     > "$OUT/overlay.log" 2>&1 &
 LOG_PID=$!
 trap 'kill $LOG_PID 2>/dev/null' EXIT
@@ -42,7 +42,7 @@ sleep 0.3
 echo
 echo "=== picker: hovers and drops, same clock ==="
 grep -E "hover|picker (loaded|dropped|re-ranked)" "$OUT/overlay.log" \
-    | sed 's/.*\[com.boli.duoshot:overlay\] //' \
+    | sed 's/.*\[com.jizhiovo.duoshot:overlay\] //' \
     | tail -50
 echo
 echo "full logs: $OUT"

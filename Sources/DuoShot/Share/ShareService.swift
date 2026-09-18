@@ -55,7 +55,7 @@ final class ShareService {
 
     /// The Keychain item. Service string rather than the app's bundle id so the
     /// token survives a bundle rename, and so two builds of the same app share it.
-    static let credentials = LinkdropCredentials(service: "com.boli.duoshot.share")
+    static let credentials = LinkdropCredentials(service: "com.jizhiovo.duoshot.share")
 
     private init() {}
 

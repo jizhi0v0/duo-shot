@@ -3,12 +3,12 @@
 -include local.mk
 
 APP_NAME  := DuoShot
-BUNDLE_ID := com.boli.duoshot
-# The Team ID the checked-in Designated Requirement was recorded with.
-# `dr-check` substitutes TEAM_ID for it, so overriding TEAM_ID still asserts
-# the full requirement -- just for the certificate actually doing the signing.
-DR_TEAM_ID := RS59HDH7Y3
-TEAM_ID   ?= $(DR_TEAM_ID)
+BUNDLE_ID ?= com.jizhiovo.duoshot
+# Overridable because a fork cannot sign with somebody else's certificate. Both
+# reach the Designated Requirement, which is what the Screen Recording grant is
+# keyed on -- see dr-check, which builds the expected DR from these two values
+# rather than from a checked-in literal.
+TEAM_ID   ?= RS59HDH7Y3
 SIGN_ID   ?= Developer ID Application: BO LI ($(TEAM_ID))
 CONFIG    ?= release
 MACOS_MIN ?= 26.0
@@ -104,6 +104,7 @@ bundle: $(BUNDLE_DEPS)
 	printf 'APPL????' > "$(CONTENTS)/PkgInfo"; \
 	if [ -f Resources/AppIcon.icns ]; then cp Resources/AppIcon.icns "$(RES_DIR)/"; fi; \
 	plutil -replace CFBundleVersion -string "$$(date +%Y%m%d%H%M)" "$(CONTENTS)/Info.plist"; \
+	plutil -replace CFBundleIdentifier -string "$(BUNDLE_ID)" "$(CONTENTS)/Info.plist"; \
 	plutil -lint "$(CONTENTS)/Info.plist" >/dev/null; \
 	echo "bundled $(APP)"
 
@@ -130,10 +131,16 @@ sign: bundle
 # signs a second time, with --timestamp, which is a different codesign
 # invocation from the one `verify` checked. The build that actually ships is
 # the last one that should be taken on trust.
+#
+# The expected string is rendered from BUNDLE_ID and TEAM_ID rather than kept as
+# a literal: a fork signs with its own identifier and its own certificate, and a
+# checked-in literal would make this assertion fail for everyone but one machine
+# -- which is the fastest way to have it commented out and then be worth nothing.
 dr-check:
 	@codesign --verify --strict --verbose=2 "$(APP)" 2>&1 | sed 's/^/  /'
 	@codesign -d -r- "$(APP)" 2>/dev/null > build/actual-requirements.txt
-	@sed 's/= $(DR_TEAM_ID)$$/= $(TEAM_ID)/' Resources/expected-requirements.txt > build/expected-requirements.txt
+	@sed -e 's/@BUNDLE_ID@/$(BUNDLE_ID)/' -e 's/@TEAM_ID@/$(TEAM_ID)/' \
+		Resources/expected-requirements.txt > build/expected-requirements.txt
 	@if diff -u build/expected-requirements.txt build/actual-requirements.txt; then \
 		echo "  DR stable: $$(cat build/actual-requirements.txt)"; \
 	else \
@@ -211,7 +218,12 @@ mic-repro: verify
 # errSecInternalComponent. Testing the *behaviour* of an older OS is a separate
 # job: sign here, `ditto` the bundle across, and let it inherit the TCC grant,
 # which works because the Designated Requirement contains no path and no cdhash.
-# Set CHECK_HOST (user@host) in local.mk; there is deliberately no default.
+#
+# No default host: this is somebody's second Mac, and the only person who knows
+# its address is whoever owns it. Put CHECK_HOST := user@host in the untracked
+# local.mk, set it in the environment, or pass it per call:
+#
+#   make check-26 CHECK_HOST=you@your-other-mac.local
 #
 # The other Mac's *default* toolchain is not trusted. It has to be a whole
 # Xcode 26.x, not the 27 Xcode pointed at a 26 SDK with `--sdk`:
@@ -226,12 +238,20 @@ mic-repro: verify
 CHECK_HOST  ?=
 CHECK_DIR   ?= ~/duo-shot-sdkcheck
 CHECK_XCODE ?= /Applications/Xcode-26.6.app
-NEED_CHECK_HOST = @test -n "$(CHECK_HOST)" || { echo "CHECK_HOST is not set -- put CHECK_HOST := user@host in local.mk"; exit 1; }
 CHECK_ENV = export DEVELOPER_DIR="$(CHECK_XCODE)/Contents/Developer";
+
+# Both remote targets open with this. Without it the first ssh fails with
+# `Could not resolve hostname` on an empty string, which names the wrong problem.
+REQUIRE_CHECK_HOST = if [ -z "$(CHECK_HOST)" ]; then \
+		echo "CHECK_HOST is not set -- this target needs a second Mac running the"; \
+		echo "deployment minimum. Example:"; \
+		echo "  make $@ CHECK_HOST=you@your-other-mac.local"; \
+		exit 2; \
+	fi
 
 .PHONY: check-26
 check-26:
-	$(NEED_CHECK_HOST)
+	@$(REQUIRE_CHECK_HOST)
 	@echo "syncing to $(CHECK_HOST):$(CHECK_DIR)"
 	@rsync -az --delete \
 		--exclude '.build' --exclude 'build' --exclude '.git' --exclude 'dist' \
@@ -267,7 +287,7 @@ check-26:
 #      with `screen-capture-access: denied` and nothing else explains why.
 .PHONY: test-mini
 test-mini: verify
-	$(NEED_CHECK_HOST)
+	@$(REQUIRE_CHECK_HOST)
 	@echo "syncing to $(CHECK_HOST):$(CHECK_DIR)"
 	@rsync -az --delete \
 		--exclude '.build' --exclude 'build' --exclude '.git' --exclude 'dist' \
