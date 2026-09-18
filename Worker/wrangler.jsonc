@@ -20,7 +20,7 @@
     // wrong value produces links that 404 while uploads keep succeeding.
     "PUBLIC_BASE": "https://s.example.com",
     "R2_BUCKET_NAME": "duoshot"
-  },
+  }
 
   // Secrets, set with `wrangler secret put <NAME>` -- never in this file:
   //   UPLOAD_TOKEN           the only credential the DuoShot client holds
@@ -34,9 +34,13 @@
   // `cf-cache-status` at all, so every range request still reaches R2. See the
   // note in src/serve.ts for why that is the wanted behaviour.
   //
-  // This file is a template: `Scripts/setup.sh --domain` fills in the domain
-  // and uncomments the route. To keep a deployed copy out of git, put it in
-  // wrangler.local.jsonc (ignored) and deploy with `-c wrangler.local.jsonc`.
+  // Both the domain above and the route below are placeholders.
+  // `Scripts/setup.sh --domain <yours>` fills them in and uncomments the route
+  // (it also puts the comma back on the block above, which JSON needs once this
+  // line stops being a comment). Until then the Worker deploys only to
+  // *.workers.dev, which is enough for everything except a stable link. To keep
+  // a deployed copy out of git, put it in wrangler.local.jsonc (ignored) and
+  // deploy with `-c wrangler.local.jsonc`.
   //
   // "routes": [{ "pattern": "s.example.com", "custom_domain": true }]
 }
