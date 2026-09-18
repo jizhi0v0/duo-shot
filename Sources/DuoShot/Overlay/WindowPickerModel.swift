@@ -30,30 +30,40 @@ final class WindowPickerModel {
     /// translator popup, an inspector palette, a mini player — and those are
     /// exactly what someone reaches for a window screenshot to capture.
     ///
-    /// Then three more, because people screenshot those too: the Dock (20), the
-    /// menu bar (24), and the pop-up menu layer (101), where a menu-bar app's
-    /// popup panel lives — `MenuBarExtra`'s window style and an `NSPopover`
-    /// anchored to a status item both land there. Measured 2026-08-04 on
-    /// DuoUpdater: layer 101, alpha 1.00, 510×367, and still on screen at full
-    /// opacity with the overlay up, so there was nothing wrong with the panel —
-    /// the picker was simply refusing to offer it, and the hover fell through to
-    /// the maximized window behind.
+    /// Then the Dock (20) and the menu bar (24), because people screenshot those
+    /// too, and the band 101–102.
     ///
-    /// 101 was previously excluded on the grounds that "menus and tooltips live
-    /// at 101". Both do, and neither is a reason to keep the layer out: a
-    /// tooltip is turned away by `isPickable(size:)`, and an open menu is a
-    /// perfectly ordinary screenshot target.
+    /// 101 is where a menu-bar app's popup panel lives — `MenuBarExtra`'s window
+    /// style and an `NSPopover` anchored to a status item both land there.
+    /// Measured 2026-08-04 on DuoUpdater: layer 101, alpha 1.00, 510×367, and
+    /// still on screen at full opacity with the overlay up, so there was nothing
+    /// wrong with the panel — the picker was simply refusing to offer it, and
+    /// the hover fell through to the maximized window behind. It was excluded on
+    /// the grounds that "menus and tooltips live at 101". Both do, and neither
+    /// is a reason to keep the layer out: a tooltip is turned away by
+    /// `isPickable(size:)`, and an open menu is a perfectly ordinary screenshot
+    /// target.
+    ///
+    /// 102 is where a panel goes that has to sit over *another app's* 101 window.
+    /// Measured 2026-09-18 on DuoTranslator, whose panel is `popUpMenu + 1`
+    /// deliberately — a full-screen image viewer at 101 would otherwise cover
+    /// the translation of what is in it. Layer 102, alpha 1.00, 480×841, on
+    /// screen, and `SCContentFilter(desktopIndependentWindow:)` returned the
+    /// whole panel: the capture side was never the problem, this allowlist was.
+    /// Reported as "对于 duo-translator 的窗口，无法捕捉到".
     ///
     /// Deliberately *not* everything in between or above — Notification Center
     /// (21) is a full-screen window that would swallow the display, Control
-    /// Center's status items (25) are a couple of dozen 32×30 tiles, and the
-    /// levels above 101 are for overlays and help tags. Negative layers are the
-    /// desktop and its icons.
+    /// Center's status items (25) are a couple of dozen 32×30 tiles, and 103 and
+    /// up are help tags and the menus an app's own 102 panel opens (AppKit
+    /// levels those at `max(101, parent + 1)`), which belong to the window
+    /// underneath rather than being targets of their own. Negative layers are
+    /// the desktop and its icons.
     private func isPickable(layer: Int) -> Bool {
         (0...WindowInfo.topAppLayer).contains(layer)
             || layer == WindowInfo.dockLayer
             || layer == WindowInfo.menuBarLayer
-            || layer == WindowInfo.popUpMenuLayer
+            || (WindowInfo.popUpMenuLayer...WindowInfo.overlayLayer).contains(layer)
     }
 
     /// Below this and it is a shadow helper, a tooltip or a 1×1 spy window.

@@ -211,6 +211,9 @@ extension WindowInfo {
     /// Where a menu-bar app's popup panel sits — and `NSMenu`, and tooltips.
     /// 101, the same number as `NSWindow.Level.popUpMenu`.
     static let popUpMenuLayer = Int(CGWindowLevelForKey(.popUpMenuWindow))
+    /// 102, one above `popUpMenuLayer`: where a panel goes that has to sit over
+    /// another app's own 101 window. See `WindowPickerModel.isPickable(layer:)`.
+    static let overlayLayer = Int(CGWindowLevelForKey(.overlayWindow))
 
     fileprivate init(
         _ window: SCWindow, dockStrip: CGRect?, entries: [CGWindowID: WindowZOrder.Entry]

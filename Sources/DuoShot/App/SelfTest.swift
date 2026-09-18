@@ -3124,7 +3124,7 @@ enum SelfTest {
         return ok
     }
 
-    /// A menu-bar app's popup panel is pickable; the layer above it still is not.
+    /// Panels at 101 and 102 are pickable; the layer above them still is not.
     ///
     /// `MenuBarExtra`'s window style, and `NSPopover` anchored to a status item,
     /// put their panel at `.popUpMenu` (101) — measured 2026-08-04 on DuoUpdater:
@@ -3134,10 +3134,17 @@ enum SelfTest {
     /// the maximized window behind it. Reported as "window screenshot does not
     /// work on this kind of menu popup".
     ///
+    /// 102 is the same story one level up, and it was this test's control until
+    /// 2026-09-18: DuoTranslator's panel is `popUpMenu + 1` on purpose, so that
+    /// another app's full-screen viewer at 101 cannot cover the translation of
+    /// what is in it, and the picker dropped it with "layer 102". Reported as
+    /// "对于 duo-translator 的窗口，无法捕捉到".
+    ///
     /// Not a one-sided assertion: this is an allowlist, and widening it is only
-    /// correct if it stays one. The control is a second panel one level up, at
-    /// `.overlay` (102) — same size, same opacity, same instant — which must
-    /// still be refused. Without it, deleting `isPickable(layer:)` outright
+    /// correct if it stays one. The control is a third panel at `.overlay + 1`
+    /// (103) — same size, same opacity, same instant — which must still be
+    /// refused. That is where help tags sit, and where AppKit puts a menu opened
+    /// from a 102 panel. Without it, deleting `isPickable(layer:)` outright
     /// would pass.
     private static func popupPanelsArePickable(
         _ coordinator: CaptureCoordinator
@@ -3152,9 +3159,11 @@ enum SelfTest {
             return window
         }
         let popup = panel(level: .popUpMenu, x: 120)
-        let above = panel(level: .init(rawValue: NSWindow.Level.popUpMenu.rawValue + 1), x: 520)
+        let overlay = panel(level: .init(rawValue: NSWindow.Level.popUpMenu.rawValue + 1), x: 520)
+        let above = panel(level: .init(rawValue: NSWindow.Level.popUpMenu.rawValue + 2), x: 920)
         defer {
             popup.orderOut(nil)
+            overlay.orderOut(nil)
             above.orderOut(nil)
         }
 
@@ -3176,6 +3185,7 @@ enum SelfTest {
         // be trivially satisfied by an empty `pickable` set.
         let enumerated = Set(windows.map(\.id))
         guard enumerated.contains(CGWindowID(popup.windowNumber)),
+              enumerated.contains(CGWindowID(overlay.windowNumber)),
               enumerated.contains(CGWindowID(above.windowNumber))
         else {
             print("popup panels:  not enumerated — cannot tell")
@@ -3183,9 +3193,11 @@ enum SelfTest {
         }
 
         let popupOffered = pickable.contains(CGWindowID(popup.windowNumber))
+        let overlayOffered = pickable.contains(CGWindowID(overlay.windowNumber))
         let aboveOffered = pickable.contains(CGWindowID(above.windowNumber))
-        let ok = popupOffered && !aboveOffered
+        let ok = popupOffered && overlayOffered && !aboveOffered
         print("popup panels:  popUpMenu(101) pickable=\(popupOffered), "
+            + "overlay(102) pickable=\(overlayOffered), "
             + "one level above pickable=\(aboveOffered) -> \(ok ? "OK" : "FAIL")")
         return ok
     }
