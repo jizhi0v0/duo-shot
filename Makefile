@@ -77,7 +77,8 @@ universal:
 	test -x "$$ARM_BIN"; test -x "$$INTEL_BIN"; \
 	mkdir -p "$$(dirname "$(UNIVERSAL_EXEC)")"; \
 	lipo -create "$$ARM_BIN" "$$INTEL_BIN" -output "$(UNIVERSAL_EXEC)"; \
-	lipo "$(UNIVERSAL_EXEC)" -verify_arch arm64 x86_64; \
+	lipo "$(UNIVERSAL_EXEC)" -verify_arch arm64; \
+	lipo "$(UNIVERSAL_EXEC)" -verify_arch x86_64; \
 	echo "universal $$(lipo -archs "$(UNIVERSAL_EXEC)")"
 
 # --- bundle ------------------------------------------------------------------
