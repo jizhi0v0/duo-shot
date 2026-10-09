@@ -1,7 +1,15 @@
+# Machine-local settings, untracked: CHECK_HOST for the second machine, or
+# TEAM_ID / SIGN_ID for a fork signing with its own Developer ID certificate.
+-include local.mk
+
 APP_NAME  := DuoShot
 BUNDLE_ID := com.boli.duoshot
-TEAM_ID   := RS59HDH7Y3
-SIGN_ID   := Developer ID Application: BO LI ($(TEAM_ID))
+# The Team ID the checked-in Designated Requirement was recorded with.
+# `dr-check` substitutes TEAM_ID for it, so overriding TEAM_ID still asserts
+# the full requirement -- just for the certificate actually doing the signing.
+DR_TEAM_ID := RS59HDH7Y3
+TEAM_ID   ?= $(DR_TEAM_ID)
+SIGN_ID   ?= Developer ID Application: BO LI ($(TEAM_ID))
 CONFIG    ?= release
 MACOS_MIN ?= 26.0
 NOTARY_PROFILE ?= DuoShot
@@ -124,7 +132,8 @@ sign: bundle
 dr-check:
 	@codesign --verify --strict --verbose=2 "$(APP)" 2>&1 | sed 's/^/  /'
 	@codesign -d -r- "$(APP)" 2>/dev/null > build/actual-requirements.txt
-	@if diff -u Resources/expected-requirements.txt build/actual-requirements.txt; then \
+	@sed 's/= $(DR_TEAM_ID)$$/= $(TEAM_ID)/' Resources/expected-requirements.txt > build/expected-requirements.txt
+	@if diff -u build/expected-requirements.txt build/actual-requirements.txt; then \
 		echo "  DR stable: $$(cat build/actual-requirements.txt)"; \
 	else \
 		echo "!! Designated Requirement drifted -- the TCC grant WILL be lost."; \
@@ -201,11 +210,14 @@ mic-repro: verify
 # errSecInternalComponent. Testing the *behaviour* of an older OS is a separate
 # job: sign here, `ditto` the bundle across, and let it inherit the TCC grant,
 # which works because the Designated Requirement contains no path and no cdhash.
-CHECK_HOST ?= bobby@mac-mini.example.ts.net
+# Set CHECK_HOST (user@host) in local.mk; there is deliberately no default.
+CHECK_HOST ?=
 CHECK_DIR  ?= ~/duo-shot-sdkcheck
+NEED_CHECK_HOST = @test -n "$(CHECK_HOST)" || { echo "CHECK_HOST is not set -- put CHECK_HOST := user@host in local.mk"; exit 1; }
 
 .PHONY: check-26
 check-26:
+	$(NEED_CHECK_HOST)
 	@echo "syncing to $(CHECK_HOST):$(CHECK_DIR)"
 	@rsync -az --delete \
 		--exclude '.build' --exclude 'build' --exclude '.git' --exclude 'dist' \
@@ -233,6 +245,7 @@ check-26:
 #      with `screen-capture-access: denied` and nothing else explains why.
 .PHONY: test-mini
 test-mini: verify
+	$(NEED_CHECK_HOST)
 	@echo "syncing to $(CHECK_HOST):$(CHECK_DIR)"
 	@rsync -az --delete \
 		--exclude '.build' --exclude 'build' --exclude '.git' --exclude 'dist' \

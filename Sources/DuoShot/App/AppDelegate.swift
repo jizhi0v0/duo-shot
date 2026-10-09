@@ -292,9 +292,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // A take is finalised before exit because a truncated file is worse than
         // a slow quit. An upload is not: the capture is already on disk, the
         // only loss is a transfer that can be started again, and holding a quit
-        // open for a minute-long upload is the worse trade. The plan writes this
-        // down so nobody drifts into building a resumable queue -- see
-        // plans/quiet-ferrying-parcel.md.
+        // open for a minute-long upload is the worse trade. Written down so
+        // nobody drifts into building a resumable queue.
         //
         // The server end of it is handled too: a record whose bytes never
         // arrived says "the upload did not finish" rather than claiming the link

@@ -34,7 +34,7 @@
 	<key>NSSupportsSuddenTermination</key>
 	<false/>
 	<key>NSHumanReadableCopyright</key>
-	<string>Copyright © 2026 Bo Li. All rights reserved.</string>
+	<string>Copyright © 2026 Bo Li. MIT License.</string>
 	<!--
 	  Microphone IS a usage-string service, unlike Screen Recording: this string
 	  is shown verbatim in the prompt, and an app that touches the microphone

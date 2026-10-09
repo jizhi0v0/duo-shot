@@ -34,5 +34,9 @@
   // `cf-cache-status` at all, so every range request still reaches R2. See the
   // note in src/serve.ts for why that is the wanted behaviour.
   //
-  "routes": [{ "pattern": "s.example.com", "custom_domain": true }]
+  // This file is a template: `Scripts/setup.sh --domain` fills in the domain
+  // and uncomments the route. To keep a deployed copy out of git, put it in
+  // wrangler.local.jsonc (ignored) and deploy with `-c wrangler.local.jsonc`.
+  //
+  // "routes": [{ "pattern": "s.example.com", "custom_domain": true }]
 }

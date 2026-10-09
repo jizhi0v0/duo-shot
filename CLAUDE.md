@@ -25,8 +25,8 @@ make install       # replace /Applications/DuoShot.app AND restart it
   Requirement. The screen-recording grant is keyed on it; `make verify` is the
   assertion and it must stay green.
 - **Two machines, and which one you are on changes what a green build means.**
-  One runs Xcode beta with the newest SDK; the other (`Mac-mini`) runs
-  the deployment minimum. Check before concluding anything:
+  One runs Xcode beta with the newest SDK; the other (`CHECK_HOST`, set in the
+  untracked `local.mk`) runs the deployment minimum. Check before concluding anything:
   `sw_vers -productVersion`, `xcrun --show-sdk-version --sdk macosx`. On the
   minimum machine an ordinary `make verify` already *is* the cross-SDK check,
   and `make check-26` is a no-op that rsyncs to itself. On the newest-SDK
@@ -156,7 +156,7 @@ The rules that are easy to break from either side:
 
 ## Debugging protocol
 
-Bobby reports UI bugs in Chinese, with screenshots and screen recordings, saved
+The maintainer reports UI bugs in Chinese, with screenshots and screen recordings, saved
 in the folder named by the `saveDirectory` preference. Those files are evidence.
 Read their pixels.
 
