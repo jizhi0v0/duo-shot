@@ -27,10 +27,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // What an interrupted click timeline or command-line take left behind:
-        // hidden copies nothing else would ever remove.
-        let staging = StagingStore.shared
-        ClickTimelineJobs.sweep([staging.directory, staging.unsavedDirectory,
-                                 Preferences.shared.saveDirectory])
+        // hidden copies nothing else would ever remove. Every copy is written
+        // into the jobs' work directory and nowhere else.
+        ClickTimelineJobs.sweep([ClickTimelineJobs.shared.workDirectory])
         CLIServer.sweepTakes()
         let granted = ScreenPermission.isGranted
         Log.app.notice("""

@@ -31,6 +31,9 @@ enum CaptureTrash {
     /// - Returns: where it landed in the Trash, or nil if it could not be moved.
     @discardableResult
     static func delete(_ url: URL) async -> URL? {
+        // A click timeline swapped in after this would put the take back
+        // (`ClickTimelineJobs`).
+        await ClickTimelineJobs.shared.stop(url)
         let landed: URL?
         do {
             landed = try await NSWorkspace.shared.recycle([url])[url]

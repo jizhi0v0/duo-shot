@@ -12,14 +12,46 @@ import Foundation
 /// saved file, swaps the copy in only if the file is still the one it started
 /// from (`ClickTimelineEmbedder`), and otherwise leaves it alone.
 ///
+/// **One at a time.** Each job is a copy the size of its take; two at once
+/// double the disk the free-space check allowed for, and the next take can be
+/// recording meanwhile. A take starting never waits for a job.
+///
+/// **Anything that replaces, moves or deletes a take stops its job first**
+/// (`stop`, called by `VideoTrim` and `CaptureTrash`). `replaceItemAt` with
+/// the original gone simply moves the copy into place, so a delete landing
+/// between the job's last check and its swap would bring the take back, and a
+/// trim landing there would be undone under a card that says it was trimmed.
+///
 /// Quitting cancels every job and starts no new one; the takes are already
 /// saved, and what is lost is their timeline. A copy a crash or a kill leaves
 /// behind is removed at the next launch (`sweep`).
 final class ClickTimelineJobs {
-    static let shared = ClickTimelineJobs()
+    static let shared = ClickTimelineJobs(workDirectory: StagingStore.shared.directory)
 
-    private var running: [UUID: ClickTimelineEmbedder.Cancellation] = [:]
+    /// Where every copy is written: staging, which nothing syncs. The launch
+    /// sweep covers exactly this.
+    let workDirectory: URL
+    /// Free space a copy must leave; raised by the self-test to take the
+    /// low-space path on a disk that has room.
+    var reserve = ClickTimelineEmbedder.defaultReserve
+
+    private struct Job {
+        let path: String
+        let cancellation: ClickTimelineEmbedder.Cancellation
+        let task: Task<Result<ClickTimelineEmbedder.Report, ClickTimelineEmbedder.Failure>, Never>
+    }
+
+    private var running: [UUID: Job] = [:]
+    /// The last job queued; the next one starts when it ends.
+    private var tail: Task<Void, Never>?
     private var isQuitting = false
+    private var active = 0
+    /// The most jobs that were ever copying at once, for the self-test.
+    private(set) var peakActiveForTest = 0
+
+    init(workDirectory: URL) {
+        self.workDirectory = workDirectory
+    }
 
     var isIdle: Bool { running.isEmpty }
 
@@ -41,16 +73,27 @@ final class ClickTimelineJobs {
         }
         let id = UUID()
         let path = url.standardizedFileURL.path
-        running[id] = cancellation
+        let previous = tail
+        let workDirectory = workDirectory, reserve = reserve
+        let task = Task { () -> Result<ClickTimelineEmbedder.Report, ClickTimelineEmbedder.Failure> in
+            await previous?.value
+            active += 1
+            peakActiveForTest = max(peakActiveForTest, active)
+            defer { active -= 1 }
+            return await ClickTimelineEmbedder.embed(
+                in: url, pending, workDirectory: workDirectory, reserve: reserve,
+                cancellation: cancellation, fault: fault, failForTest: failForTest)
+        }
+        tail = Task { _ = await task.value }
+        running[id] = Job(path: path, cancellation: cancellation, task: task)
         // With "save to disk" off the take stays in staging, where a capture
         // made meanwhile would prune it from under the copy.
         StagingStore.inUse.insert(path)
         defer {
             running[id] = nil
-            StagingStore.inUse.remove(path)
+            if !running.values.contains(where: { $0.path == path }) { StagingStore.inUse.remove(path) }
         }
-        let outcome = await ClickTimelineEmbedder.embed(
-            in: url, pending, cancellation: cancellation, fault: fault, failForTest: failForTest)
+        let outcome = await task.value
         switch outcome {
         case .success(let report):
             Log.record.notice("""
@@ -67,10 +110,24 @@ final class ClickTimelineJobs {
         return outcome
     }
 
+    /// Stops the job on `url`, if there is one, and returns once it has
+    /// stopped: after this, the job will not touch the file.
+    func stop(_ url: URL) async {
+        let path = url.standardizedFileURL.path
+        let jobs = running.values.filter { $0.path == path }
+        for job in jobs { job.cancellation.cancel() }
+        for job in jobs { _ = await job.task.value }
+    }
+
+    /// `stop`, for callers off the main actor.
+    static func stop(_ url: URL) async {
+        await shared.stop(url)
+    }
+
     /// For quitting: stop every job and start no more.
     func cancelAll() {
         isQuitting = true
-        for cancellation in running.values { cancellation.cancel() }
+        for job in running.values { job.cancellation.cancel() }
     }
 
     func waitUntilIdle(timeout: Duration) async {

@@ -65,6 +65,9 @@ nonisolated enum VideoTrim {
     /// crash halfway through would leave neither take.
     @concurrent
     static func apply(range: CMTimeRange, toFileAt url: URL) async throws -> Outcome {
+        // A click timeline swapped in after this reads the file would undo the
+        // trim (`ClickTimelineJobs`).
+        await ClickTimelineJobs.stop(url)
         let name = url.lastPathComponent
         let asset = AVURLAsset(url: url)
         let before = try? await asset.load(.duration)

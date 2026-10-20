@@ -12,10 +12,21 @@ import Synchronization
 /// `SCRecordingOutput` writes and finalises the movie itself; there is no point
 /// at which a track can be added to it. So the finished file is remuxed:
 /// every audio and video sample is copied as it is — no decode, no encode —
-/// into a new file beside it with the metadata track added, the copy is
+/// into a new file in a work directory (staging) with the metadata track
+/// added, the copy is
 /// checked against the original (`confirmSameMedia`), flushed to disk, and
 /// only then swapped in. Any failure, a change to the file meanwhile, or a
 /// cancellation leaves the original exactly as it was.
+///
+/// **The copy is never written beside the take.** The save folder can be one
+/// a sync client watches, and a hidden file there is still a file: measured
+/// on an iCloud Drive folder, a `.duoshot-clicks-*` copy was picked up and
+/// uploading within ten seconds while it was still growing, so every take went
+/// up twice and a crash left gigabytes syncing to every device. Staging is
+/// not synced, and `replaceItemAt` from it into the iCloud folder, measured the
+/// same day, kept the item's File Provider identifier and document ID, made no
+/// conflict copy, and uploaded once. That needs both on one volume; when they
+/// are not, the take keeps no timeline rather than getting a copy beside it.
 ///
 /// **Why a remux with `AVAssetWriter`, measured on a real take.** Copying the
 /// tracks with `AVMutableMovie` (`insertTimeRange(..., copySampleData: true)`)
@@ -99,10 +110,13 @@ nonisolated enum ClickTimelineEmbedder {
     /// Embeds, or leaves the file alone and says why. Never throws.
     @concurrent
     static func embed(
-        in url: URL, _ pending: Pending, cancellation: Cancellation = Cancellation(),
+        in url: URL, _ pending: Pending, workDirectory: URL, reserve: Int64 = defaultReserve,
+        cancellation: Cancellation = Cancellation(),
         fault: Fault = .none, failForTest: Bool = false
     ) async -> Result<Report, Failure> {
         do {
+            // Cancelled while it waited its turn.
+            guard !cancellation.isCancelled else { throw Failure(message: "cancelled") }
             let identity = try fileIdentity(url)
             let asset = AVURLAsset(url: url)
             let duration = try await asset.load(.duration)
@@ -128,8 +142,12 @@ nonisolated enum ClickTimelineEmbedder {
                 report.skipped = "no clicks inside the recorded area"
                 return .success(report)
             }
+            if let reason = try roomForCopy(of: url, size: identity.size, in: workDirectory, reserve: reserve) {
+                report.skipped = reason
+                return .success(report)
+            }
 
-            let destination = url.deletingLastPathComponent()
+            let destination = workDirectory
                 .appendingPathComponent("\(sweepPrefix)\(UUID().uuidString.prefix(8))")
                 .appendingPathExtension(url.pathExtension.isEmpty ? "mp4" : url.pathExtension)
             defer { try? FileManager.default.removeItem(at: destination) }
@@ -156,6 +174,36 @@ nonisolated enum ClickTimelineEmbedder {
         } catch {
             return .failure(Failure(message: error.localizedDescription))
         }
+    }
+
+    /// Free space the copy must leave behind it, on top of its own size: about
+    /// 27 minutes of recording at a typical screen bitrate (750 MB per two
+    /// minutes, measured). A take can start while a timeline is being added,
+    /// and it records into staging, the same volume as the copy, so a copy
+    /// that left the disk near full would end the next take, not this one.
+    static let defaultReserve: Int64 = 10 << 30
+
+    /// Nil when the copy can be made; otherwise why not. Never beside the take
+    /// (see the type's comment), so the work directory has to be on the take's
+    /// own volume for `replaceItemAt` to swap rather than fail.
+    private static func roomForCopy(
+        of url: URL, size: off_t, in workDirectory: URL, reserve: Int64
+    ) throws -> String? {
+        try FileManager.default.createDirectory(at: workDirectory, withIntermediateDirectories: true)
+        var folder = stat(), work = stat()
+        guard stat(url.deletingLastPathComponent().path, &folder) == 0,
+              stat(workDirectory.path, &work) == 0
+        else { throw Failure(message: "cannot read the volume of the take or of staging") }
+        guard folder.st_dev == work.st_dev else {
+            return "the take is on another volume than staging"
+        }
+        let available = try workDirectory
+            .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+            .volumeAvailableCapacityForImportantUsage ?? 0
+        guard available >= Int64(size) + reserve else {
+            return "not enough free space: \(available >> 20) MB free, the copy needs \(Int64(size) >> 20) MB and leaves \(reserve >> 20) MB"
+        }
+        return nil
     }
 
     /// The prefix of every copy this writes, for the sweep at launch: a copy

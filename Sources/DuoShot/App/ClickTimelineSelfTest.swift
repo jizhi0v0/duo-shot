@@ -274,8 +274,10 @@ enum ClickTimelineSelfTest {
         cancellation.cancel()
         let cancelOutcome = await ClickTimelineJobs.shared.run(pending, into: cancelled, cancellation: cancellation)
         intact = try await mediaDigest(of: cancelled) == mediaDigest(of: before)
-        let leftovers = ((try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? [])
-            .filter { $0.hasPrefix(ClickTimelineEmbedder.sweepPrefix) }
+        let leftovers = [directory, ClickTimelineJobs.shared.workDirectory].flatMap {
+            ((try? FileManager.default.contentsOfDirectory(atPath: $0.path)) ?? [])
+                .filter { $0.hasPrefix(ClickTimelineEmbedder.sweepPrefix) }
+        }
         let cancelMessage: String? = if case .failure(let f) = cancelOutcome { f.message } else { nil }
         check(cancelMessage == "cancelled" && intact && leftovers.isEmpty,
               "cancelled: original untouched, no copy left behind",
@@ -321,7 +323,188 @@ enum ClickTimelineSelfTest {
                 && FileManager.default.fileExists(atPath: keeper.path),
               "the orphaned copy removed, the other file kept", "removed \(swept)")
         try? FileManager.default.removeItem(at: sweepDirectory)
+
+        try await jobContract(directory: directory, before: before, insideA: insideA, insideB: insideB,
+                              pending: pending, duration: result.duration)
         return finish()
+    }
+
+    /// (12)–(17): the background job as the app runs it.
+    private static func jobContract(
+        directory: URL, before: URL, insideA: CGPoint, insideB: CGPoint,
+        pending: ClickTimelineEmbedder.Pending, duration: Double
+    ) async throws {
+        let staging = ClickTimelineJobs.shared.workDirectory
+        func copies() -> Set<String> {
+            Set(((try? FileManager.default.contentsOfDirectory(atPath: staging.path)) ?? [])
+                .filter { $0.hasPrefix(ClickTimelineEmbedder.sweepPrefix) })
+        }
+        func fresh(_ name: String) throws -> URL {
+            let url = directory.appendingPathComponent(name)
+            try? FileManager.default.removeItem(at: url)
+            try FileManager.default.copyItem(at: before, to: url)
+            return url
+        }
+        /// Until a copy appears in staging — the job is mid-copy — or 30 s.
+        func waitForCopy() async -> Bool {
+            let start = copies()
+            let deadline = ContinuousClock.now + .seconds(30)
+            while ContinuousClock.now < deadline {
+                if !copies().subtracting(start).isEmpty { return true }
+                try? await Task.sleep(for: .milliseconds(1))
+            }
+            return false
+        }
+        func hasTrack(_ url: URL) async -> Bool {
+            !((try? await AVURLAsset(url: url).loadTracks(withMediaType: .metadata)) ?? []).isEmpty
+        }
+        typealias Outcome = Result<ClickTimelineEmbedder.Report, ClickTimelineEmbedder.Failure>
+        func message(_ outcome: Outcome) -> String {
+            switch outcome {
+            case .success(let report): "embedded \(report.clicks)\(report.skipped.map { ", skipped: \($0)" } ?? "")"
+            case .failure(let failure): failure.message
+            }
+        }
+
+        print("(12) a take stopped through the coordinator is saved, then gets its timeline, copied in staging")
+        let saveFolder = directory.appendingPathComponent("saved", isDirectory: true)
+        try? FileManager.default.removeItem(at: saveFolder)
+        try FileManager.default.createDirectory(at: saveFolder, withIntermediateDirectories: true)
+        let preferences = Preferences.shared
+        let saved = (preferences.copyToClipboard, preferences.playsSound, preferences.recordingShowsCursor,
+                     preferences.recordingMicrophone, preferences.recordingShowsClicks)
+        preferences.copyToClipboard = false
+        preferences.playsSound = false
+        preferences.recordingShowsCursor = true
+        preferences.recordingMicrophone = false
+        preferences.recordingShowsClicks = false
+        defer {
+            preferences.copyToClipboard = saved.0
+            preferences.playsSound = saved.1
+            preferences.recordingShowsCursor = saved.2
+            preferences.recordingMicrophone = saved.3
+            preferences.recordingShowsClicks = saved.4
+        }
+        let recorder = RecordingCoordinator(overlay: OverlayController())
+        recorder.saveDirectoryOverride = saveFolder
+        var outputs: [OutputPipeline.RecordingOutput] = []
+        recorder.onResult = { outputs.append($0) }
+        await recorder.perform(.recordFullscreen)
+        if recorder.isRecording {
+            try await Task.sleep(for: .milliseconds(800))
+            _ = try await postClick(at: insideA, button: .left)
+            try await Task.sleep(for: .milliseconds(500))
+            _ = try await postClick(at: insideB, button: .left)
+            try await Task.sleep(for: .milliseconds(800))
+            await recorder.perform(.recordFullscreen)
+        }
+        let take = outputs.first?.url
+        let jobs = ClickTimelineJobs.shared
+        var sawJob = false, copyInStaging = false
+        var strangers: Set<String> = []
+        let startCopies = copies()
+        let deadline = ContinuousClock.now + .seconds(60)
+        while take != nil, ContinuousClock.now < deadline {
+            if !jobs.isIdle { sawJob = true }
+            if !copies().subtracting(startCopies).isEmpty { copyInStaging = true }
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: saveFolder.path)) ?? []
+            strangers.formUnion(names.filter { $0 != take?.lastPathComponent })
+            if sawJob, jobs.isIdle { break }
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        var savedClicks: [CLIClick]?
+        if let take { savedClicks = try? await ClickTimeline.read(from: take) }
+        check(take?.deletingLastPathComponent().standardizedFileURL == saveFolder.standardizedFileURL
+                && savedClicks?.count == 4,
+              "saved to the save folder, and its 2 clicks (down and up) are in it afterwards",
+              "take \(take?.lastPathComponent ?? "none"), clicks \(savedClicks?.count ?? -1)")
+        check(sawJob && copyInStaging && strangers.isEmpty,
+              "the copy was made in staging, and nothing but the take ever appeared in the save folder",
+              "job seen \(sawJob), copy in staging \(copyInStaging), other files in the save folder \(strangers.sorted())")
+
+        print("(13) a file changed while its timeline is copied is left alone")
+        let changed = try fresh("clicks-changed.mp4")
+        let changedJob = Task { await ClickTimelineJobs.shared.run(pending, into: changed) }
+        let changedInFlight = await waitForCopy()
+        // The same bytes, touched: only the identity differs.
+        try FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: changed.path)
+        let changedOutcome = await changedJob.value
+        var intact = try await mediaDigest(of: changed) == mediaDigest(of: before)
+        var track = await hasTrack(changed)
+        check(changedInFlight && message(changedOutcome).contains("changed") && intact && !track,
+              "refused, the file as it was, no track",
+              "in flight \(changedInFlight): \(message(changedOutcome)), intact=\(intact), track=\(track)")
+
+        print("(14) quitting stops a job that is copying, and starts no more")
+        let quitting = ClickTimelineJobs(workDirectory: staging)
+        let quitFile = try fresh("clicks-quit.mp4")
+        let quitJob = Task { await quitting.run(pending, into: quitFile) }
+        let quitInFlight = await waitForCopy()
+        let copiesAtQuit = copies()
+        quitting.cancelAll()
+        let quitOutcome = await quitJob.value
+        let afterQuit = await quitting.run(pending, into: quitFile)
+        intact = try await mediaDigest(of: quitFile) == mediaDigest(of: before)
+        track = await hasTrack(quitFile)
+        let leftover = copies().intersection(copiesAtQuit)
+        check(quitInFlight && message(quitOutcome) == "cancelled" && message(afterQuit) == "DuoShot is quitting"
+                && intact && !track && leftover.isEmpty && quitting.isIdle,
+              "the running job cancelled, the take untouched, its copy gone; the next one refused",
+              "in flight \(quitInFlight): \(message(quitOutcome)); then \(message(afterQuit)); intact=\(intact) track=\(track) leftover \(leftover.sorted())")
+
+        print("(15) a trim and a delete stop the job on their file first")
+        let trimFile = try fresh("clicks-trim-during-job.mp4")
+        let trimJob = Task { await ClickTimelineJobs.shared.run(pending, into: trimFile) }
+        let trimInFlight = await waitForCopy()
+        let cut = 1.0
+        _ = try await VideoTrim.apply(
+            range: CMTimeRange(start: CMTime(seconds: cut, preferredTimescale: 600),
+                               end: CMTime(seconds: duration, preferredTimescale: 600)),
+            toFileAt: trimFile)
+        let trimOutcome = await trimJob.value
+        let trimmedLength = (try? await AVURLAsset(url: trimFile).load(.duration).seconds) ?? 0
+        check(trimInFlight && message(trimOutcome) == "cancelled" && trimmedLength < duration - cut / 2,
+              "trim: the job was cancelled, the trim stands",
+              String(format: "in flight %@: %@, %.2f s of %.2f s", "\(trimInFlight)", message(trimOutcome),
+                     trimmedLength, duration))
+
+        let deleteFile = try fresh("clicks-delete-during-job.mp4")
+        let deleteJob = Task { await ClickTimelineJobs.shared.run(pending, into: deleteFile) }
+        let deleteInFlight = await waitForCopy()
+        let binned = await CaptureTrash.delete(deleteFile)
+        let deleteOutcome = await deleteJob.value
+        let resurrected = FileManager.default.fileExists(atPath: deleteFile.path)
+        if let binned { try? FileManager.default.removeItem(at: binned) }
+        check(deleteInFlight && binned != nil && message(deleteOutcome) == "cancelled" && !resurrected,
+              "delete: the job was cancelled, the take stays in the Trash",
+              "in flight \(deleteInFlight): \(message(deleteOutcome)), binned \(binned != nil), back in place \(resurrected)")
+
+        print("(16) without room for the copy and a take after it, no copy is made")
+        let cramped = ClickTimelineJobs(workDirectory: staging)
+        cramped.reserve = Int64.max / 4
+        let crampedFile = try fresh("clicks-low-space.mp4")
+        let crampedCopies = copies()
+        let crampedOutcome = await cramped.run(pending, into: crampedFile)
+        track = await hasTrack(crampedFile)
+        intact = try await mediaDigest(of: crampedFile) == mediaDigest(of: before)
+        let skippedForSpace: Bool = if case .success(let r) = crampedOutcome {
+            r.skipped?.contains("free space") == true
+        } else { false }
+        check(skippedForSpace && !track && intact && copies() == crampedCopies,
+              "skipped, and says why; the take as it was",
+              "\(message(crampedOutcome)), track=\(track), intact=\(intact)")
+
+        print("(17) two jobs never copy at once")
+        let serial = ClickTimelineJobs(workDirectory: staging)
+        let first = try fresh("clicks-serial-1.mp4"), second = try fresh("clicks-serial-2.mp4")
+        async let one = serial.run(pending, into: first)
+        async let two = serial.run(pending, into: second)
+        let (oneOutcome, twoOutcome) = await (one, two)
+        let firstTrack = await hasTrack(first), secondTrack = await hasTrack(second)
+        let bothTracks = firstTrack && secondTrack
+        check(serial.peakActiveForTest == 1 && bothTracks,
+              "both embedded, one after the other",
+              "peak at once \(serial.peakActiveForTest); \(message(oneOutcome)); \(message(twoOutcome))")
     }
 
     // MARK: - Quit timing (a measurement, not in `make test`)
@@ -410,8 +593,10 @@ enum ClickTimelineSelfTest {
         let unwind = Date().timeIntervalSince(cancelAt)
         stat(large.path, &info)
         let identityAfter = (info.st_ino, info.st_size, info.st_mtimespec.tv_sec, info.st_mtimespec.tv_nsec)
-        let leftovers = ((try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? [])
-            .filter { $0.hasPrefix(ClickTimelineEmbedder.sweepPrefix) }
+        let leftovers = [directory, ClickTimelineJobs.shared.workDirectory].flatMap {
+            ((try? FileManager.default.contentsOfDirectory(atPath: $0.path)) ?? [])
+                .filter { $0.hasPrefix(ClickTimelineEmbedder.sweepPrefix) }
+        }
         let message: String = if case .failure(let f) = outcome { f.message } else { "finished anyway" }
         print(String(format: "quit:          cancelled 1 s in, unwound in %.3f s (%@); file unchanged: %@; copies left: %d",
                      unwind, message, identityBefore == identityAfter ? "yes" : "NO", leftovers.count))
