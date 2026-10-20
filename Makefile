@@ -26,6 +26,7 @@ MACOS_DIR := $(CONTENTS)/MacOS
 RES_DIR   := $(CONTENTS)/Resources
 EXEC      := $(MACOS_DIR)/$(APP_NAME)
 UNIVERSAL_EXEC := build/universal/$(APP_NAME)
+UNIVERSAL_CLIENT := build/universal/duoshot-cli
 ARM64_SCRATCH  := .build/universal-arm64
 X86_64_SCRATCH := .build/universal-x86_64
 # Hardened Runtime denies the microphone outright, with NO prompt, unless the
@@ -86,7 +87,11 @@ universal:
 	lipo -create "$$ARM_BIN" "$$INTEL_BIN" -output "$(UNIVERSAL_EXEC)"; \
 	lipo "$(UNIVERSAL_EXEC)" -verify_arch arm64; \
 	lipo "$(UNIVERSAL_EXEC)" -verify_arch x86_64; \
-	echo "universal $$(lipo -archs "$(UNIVERSAL_EXEC)")"
+	lipo -create "$$(dirname "$$ARM_BIN")/duoshot-cli" "$$(dirname "$$INTEL_BIN")/duoshot-cli" \
+		-output "$(UNIVERSAL_CLIENT)"; \
+	lipo "$(UNIVERSAL_CLIENT)" -verify_arch arm64; \
+	lipo "$(UNIVERSAL_CLIENT)" -verify_arch x86_64; \
+	echo "universal $$(lipo -archs "$(UNIVERSAL_EXEC)"), client $$(lipo -archs "$(UNIVERSAL_CLIENT)")"
 
 # --- bundle ------------------------------------------------------------------
 # Assembled by hand on purpose. No SwiftPM resources anywhere in this project:
@@ -165,13 +170,14 @@ verify: sign dr-check client
 # signed $(BUNDLE_ID).cli), so an agent running it would have read files with
 # DuoShot's grants. It is not part of the app's Designated Requirement.
 # `make install` puts it in ~/.local/bin; the self-test finds it next to the
-# bundle. Native slice only; `dist` does not ship it.
-CLIENT     := build/duoshot
-CLIENT_ID  := $(BUNDLE_ID).cli
-CLIENT_BIN ?= $$(swift build -c $(CONFIG) --show-bin-path)/duoshot-cli
+# bundle. `dist-app` builds it from both slices, like the app.
+CLIENT      := build/duoshot
+CLIENT_ID   := $(BUNDLE_ID).cli
+CLIENT_DEPS ?= build
+CLIENT_BIN  ?= $$(swift build -c $(CONFIG) $(SWIFT_FLAGS) --show-bin-path)/duoshot-cli
 
 .PHONY: client
-client: build
+client: $(CLIENT_DEPS)
 	@set -eu; \
 	BIN="$(CLIENT_BIN)"; \
 	test -x "$$BIN" || { echo "missing product: $$BIN"; exit 1; }; \
@@ -521,7 +527,13 @@ install: verify
 # way it ships. It exists so that binary can be inspected and tried without
 # sending anything to Apple.
 dist-app:
-	@$(MAKE) verify BUNDLE_DEPS=universal BUNDLE_EXEC='$(UNIVERSAL_EXEC)' SELFTEST=0
+	@$(MAKE) verify BUNDLE_DEPS=universal BUNDLE_EXEC='$(UNIVERSAL_EXEC)' \
+		CLIENT_DEPS=universal CLIENT_BIN='$(UNIVERSAL_CLIENT)' SELFTEST=0
+	@codesign --force --sign "$(SIGN_ID)" --identifier $(CLIENT_ID) \
+		--options runtime --timestamp "$(CLIENT)"
+	@lipo "$(CLIENT)" -verify_arch arm64
+	@lipo "$(CLIENT)" -verify_arch x86_64
+	@codesign --verify --strict "$(CLIENT)" && echo "signed $(CLIENT) for release"
 	@codesign --force \
 		--sign "$(SIGN_ID)" \
 		--identifier $(BUNDLE_ID) \
@@ -543,6 +555,14 @@ dist: dist-app
 	@ditto -c -k --keepParent "$(APP)" "dist/$(APP_NAME).zip"
 	@rm -f "dist/$(APP_NAME)-submit.zip"
 	@echo "notarized dist/$(APP_NAME).zip"
+	@# The client is a bare executable: notarized, but it cannot be stapled, so
+	@# Gatekeeper looks its ticket up online. Not "duoshot.zip": on a
+	@# case-insensitive volume that is the same file as DuoShot.zip.
+	@rm -f dist/duoshot-cli.zip
+	@ditto -c -k "$(CLIENT)" dist/duoshot-cli.zip
+	@xcrun notarytool submit dist/duoshot-cli.zip \
+		--keychain-profile "$(NOTARY_PROFILE)" --wait
+	@echo "notarized dist/duoshot-cli.zip"
 
 clean:
 	rm -rf .build build dist
