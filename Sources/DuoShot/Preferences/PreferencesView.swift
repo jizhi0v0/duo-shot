@@ -15,8 +15,8 @@ import UniformTypeIdentifiers
 
 // MARK: - General
 
-/// "Allow command-line capture". Session-only: it is off at every launch and
-/// is not a preference at all — see `CommandLineAccess` for why. The switch
+/// "Allow command-line capture". Kept across launches, read from the
+/// persistent domain only — see `CommandLineAccessStore` for why. The switch
 /// shows whether the server is *listening*, not what was last asked for, so a
 /// socket held by another DuoShot reads as off, with the reason under it.
 struct CommandLineSection: View {
@@ -35,7 +35,7 @@ struct CommandLineSection: View {
                         .font(.caption)
                         .foregroundStyle(.red)
                 }
-                Text("While on, any program run by this user can capture the screen through DuoShot (the duoshot command-line tool), without a Screen Recording permission of its own. Off again at every launch.")
+                Text("While on, any program run by this user can capture the screen through DuoShot (the duoshot command-line tool), without a Screen Recording permission of its own. Stays on until you turn it off.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

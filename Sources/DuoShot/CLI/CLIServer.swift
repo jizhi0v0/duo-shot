@@ -3,22 +3,57 @@ import Darwin
 import DuoShotCLIWire
 import Observation
 
-/// Whether the command line is being served, for this session only.
+/// Where "Allow command-line capture" is kept between launches.
 ///
-/// **Never persisted and never read from defaults.** A setting kept in
-/// `UserDefaults.standard` can be switched on without the user: a launch
-/// argument (`-allowsCommandLineCapture YES`) lands in the argument domain, and
-/// `defaults write` plus a relaunch lands in the persistent one — both
-/// confirmed by probe against the first version, which kept it there. So it is
-/// off at every launch, and only the Settings toggle turns it on.
+/// **Read from the persistent domain only.** `UserDefaults.bool(forKey:)`
+/// answers from the argument domain first, so a stored setting read that way
+/// is switched on by any same-user process that launches the app with
+/// `--args -allowsCommandLineCapture YES` — confirmed by probe against the
+/// first version. `persistentDomain(forName:)` is what is on disk and nothing
+/// else; the argument and registration domains never reach it.
 ///
-/// `isListening` is the server's own answer, not the toggle's wish: when the
+/// **Accepted risk:** a same-user process can still `defaults write` the key
+/// and relaunch DuoShot, and it will come up listening. That is the price of
+/// the setting surviving a restart, and the maintainer chose it; the "CLI"
+/// mark in the menu bar, shown in every state and keeping the item up even
+/// when the icon is hidden, is what makes it visible. Only the Settings toggle
+/// writes the key, and a fresh install has none: off.
+struct CommandLineAccessStore {
+    static let key = "allowsCommandLineCapture"
+
+    let defaults: UserDefaults
+    /// The domain `defaults` writes to: the app's bundle identifier for the
+    /// real store, the suite's name for the self-test's.
+    let domain: String
+
+    static var standard: CommandLineAccessStore {
+        CommandLineAccessStore(defaults: .standard, domain: Bundle.main.bundleIdentifier ?? "")
+    }
+
+    var isOn: Bool {
+        (defaults.persistentDomain(forName: domain)?[Self.key] as? Bool) ?? false
+    }
+
+    func save(_ on: Bool) {
+        defaults.set(on, forKey: Self.key)
+    }
+}
+
+/// Whether the command line is being served.
+///
+/// Persistent: once the user turns it on in Settings it stays on across
+/// launches until they turn it off (`CommandLineAccessStore` says how it is
+/// read, and what that still leaves open). Changed from outside while the app
+/// runs, it applies at the next launch.
+///
+/// `isListening` is the server's own answer, not the stored wish: when the
 /// socket cannot be taken (another DuoShot holds it), Settings shows it off and
 /// says why.
 @Observable
 final class CommandLineAccess {
-    static let shared = CommandLineAccess()
+    static let shared = CommandLineAccess(store: .standard)
 
+    @ObservationIgnored let store: CommandLineAccessStore
     private(set) var isListening = false
     /// Why the last request to listen did not end up listening.
     private(set) var problem: String?
@@ -28,10 +63,13 @@ final class CommandLineAccess {
     /// For the menu-bar indicator.
     @ObservationIgnored var onListeningChanged: (() -> Void)?
 
-    init() {}
+    init(store: CommandLineAccessStore) {
+        self.store = store
+    }
 
-    /// What the Settings toggle calls.
+    /// What the Settings toggle calls. The only writer of the stored value.
     func request(_ on: Bool) {
+        store.save(on)
         onRequest?(on)
     }
 
@@ -45,7 +83,7 @@ final class CommandLineAccess {
 
 /// The app's half of the command line — see `CLIWire` for the protocol.
 ///
-/// **Off unless the user turned it on in this session.** While it listens, any
+/// **Off unless the user turned it on.** While it listens, any
 /// program running as this user can photograph the screen through DuoShot's
 /// grant, which is exactly what Screen Recording's per-app consent exists to
 /// prevent. So the socket does not exist until the user asks for it, and going
@@ -124,8 +162,8 @@ final class CLIServer {
 
     // MARK: - The gate
 
-    /// Serves while `access` asks for it. Starts off: nothing is read from
-    /// anywhere to decide otherwise.
+    /// Serves while `access` asks for it, starting from what the user last
+    /// chose in Settings (`CommandLineAccessStore`).
     func follow(_ access: CommandLineAccess) {
         self.access = access
         access.onRequest = { [weak self] on in self?.apply(on) }
@@ -136,7 +174,7 @@ final class CLIServer {
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.apply(false) }
         }
-        apply(false)
+        apply(access.store.isOn)
     }
 
     private func apply(_ on: Bool) {

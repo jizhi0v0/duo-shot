@@ -6,8 +6,7 @@ import ImageIO
 /// `--selftest-cli <dir> -allowsCommandLineCapture YES`: the command line end
 /// to end.
 ///
-/// The real server (`CLIServer`, behind the real session gate
-/// `CommandLineAccess`) runs in this process on a private socket, and every
+/// The real server (`CLIServer`, behind the real gate `CommandLineAccess`) runs in this process on a private socket, and every
 /// command goes through the real client: the standalone `duoshot` built next to
 /// this bundle (`build/duoshot`), launched as a subprocess. What is checked is the
 /// exit status, the JSON on stdout and the pixels in the files the client wrote.
@@ -15,7 +14,8 @@ import ImageIO
 /// The launch argument is part of the test, not a convenience: it is exactly
 /// how the gate could once be switched on from outside, and the run asserts
 /// that it is visible to `UserDefaults` *and* that the gate is off anyway.
-/// Nothing here writes to the persistent defaults domain.
+/// The stored setting lives in a throwaway suite of this run's own; DuoShot's
+/// real domain is never written.
 enum CLISelfTest {
     private static var failures: [String] = []
     private static let gateKey = "allowsCommandLineCapture"
@@ -37,16 +37,54 @@ enum CLISelfTest {
         let socket = socketDirectory.appendingPathComponent("capture.sock").path
         defer { try? FileManager.default.removeItem(at: socketDirectory) }
 
-        print("(s1) off at launch, whatever the defaults say")
+        print("(s1) persistent, but only from what Settings stored")
         let argument = UserDefaults.standard.volatileDomain(
             forName: UserDefaults.argumentDomain)[gateKey]
         check(argument != nil, "the launch argument -\(gateKey) YES reached UserDefaults",
               argument.map { "\($0)" } ?? "run with -\(gateKey) YES, or this proves nothing")
-        // Stands in for a pre-written key: same lookup, never persisted.
+        // A registered default is another domain the stored value must ignore.
         UserDefaults.standard.register(defaults: [gateKey: true])
-        check(UserDefaults.standard.bool(forKey: gateKey), "a registered default says on")
 
-        let access = CommandLineAccess.shared
+        // Stores of the test's own, so the real domain is never written. Fixed
+        // names, emptied at both ends: an emptied suite keeps an empty plist
+        // that the preferences daemon writes back if it is deleted, so a name
+        // per run would leave one behind per run.
+        let suite = "duoshot.selftest.cli"
+        let storedSuite = suite + ".stored"
+        guard let defaults = UserDefaults(suiteName: suite),
+              let storedDefaults = UserDefaults(suiteName: storedSuite)
+        else {
+            print("result:        FAIL — no test suite")
+            return 1
+        }
+        defaults.removePersistentDomain(forName: suite)
+        storedDefaults.removePersistentDomain(forName: storedSuite)
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            storedDefaults.removePersistentDomain(forName: storedSuite)
+        }
+        let store = CommandLineAccessStore(defaults: defaults, domain: suite)
+        check(defaults.bool(forKey: gateKey),
+              "the suite's own lookup sees the launch argument (so ignoring it is a choice)")
+        check(!store.isOn, "a fresh store says off, launch argument and all")
+
+        // Stored on by an earlier session: on from the start.
+        storedDefaults.setPersistentDomain([gateKey: true], forName: storedSuite)
+        let earlier = CommandLineAccess(
+            store: CommandLineAccessStore(defaults: storedDefaults, domain: storedSuite))
+        let earlierSocket = socketDirectory.appendingPathComponent("stored.sock").path
+        let earlierServer = CLIServer(socketPath: earlierSocket, engine: CaptureEngine())
+        earlierServer.follow(earlier)
+        check(earlier.isListening && FileManager.default.fileExists(atPath: earlierSocket),
+              "stored on: listening from the start")
+        earlier.request(false)
+        let storedAfter = storedDefaults.persistentDomain(forName: storedSuite)?[gateKey] as? Bool
+        check(storedAfter == false && !FileManager.default.fileExists(atPath: earlierSocket)
+                && !earlier.isListening,
+              "toggled off: stored off, socket gone", "stored=\(storedAfter.map { "\($0)" } ?? "nil")")
+        earlier.onRequest = nil
+
+        let access = CommandLineAccess(store: store)
         let engine = CaptureEngine()
         let server = CLIServer(socketPath: socket, engine: engine)
         server.follow(access)
@@ -55,7 +93,7 @@ enum CLISelfTest {
             access.onRequest = nil
         }
         check(!access.isListening && !FileManager.default.fileExists(atPath: socket),
-              "the gate is off and there is no socket")
+              "fresh store, launch argument -\(gateKey) YES: off, no socket")
 
         print("(a) gate")
         var run = await client(["windows"], socket: socket)

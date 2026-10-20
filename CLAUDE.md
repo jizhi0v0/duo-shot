@@ -210,11 +210,15 @@ The `duoshot` tool asks the running app for pixels over a Unix socket
 (`CLIServer`, `Sources/DuoShotCLIWire`). While that socket is open, any program
 of this user's can capture the screen with DuoShot's grant — so:
 
-- **The switch is session-only, never a preference.** `UserDefaults.standard`
-  answers from the argument domain (`open … --args -allowsCommandLineCapture
-  YES`) and from `defaults write` by any same-user process, so a stored "on"
-  can be set from outside. It is off at every launch; only the Settings toggle
-  turns it on.
+- **The switch persists, but is read from the persistent domain only.**
+  `UserDefaults.bool(forKey:)` answers from the argument domain first, so a
+  stored "on" read that way is switched on by `open … --args
+  -allowsCommandLineCapture YES` from any same-user process
+  (`CommandLineAccessStore` uses `persistentDomain(forName:)`). What remains,
+  accepted: a same-user process can `defaults write` it and relaunch. The "CLI"
+  menu-bar mark, in every state and keeping the item up even with the icon
+  hidden, is what makes that visible. A fresh install is off; only the
+  Settings toggle writes it, and self-tests use a suite of their own.
 - **The client lives outside DuoShot.app.** TCC judges any binary inside an app
   bundle as the enclosing app for folder access, whatever it was signed as:
   measured, a helper in `Contents/` with its own identifier logged
