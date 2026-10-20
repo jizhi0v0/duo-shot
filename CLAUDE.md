@@ -204,6 +204,31 @@ in `make test`. Conventions that are load-bearing:
   a rect that is also an outline on screen or the size of a file: it came out
   as 12 pt of nothing around the Dock, in the outline and in the picture alike.
 
+## Command-line capture
+
+The `duoshot` tool asks the running app for pixels over a Unix socket
+(`CLIServer`, `Sources/DuoShotCLIWire`). While that socket is open, any program
+of this user's can capture the screen with DuoShot's grant — so:
+
+- **The switch is session-only, never a preference.** `UserDefaults.standard`
+  answers from the argument domain (`open … --args -allowsCommandLineCapture
+  YES`) and from `defaults write` by any same-user process, so a stored "on"
+  can be set from outside. It is off at every launch; only the Settings toggle
+  turns it on.
+- **The client lives outside DuoShot.app.** TCC judges any binary inside an app
+  bundle as the enclosing app for folder access, whatever it was signed as:
+  measured, a helper in `Contents/` with its own identifier logged
+  `AUTHREQ_SUBJECT subject=<the app's id>` and read `~/Desktop` on the app's
+  grant. From `build/duoshot` the same read prompts in the tool's own name.
+- **An as-seen shot is two captures** — the isolated shape, then the region —
+  and a panel closing between them returned a picture of what was behind it, cut
+  to its outline, with alpha 1. The window is re-checked after the region and
+  anything different exits 6. The alpha read before capturing is not enough.
+- **`--selftest-*` is compiled out of what ships** (`SELFTEST=0`, `#if
+  DUOSHOT_SELFTEST`). Launched through LaunchServices, DuoShot is its own TCC
+  responsible process, so a self-test entry point in a release build is a
+  capture-anything-to-any-path command for any same-user process.
+
 ## The image editor
 
 `ImageEdit` (model + renderer, `Output/`) and `ImageEditor` (UI, `Preview/`).
