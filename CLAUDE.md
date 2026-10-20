@@ -265,8 +265,20 @@ it as a timed metadata track in the movie (`ClickTimeline`,
   into a new file that replaces the original only after the copy is checked.
   `AVMutableMovie` and passthrough export both lost the last two AAC packets
   (priming applied twice); the `AVAssetWriter` remux keeps them, but only with
-  the writer's movie timescale set to the source's. Gaps between clicks are
-  explicit empty groups, or a trim drags an earlier click in at time zero.
+  the writer's movie timescale set to the source's, and without
+  `endSession(atSourceTime:)`, which stretches each track's last sample. Gaps
+  between clicks are explicit empty groups, or a trim drags an earlier click in
+  at time zero.
+- **The take is saved first, the timeline follows** (`ClickTimelineJobs`). The
+  copy costs about 3–5 s per GB, and a long take is several GB: done before
+  the save it held up the card, and a quit in that window stranded the take
+  in staging. The job swaps the copy in only if the saved file is still the
+  one it read; quitting cancels it (measured: 3 ms to unwind, 1 s into a 3 GB
+  copy) and the take keeps no timeline. Copies an interrupted job leaves are
+  hidden, so the launch sweeps them.
+- **Only what the picture shows.** Clicks outside the recorded area (outside
+  the window, for `--isolated`) are not stored, and a take that hides the
+  pointer gets no timeline.
 
 ## The image editor
 
