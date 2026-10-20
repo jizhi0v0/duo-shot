@@ -3,7 +3,7 @@ import Foundation
 /// Adds click timelines to takes that have already been saved.
 ///
 /// **After the save, not before it.** The embed is a full copy of the movie —
-/// measured at about 2.8 s per GB — and a twenty-minute take at a typical
+/// measured at 3–5 s per GB — and a twenty-minute take at a typical
 /// screen bitrate is several GB. Done before the take was handed to the output
 /// pipeline, it held up the card and the save by tens of seconds, and a quit in
 /// that window could leave the take in staging, unsaved, with a hidden copy of
