@@ -138,7 +138,9 @@ nonisolated enum ClickTimelineEmbedder {
                             cancellation: cancellation, fault: fault)
             try await confirmSameMedia(asset, as: AVURLAsset(url: destination), cancellation: cancellation)
             try fullSync(destination)
+            #if DUOSHOT_SELFTEST
             if failForTest { throw Failure(message: "failing on purpose (self-test)") }
+            #endif
             guard !cancellation.isCancelled else { throw Failure(message: "cancelled") }
             // Trimmed, moved or deleted since this started: whatever it is now,
             // it is no longer the file the copy was made from.
