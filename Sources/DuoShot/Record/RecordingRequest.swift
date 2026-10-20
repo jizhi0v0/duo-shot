@@ -10,17 +10,22 @@ nonisolated enum RecordingRequest: Sendable {
     /// engine converts it, so `DisplayGeometry` keeps a single caller.
     case area(displayID: CGDirectDisplayID, rectInAppKitGlobal: CGRect)
     case display(CGDirectDisplayID)
+    /// One window on its own (`SCContentFilter(desktopIndependentWindow:)`):
+    /// what it draws, whatever is in front of it, without raising it. The
+    /// display is the one it was on at the start, for the bookkeeping.
+    case window(CGWindowID, displayID: CGDirectDisplayID)
 
     var kind: String {
         switch self {
         case .area: "area"
         case .display: "display"
+        case .window: "window"
         }
     }
 
     var displayID: CGDirectDisplayID {
         switch self {
-        case .area(let id, _), .display(let id): id
+        case .area(let id, _), .display(let id), .window(_, let id): id
         }
     }
 }

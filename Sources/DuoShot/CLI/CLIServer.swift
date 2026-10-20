@@ -57,6 +57,10 @@ final class CommandLineAccess {
     private(set) var isListening = false
     /// Why the last request to listen did not end up listening.
     private(set) var problem: String?
+    /// When the command-line take that is running started; nil when none is.
+    /// The menu bar shows its clock, so a recording an agent started is never
+    /// running unseen.
+    private(set) var recordingSince: Date?
 
     /// Set by the server it controls (`CLIServer.follow`).
     @ObservationIgnored var onRequest: ((Bool) -> Void)?
@@ -71,6 +75,11 @@ final class CommandLineAccess {
     func request(_ on: Bool) {
         store.save(on)
         onRequest?(on)
+    }
+
+    fileprivate func noteRecording(_ since: Date?) {
+        recordingSince = since
+        onListeningChanged?()
     }
 
     fileprivate func report(listening: Bool, problem: String?) {
@@ -117,6 +126,11 @@ final class CLIServer {
 
     let socketPath: String
     private let engine: CaptureEngine
+    /// Its own, like the capture engine: a command-line take shares nothing
+    /// with one the user started.
+    private let recorder = RecordingEngine()
+    private var recordInFlight = false
+    private var recordEndedEarly: String?
     private var source: (any DispatchSourceRead)?
     /// The socket file this instance created, so `stop` cannot remove one that
     /// another instance has since put at the same path.
@@ -152,6 +166,8 @@ final class CLIServer {
     private(set) var capturesStartedForTest = 0
     private(set) var encodesStartedForTest = 0
     var openConnectionsForTest: Int { connections.count }
+    /// For the self-test: whether a command-line take is still running.
+    var isRecordingForTest: Bool { recorder.isRecording }
 
     init(socketPath: String = CLIWire.defaultSocketPath, engine: CaptureEngine) {
         self.socketPath = socketPath
@@ -374,9 +390,15 @@ final class CLIServer {
                 command line: \(request.command.rawValue, privacy: .public) \
                 for peer pid \(peerPID, privacy: .public)
                 """)
-            (reply, payload) = await serialized { [weak self] in
-                guard let self else { return (.failure("DuoShot is quitting", exitCode: CLIExit.unreachable), Data()) }
-                return await self.respond(to: request, epoch: accepted)
+            if request.command == .record {
+                // Not on the serial queue: a two-minute take would hold every
+                // other request behind it, and it shares no engine with them.
+                (reply, payload) = await record(request, epoch: accepted)
+            } else {
+                (reply, payload) = await serialized { [weak self] in
+                    guard let self else { return (.failure("DuoShot is quitting", exitCode: CLIExit.unreachable), Data()) }
+                    return await self.respond(to: request, epoch: accepted)
+                }
             }
             Log.capture.notice("""
                 command line: \(request.command.rawValue, privacy: .public) \
@@ -398,7 +420,8 @@ final class CLIServer {
     }
 
     @concurrent private static func send(_ data: Data, to client: Int32) async {
-        _ = CLIWire.writeAll(client, data, within: replyDeadline)
+        // A movie can be a few hundred megabytes; allow it 20 MB/s on top.
+        _ = CLIWire.writeAll(client, data, within: replyDeadline + Double(data.count) / 20_000_000)
     }
 
     // MARK: - Commands
@@ -419,6 +442,8 @@ final class CLIServer {
                 windows = windows.filter { $0.pid == pid }
             }
             return (CLIReply(ok: true, windows: windows), Data())
+        case .record:
+            return (.failure("record is not served here", exitCode: CLIExit.usage), Data())
         case .shot:
             do {
                 return try await shoot(request, epoch: accepted)
@@ -431,6 +456,120 @@ final class CLIServer {
                 return (.failure("capture failed: \(message)", exitCode: CLIExit.captureFailed),
                         Data())
             }
+        }
+    }
+
+    // MARK: - Recording
+
+    private func record(_ request: CLIRequest, epoch accepted: Int) async -> (CLIReply, Data) {
+        guard let seconds = request.seconds, seconds > 0, seconds <= CLIWire.maximumRecordSeconds else {
+            return (.failure("record needs --seconds above 0 and at most \(Int(CLIWire.maximumRecordSeconds))",
+                             exitCode: CLIExit.usage), Data())
+        }
+        guard !recordInFlight else {
+            return (.failure("a command-line recording is already running", exitCode: CLIExit.captureFailed), Data())
+        }
+        recordInFlight = true
+        defer { recordInFlight = false }
+        do {
+            return try await recordTake(request, seconds: seconds, epoch: accepted)
+        } catch let failure as Failure {
+            return (.failure(failure.message, exitCode: failure.exitCode), Data())
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+            return (.failure("recording failed: \(message)", exitCode: CLIExit.captureFailed), Data())
+        }
+    }
+
+    /// Where a take is written before its bytes go back: a 0700 directory of
+    /// the app's own, never a path the client named.
+    private static func privateTakeURL() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DuoShotCommandLine", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        chmod(directory.path, 0o700)
+        return directory.appendingPathComponent(UUID().uuidString).appendingPathExtension("mp4")
+    }
+
+    private func recordTake(
+        _ request: CLIRequest, seconds: Double, epoch accepted: Int
+    ) async throws -> (CLIReply, Data) {
+        var mode = "rect"
+        var windowRef: CLIShot.Window?
+        let recordingRequest: RecordingRequest
+        var watchedWindow: CGWindowID?
+        if let rect = request.rect {
+            let inAppKit = DisplayGeometry.flipped(rect.cgRect)
+            guard let screen = NSScreen.screens.first(where: { $0.frame.contains(inAppKit) }),
+                  let displayID = ScreenIndex.displayID(of: screen)
+            else { throw Failure(message: "rect \(Self.describe(rect)) is not inside one display") }
+            recordingRequest = .area(displayID: displayID, rectInAppKitGlobal: inAppKit)
+        } else {
+            let target = try Self.target(of: request)
+            windowRef = .init(id: target.id, owner: target.owner, title: target.title)
+            let frame = DisplayGeometry.flipped(target.frame.cgRect)
+            guard let screen = NSScreen.screens.first(where: { $0.frame.contains(CGPoint(x: frame.midX, y: frame.midY)) })
+                    ?? NSScreen.screens.first(where: { $0.frame.intersects(frame) }),
+                  let displayID = ScreenIndex.displayID(of: screen)
+            else { throw Failure(message: "window \(target.id) is not on a display") }
+            if request.isolated == true {
+                mode = "isolated"
+                recordingRequest = .window(target.id, displayID: displayID)
+                watchedWindow = target.id
+            } else {
+                mode = "as_seen"
+                let visible = frame.intersection(screen.frame)
+                guard !visible.isNull, visible.width >= 2, visible.height >= 2 else {
+                    throw Failure(message: "window \(target.id) is not on screen")
+                }
+                recordingRequest = .area(displayID: displayID, rectInAppKitGlobal: visible)
+            }
+        }
+
+        try await beginCapture(accepted)
+        let url = try Self.privateTakeURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        var options = RecordingOptions.default
+        options.capturesMicrophone = false
+        recordEndedEarly = nil
+        let recording = try await recorder.start(recordingRequest, options: options, to: url)
+        let region = recording.regionInCGGlobal
+        recording.onUnexpectedStop { [weak self] error in
+            let reason = error.localizedDescription
+            Task { @MainActor in self?.recordEndedEarly = "the recording stopped: \(reason)" }
+        }
+        access?.noteRecording(.now)
+        defer { access?.noteRecording(nil) }
+        Log.capture.notice("command line: recording \(mode, privacy: .public) for \(seconds, privacy: .public) s")
+
+        let started = ContinuousClock.now
+        while started.duration(to: .now) < .seconds(seconds), recordEndedEarly == nil, isLive(accepted) {
+            // An isolated take of a window that has gone — closed, minimized,
+            // moved to another Space — has nothing left to show.
+            if let watchedWindow, Self.alpha(of: watchedWindow) == nil {
+                recordEndedEarly = "the window left the screen (closed, minimized or moved to another Space)"
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        guard isLive(accepted) else {
+            await recorder.cancel()
+            throw Failure(message: "command-line capture was turned off", exitCode: CLIExit.unreachable)
+        }
+
+        switch await recorder.finish() {
+        case .finished(let result), .salvaged(let result, _):
+            let data = try Data(contentsOf: result.url)
+            if result.url != url { try? FileManager.default.removeItem(at: result.url) }
+            let info = CLIRecording(
+                mode: mode, window: windowRef, rect: request.rect, frame: CLIRect(region),
+                scale: Double(result.scale), pixelWidth: Int(result.pixelSize.width),
+                pixelHeight: Int(result.pixelSize.height), duration: result.duration,
+                clicks: result.clicks, endedEarly: recordEndedEarly)
+            return (CLIReply(ok: true, recording: info, bytes: data.count), data)
+        case .lost(_, let failure):
+            throw Failure(message: "nothing was recorded\(failure.map { ": \($0.localizedDescription)" } ?? "")")
         }
     }
 

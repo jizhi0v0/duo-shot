@@ -381,6 +381,9 @@ enum CLISelfTest {
         print("(g) as seen vs --isolated")
         try await asSeen(socket: socket, screen: screen, into: directory)
 
+        // --- (r) record ------------------------------------------------------
+        try await recordChecks(socket: socket, server: server, access: access, screen: screen, into: directory)
+
         // --- (f) frames -------------------------------------------------------
         print("(f) frames")
         try await frames(socket: socket, into: directory)
@@ -430,6 +433,298 @@ enum CLISelfTest {
     }
 
     private static let idleConnections = 12
+
+    // MARK: - Record
+
+    private static func recordChecks(
+        socket: String, server: CLIServer, access: CommandLineAccess, screen: CGRect, into directory: URL
+    ) async throws {
+        let scale = NSScreen.screens[0].backingScaleFactor
+
+        print("(r1) record --rect, and the menu bar says so while it runs")
+        StatusItemController.buildsMenu = false
+        let coordinator = CaptureCoordinator()
+        let status = StatusItemController(
+            coordinator: coordinator,
+            recorder: RecordingCoordinator(overlay: coordinator.overlay),
+            scroller: ScrollCaptureCoordinator(engine: coordinator.engine, overlay: coordinator.overlay))
+        status.setUserShowsIcon(false)
+        status.follow(access)
+        defer {
+            status.remove()
+            access.onListeningChanged = nil
+        }
+        let target = window(
+            frame: CGRect(x: screen.minX + 80, y: screen.minY + 80, width: 320, height: 240),
+            colours: [Colour.red, Colour.green, Colour.blue, Colour.yellow], level: .floating)
+        try await Task.sleep(for: .milliseconds(400))
+        let rect = DisplayGeometry.flipped(target.frame)
+        let rectArgument = "\(Int(rect.minX)),\(Int(rect.minY)),\(Int(rect.width)),\(Int(rect.height))"
+        let rectMovie = directory.appendingPathComponent("cli-record-rect.mp4")
+        try? FileManager.default.removeItem(at: rectMovie)
+        let rectTake = Task { await client(["record", "--rect", rectArgument, "--seconds", "2",
+                                            "--out", rectMovie.path], socket: socket) }
+        try await Task.sleep(for: .milliseconds(1200))
+        let during = status.buttonForTest?.title ?? "<no item>"
+        var run = await rectTake.value
+        let after = status.buttonForTest?.title ?? "<no item>"
+        let recorded = try? JSONDecoder().decode(CLIRecording.self, from: run.stdoutData)
+        check(during.contains(":") && during.contains("CLI"),
+              "while it records: the clock and the CLI mark in the menu bar", during)
+        check(!after.contains(":"), "after it: no clock", after)
+        let movieDuration = (try? await AVURLAsset(url: rectMovie).load(.duration).seconds) ?? 0
+        check(run.status == 0 && recorded?.mode == "rect"
+                && recorded?.pixelWidth == Int(rect.width * scale)
+                && abs(movieDuration - 2) < 0.6 && abs((recorded?.duration ?? 0) - movieDuration) < 0.05,
+              "the movie comes back, about 2 s, frame x scale",
+              "\(run.summary) mode=\(recorded?.mode ?? "?") \(recorded?.pixelWidth ?? 0) px, \(String(format: "%.2f", movieDuration)) s")
+        target.orderOut(nil)
+
+        print("(r2) the cap")
+        run = await client(["record", "--rect", rectArgument, "--seconds", "500",
+                            "--out", rectMovie.path], socket: socket)
+        check(run.status == CLIExit.usage, "--seconds 500: the client refuses, exit 2", run.summary)
+        var capped = CLIRequest(command: .record)
+        capped.rect = CLIRect(rect)
+        capped.seconds = 500
+        let reply = await rawReply(capped, socket: socket)
+        check(reply?.ok == false && reply?.exitCode == CLIExit.usage,
+              "--seconds 500 sent past the client: the app refuses too",
+              reply.map { "exit \($0.exitCode ?? -1): \($0.error ?? "")" } ?? "no reply within 5 s")
+
+        print("(r3) turned off mid-take")
+        let offMovie = directory.appendingPathComponent("cli-record-off.mp4")
+        try? FileManager.default.removeItem(at: offMovie)
+        let offTake = Task { await client(["record", "--rect", rectArgument, "--seconds", "4",
+                                           "--out", offMovie.path], socket: socket) }
+        try await Task.sleep(for: .milliseconds(1200))
+        let wasRecording = server.isRecordingForTest
+        access.request(false)
+        // The client is cut off at once either way; what matters is that the
+        // app stops recording too, not when the take would have ended.
+        let offAt = Date()
+        while server.isRecordingForTest, Date().timeIntervalSince(offAt) < 3 {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let stoppedAfter = Date().timeIntervalSince(offAt)
+        run = await offTake.value
+        access.request(true)
+        check(wasRecording && stoppedAfter < 1.5, "the app stops recording within 1.5 s of being turned off",
+              String(format: "recording before: %@, stopped after %.2f s", wasRecording ? "yes" : "no", stoppedAfter))
+        check(run.status == CLIExit.unreachable && !FileManager.default.fileExists(atPath: offMovie.path),
+              "exit 3, no movie", run.summary)
+
+        print("(r4) --isolated: a covered window, recorded on its own")
+        let fixture = ClickTimelineSelfTest.FlipWindow(
+            frame: CGRect(x: screen.minX + 140, y: screen.minY + 140, width: 360, height: 240))
+        let cover = window(frame: fixture.frame.insetBy(dx: -30, dy: -30),
+                           colours: Array(repeating: Colour.green, count: 4),
+                           level: NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1))
+        let outsider = window(
+            frame: CGRect(x: fixture.frame.maxX + 80, y: fixture.frame.minY, width: 120, height: 90),
+            colours: Array(repeating: Colour.red, count: 4), level: .floating)
+        defer {
+            fixture.orderOut(nil)
+            cover.orderOut(nil)
+            outsider.orderOut(nil)
+        }
+        try await Task.sleep(for: .milliseconds(500))
+        let fixtureRect = DisplayGeometry.flipped(fixture.frame)
+        for isolated in [true, false] {
+            let label = isolated ? "isolated" : "as_seen"
+            let movie = directory.appendingPathComponent("cli-record-\(label).mp4")
+            try? FileManager.default.removeItem(at: movie)
+            let frontBefore = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            let aboveBefore = windowsAbove(fixture)
+            let barShot = directory.appendingPathComponent("cli-menubar-before-\(label).png")
+            let barRect = menuBarRect()
+            _ = await client(["shot", "--rect", barRect, "--out", barShot.path], socket: socket)
+            let windowsBefore = Set(onScreenWindowNames())
+            var arguments = ["record", "--window", "\(fixture.windowNumber)", "--seconds", "4",
+                             "--out", movie.path]
+            if isolated { arguments.append("--isolated") }
+            let take = Task { await client(arguments, socket: socket) }
+            // The fixture changes on its own once a second; a click lands on
+            // the cover over it, and one outside it entirely.
+            var newWindows: [String] = []
+            for step in 0..<6 {
+                try await Task.sleep(for: .milliseconds(500))
+                if step % 2 == 1 { fixture.flip() }
+                if step == 2 {
+                    _ = try await ClickTimelineSelfTest.postClick(
+                        at: CGPoint(x: fixtureRect.minX + 60, y: fixtureRect.minY + 50), button: .left)
+                    newWindows = onScreenWindowNames().filter { !windowsBefore.contains($0) }
+                }
+                if step == 3 {
+                    _ = try await ClickTimelineSelfTest.postClick(
+                        at: DisplayGeometry.flipped(CGPoint(x: outsider.frame.midX, y: outsider.frame.midY)),
+                        button: .left)
+                }
+                if step == 4 {
+                    // After the clicks: a shot takes a moment, and must not push
+                    // one of them past the end of the take.
+                    let during = directory.appendingPathComponent("cli-menubar-during-\(label).png")
+                    _ = await client(["shot", "--rect", barRect, "--out", during.path], socket: socket)
+                }
+            }
+            run = await take.value
+            let info = try? JSONDecoder().decode(CLIRecording.self, from: run.stdoutData)
+            let fractions = try await colourFractions(of: movie)
+            let greenest = fractions.map(\.green).max() ?? -1
+            let fixtureColours = Set(fractions.compactMap { $0.blue > 0.9 ? "blue" : $0.yellow > 0.9 ? "yellow" : nil })
+            print("  \(label): \(fractions.count) frames, green per frame \(fractions.map { String(format: "%.0f%%", $0.green * 100) })")
+            if isolated {
+                check(run.status == 0 && info?.mode == "isolated", "--isolated: exit 0, says isolated", run.summary)
+                check(greenest == 0 && fixtureColours == ["blue", "yellow"],
+                      "--isolated: the window's own changing content, 0% of the cover in every frame",
+                      String(format: "max green %.2f%%, fixture colours %@", greenest * 100, fixtureColours.sorted().joined(separator: ",")))
+                _ = (frontBefore, aboveBefore)
+                let differing = menuBarDifference(
+                    directory.appendingPathComponent("cli-menubar-before-\(label).png"),
+                    directory.appendingPathComponent("cli-menubar-during-\(label).png"))
+                print("  menu bar right side, before vs during the take: \(differing) (photographs kept in the output directory)")
+                print("  windows that appeared during the take (any system recording indicator would be here): \(newWindows.isEmpty ? "none" : newWindows.joined(separator: "; "))")
+                let clicks = ((try? await ClickTimeline.read(from: movie)) ?? []).filter { $0.phase == "down" }
+                let inside = clicks.first { !$0.outside }
+                let outsideClick = clicks.first { $0.outside }
+                check(clicks.count == 2 && inside.map {
+                        abs($0.px - 60 * scale) <= 1 && abs($0.py - 50 * scale) <= 1 } == true
+                        && outsideClick != nil,
+                      "--isolated: clicks mapped into the window's pixels, the one outside it flagged",
+                      clicks.map { String(format: "(%.0f,%.0f) px outside=%@", $0.px, $0.py, $0.outside ? "yes" : "no") }.joined(separator: "; "))
+            } else {
+                check(run.status == 0 && info?.mode == "as_seen" && greenest > 0.9,
+                      "as seen: the cover is what the screen shows, so the movie shows it",
+                      String(format: "%@ max green %.1f%%", run.summary, greenest * 100))
+            }
+        }
+
+        print("(r4b) --isolated raises nothing: a take with no clicks posted during it")
+        let frontBefore = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let aboveBefore = windowsAbove(fixture)
+        let quiet = directory.appendingPathComponent("cli-record-quiet.mp4")
+        try? FileManager.default.removeItem(at: quiet)
+        run = await client(["record", "--window", "\(fixture.windowNumber)", "--isolated", "--seconds", "1.5",
+                            "--out", quiet.path], socket: socket)
+        // Every window that was above the fixture and is still on screen is
+        // still above it, and the frontmost application has not changed.
+        let stillOnScreen = Set(CLIServer.onScreenWindows().map(\.window.id))
+        let aboveAfter = Set(windowsAbove(fixture))
+        let lost = aboveBefore.filter { stillOnScreen.contains($0) && !aboveAfter.contains($0) }
+        let lostNames = CLIServer.onScreenWindows().filter { lost.contains($0.window.id) }
+            .map { "\($0.window.owner)#\($0.window.id)" }
+        check(run.status == 0 && NSWorkspace.shared.frontmostApplication?.processIdentifier == frontBefore
+                && aboveBefore.contains(UInt32(cover.windowNumber)) && lost.isEmpty,
+              "--isolated: nothing activated or raised (frontmost app; everything above it still above it)",
+              "\(run.summary); front \(frontBefore ?? 0) -> \(NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0), \(aboveBefore.count) above before, now below it: \(lostNames)")
+
+        print("(r5) the window goes away mid-take")
+        for minimize in [false, true] {
+            let label = minimize ? "minimized" : "closed"
+            let leaving = NSWindow(contentRect: CGRect(x: screen.minX + 160, y: screen.minY + 160, width: 300, height: 200),
+                                   styleMask: [.titled, .miniaturizable], backing: .buffered, defer: false)
+            leaving.isReleasedWhenClosed = false
+            leaving.orderFrontRegardless()
+            try await Task.sleep(for: .milliseconds(500))
+            let movie = directory.appendingPathComponent("cli-record-\(label).mp4")
+            try? FileManager.default.removeItem(at: movie)
+            let take = Task { await client(["record", "--window", "\(leaving.windowNumber)", "--isolated",
+                                            "--seconds", "4", "--out", movie.path], socket: socket) }
+            try await Task.sleep(for: .milliseconds(1500))
+            if minimize { leaving.miniaturize(nil) } else { leaving.orderOut(nil) }
+            run = await take.value
+            let info = try? JSONDecoder().decode(CLIRecording.self, from: run.stdoutData)
+            let kept = (try? await AVURLAsset(url: movie).load(.duration).seconds) ?? 0
+            check(run.status == CLIExit.captureFailed && info?.endedEarly != nil && kept > 0.5 && kept < 3.5,
+                  "\(label) mid-take: exit 4, says it ended early, keeps what was recorded",
+                  String(format: "%@; movie %.2f s; ended_early: %@", run.summary, kept, info?.endedEarly ?? "nil"))
+            leaving.orderOut(nil)
+        }
+    }
+
+    /// The windows in front of this one, by the window server's own list and
+    /// layers (the same rule `occluded_by` uses).
+    private static func windowsAbove(_ window: NSWindow) -> [UInt32] {
+        let list = CLIServer.onScreenWindows()
+        guard let me = list.first(where: { $0.window.id == UInt32(window.windowNumber) }) else { return [] }
+        return list.filter {
+            $0.window.layer > me.window.layer || ($0.window.layer == me.window.layer && $0.depth < me.depth)
+        }.map(\.window.id)
+    }
+
+    /// The right-hand 500 points of the menu bar, as `--rect` wants it.
+    private static func menuBarRect() -> String {
+        let main = NSScreen.screens[0].frame
+        return "\(Int(main.width) - 500),0,500,24"
+    }
+
+    private static func menuBarDifference(_ a: URL, _ b: URL) -> String {
+        guard let first = Bitmap(a), let second = Bitmap(b),
+              first.width == second.width, first.height == second.height
+        else { return "could not compare" }
+        var differing = 0, total = 0
+        for y in 0..<first.height {
+            for x in 0..<first.width {
+                total += 1
+                let p = first.pixel(x, y), q = second.pixel(x, y)
+                if abs(p.r - q.r) + abs(p.g - q.g) + abs(p.b - q.b) > 30 { differing += 1 }
+            }
+        }
+        return "\(differing) of \(total) pixels differ"
+    }
+
+    private static func onScreenWindowNames() -> [String] {
+        CLIServer.onScreenWindows().map { "\($0.window.owner)#\($0.window.id) layer \($0.window.layer) \($0.window.title)" }
+    }
+
+    /// Per frame of the movie: the share of sampled pixels that are the
+    /// cover's green, and the fixture's blue and yellow.
+    private static func colourFractions(of url: URL) async throws -> [(t: Double, green: Double, blue: Double, yellow: Double)] {
+        let asset = AVURLAsset(url: url)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else { return [] }
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+        ])
+        reader.add(output)
+        reader.startReading()
+        var result: [(Double, Double, Double, Double)] = []
+        while let sample = output.copyNextSampleBuffer() {
+            guard let buffer = CMSampleBufferGetImageBuffer(sample) else { continue }
+            CVPixelBufferLockBaseAddress(buffer, .readOnly)
+            let base = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: UInt8.self)
+            let row = CVPixelBufferGetBytesPerRow(buffer)
+            let width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer)
+            var green = 0, blue = 0, yellow = 0, total = 0
+            for y in stride(from: 2, to: height - 2, by: 6) {
+                for x in stride(from: 2, to: width - 2, by: 6) {
+                    let p = base + y * row + x * 4
+                    let (b, g, r) = (Int(p[0]), Int(p[1]), Int(p[2]))
+                    total += 1
+                    if g > 150, r < 100, b < 100 { green += 1 }
+                    if b > 150, r < 100, g < 100 { blue += 1 }
+                    if r > 150, g > 150, b < 100 { yellow += 1 }
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(buffer, .readOnly)
+            let n = Double(max(total, 1))
+            result.append((CMSampleBufferGetPresentationTimeStamp(sample).seconds,
+                           Double(green) / n, Double(blue) / n, Double(yellow) / n))
+        }
+        return result
+    }
+
+    /// Sends a request and reads the reply header, giving up after 5 s.
+    @concurrent private static func rawReply(_ request: CLIRequest, socket: String) async -> CLIReply? {
+        guard case .success(let fd) = CLIWire.connect(to: socket) else { return nil }
+        defer { close(fd) }
+        guard var line = try? CLIWire.encoder.encode(request) else { return nil }
+        line.append(0x0A)
+        guard CLIWire.writeAll(fd, line),
+              let header = CLIWire.readLine(fd, limit: 1 << 20, within: 5)
+        else { return nil }
+        return try? JSONDecoder().decode(CLIReply.self, from: header)
+    }
 
     // MARK: - Raw sockets
 
@@ -834,7 +1129,7 @@ enum CLISelfTest {
     /// in front — pointed at the test's socket. Output goes to files rather
     /// than pipes so a chatty stderr cannot stall it, and a run that has not
     /// finished in a minute is killed and reported as such.
-    @concurrent private static func client(
+    @concurrent static func client(
         _ arguments: [String], socket: String, executable: URL? = nil
     ) async -> ClientRun {
         let process = Process()

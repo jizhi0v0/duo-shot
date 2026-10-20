@@ -25,6 +25,15 @@ package enum CLIClient {
           frames VIDEO --out DIR (--at t1,t2,… | --every SECONDS | --scene [THRESHOLD])
                  [--crop x,y,w,h] [--tile COLSxROWS]
               Stills from a video file. Runs here; needs no running DuoShot.
+              With a DuoShot recording, the JSON also lists its clicks, each --scene
+              change says how long after a click it came (after_click_ms), and
+              frames near a click get a ring drawn on them (said in the JSON).
+          record --out F.mp4 (--window ID | --app NAME [--panel] | --rect x,y,w,h)
+                 --seconds N [--isolated]
+              Record through the running DuoShot, at most 120 s; the menu bar shows
+              the clock while it runs. --isolated records the window on its own,
+              covered or not, without raising it. Exit 4 with the movie still
+              written when the take ended early (the window went away).
               The JSON lists every frame written; --tile adds contact sheets
               (each at most 2000 px on its long edge).
 
@@ -54,6 +63,7 @@ package enum CLIClient {
         case "windows": return windows(rest)
         case "shot": return shot(rest)
         case "frames": return await frames(rest)
+        case "record": return record(rest)
         case "-h", "--help", "help":
             FileHandle.standardOutput.write(Data(usage.utf8))
             return CLIExit.ok
@@ -79,6 +89,66 @@ package enum CLIClient {
         case .failure(let code): return code
         case .success(let (reply, _)):
             printJSON(reply.windows ?? [CLIWindow]())
+            return CLIExit.ok
+        }
+    }
+
+    // MARK: - record
+
+    private static func record(_ arguments: [String]) -> Int32 {
+        var options = Options(arguments)
+        let out = options.value("--out")
+        let window = options.value("--window")
+        let app = options.value("--app")
+        let rect = options.value("--rect")
+        let secondsText = options.value("--seconds")
+        let panel = options.flag("--panel")
+        let isolated = options.flag("--isolated")
+        guard options.isEmpty else { return usageError(options.leftover) }
+        guard let out else { return usageError("record needs --out PATH.mp4") }
+        guard [window, app, rect].compactMap({ $0 }).count == 1 else {
+            return usageError("record needs exactly one of --window, --app, --rect")
+        }
+        guard let secondsText, let seconds = Double(secondsText), seconds > 0,
+              seconds <= CLIWire.maximumRecordSeconds
+        else { return usageError("record needs --seconds above 0 and at most \(Int(CLIWire.maximumRecordSeconds))") }
+        if panel, app == nil { return usageError("--panel goes with --app") }
+        if isolated, rect != nil { return usageError("--isolated is for a window, not --rect") }
+
+        var request = CLIRequest(command: .record)
+        if let window {
+            guard let id = UInt32(window) else { return usageError("--window needs a window id") }
+            request.window = id
+        }
+        request.app = app
+        request.panel = panel ? true : nil
+        request.isolated = isolated ? true : nil
+        request.seconds = seconds
+        if let rect {
+            guard let parsed = CLIRect(argument: rect) else {
+                return usageError("--rect needs x,y,w,h with a positive size")
+            }
+            request.rect = parsed
+        }
+
+        switch exchange(request, waiting: seconds + 60) {
+        case .failure(let code): return code
+        case .success(let (reply, movie)):
+            guard var recording = reply.recording, let movie else {
+                return fail("DuoShot sent no movie", CLIExit.captureFailed)
+            }
+            let url = URL(fileURLWithPath: out).standardizedFileURL
+            do {
+                try movie.write(to: url, options: .atomic)
+            } catch {
+                return fail("cannot write \(url.path): \(error.localizedDescription)", CLIExit.captureFailed)
+            }
+            recording.path = url.path
+            printJSON(recording)
+            if let early = recording.endedEarly {
+                return fail("the take ended early: \(early); what was recorded is in \(url.path)",
+                            CLIExit.captureFailed)
+            }
             return CLIExit.ok
         }
     }
@@ -213,7 +283,7 @@ package enum CLIClient {
         case failure(Int32)
     }
 
-    private static func exchange(_ request: CLIRequest) -> Exchange {
+    private static func exchange(_ request: CLIRequest, waiting: Double = 60) -> Exchange {
         let fd: Int32
         switch CLIWire.connect(to: socketPath) {
         case .success(let connected): fd = connected
@@ -226,7 +296,7 @@ package enum CLIClient {
             return .failure(fail("cannot encode the request", CLIExit.usage))
         }
         line.append(0x0A)
-        guard CLIWire.writeAll(fd, line), let header = CLIWire.readLine(fd, limit: 1 << 20, within: 60),
+        guard CLIWire.writeAll(fd, line), let header = CLIWire.readLine(fd, limit: 1 << 20, within: waiting),
               let reply = try? JSONDecoder().decode(CLIReply.self, from: header)
         else { return .failure(fail("DuoShot did not answer", CLIExit.unreachable)) }
 

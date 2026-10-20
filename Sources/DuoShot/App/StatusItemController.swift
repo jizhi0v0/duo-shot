@@ -35,7 +35,16 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// For the self-test: stands in for `recorder.isRecording`, so the clock
     /// branch can be drawn without starting a take.
     var recordingOverrideForTest: Bool?
-    private var isRecording: Bool { recordingOverrideForTest ?? recorder.isRecording }
+    /// A take the user started, or one an agent started through the command
+    /// line — the clock shows either, so neither runs unseen.
+    private var isRecording: Bool {
+        recordingOverrideForTest ?? (recorder.isRecording || commandLine?.recordingSince != nil)
+    }
+
+    private var recordingElapsed: TimeInterval {
+        if recorder.isRecording { return recorder.elapsed }
+        return commandLine?.recordingSince.map { Date.now.timeIntervalSince($0) } ?? 0
+    }
 
     init(
         coordinator: CaptureCoordinator, recorder: RecordingCoordinator,
@@ -246,7 +255,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     private func updateRecordingTitle() {
-        let total = Int(recorder.elapsed)
+        let total = Int(recordingElapsed)
         setTitle(String(format: " %d:%02d", total / 60, total % 60))
     }
 

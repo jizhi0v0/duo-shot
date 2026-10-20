@@ -6,6 +6,7 @@ nonisolated enum RecordingError: Error, LocalizedError {
     case alreadyRecording
     case notRecording
     case displayNotFound(CGDirectDisplayID)
+    case windowNotFound(CGWindowID)
     case writerNeverStarted
     case fileMissing(URL)
     case emptyFile(URL)
@@ -16,6 +17,8 @@ nonisolated enum RecordingError: Error, LocalizedError {
             "A recording is already in progress."
         case .notRecording:
             "No recording is in progress."
+        case .windowNotFound(let id):
+            "Window \(id) is no longer on screen."
         case .displayNotFound(let id):
             LoginSession.noDisplaysHint.map { "No SCDisplay for display ID \(id) — \($0)." }
                 ?? "No SCDisplay for display ID \(id)."
@@ -50,15 +53,23 @@ final class ActiveRecording {
     let startedAt: Date
 
     fileprivate let session: SCKRecordingSession
+    /// The clicks made during the take (`ClickRecorder`).
+    fileprivate let clicks: ClickRecorder
+    /// What the take shows, global points, origin top-left: the area, the
+    /// display, or the window's frame at the start.
+    let regionInCGGlobal: CGRect
 
     var url: URL { session.outputURL }
 
     fileprivate init(
-        session: SCKRecordingSession, request: RecordingRequest, options: RecordingOptions,
+        session: SCKRecordingSession, clicks: ClickRecorder, regionInCGGlobal: CGRect,
+        request: RecordingRequest, options: RecordingOptions,
         microphoneDenied: Bool, pointSize: CGSize, pixelSize: CGSize, scale: CGFloat,
         sourceDescription: String
     ) {
         self.session = session
+        self.clicks = clicks
+        self.regionInCGGlobal = regionInCGGlobal
         self.request = request
         self.options = options
         self.microphoneDenied = microphoneDenied
@@ -76,6 +87,11 @@ final class ActiveRecording {
     }
 
     var fileSize: Int { session.stats.fileSize }
+
+    /// Host-clock seconds of every complete frame the stream delivered, and of
+    /// the writer's start — see `ClickTimeline` for what they are for.
+    var completeFrameHostTimes: [Double] { session.completeFrameHostTimes }
+    var writerStartHostTime: Double? { session.writerStartHostTime }
 
     /// Fires when the recording dies on its own rather than being stopped.
     func onUnexpectedStop(_ handler: @escaping @Sendable (any Error) -> Void) {
@@ -97,6 +113,15 @@ final class RecordingEngine {
 
     var isRecording: Bool { active != nil }
     var current: ActiveRecording? { active }
+
+    /// For the self-tests: make the click timeline's post-process fail after
+    /// it has written its copy, to prove the original survives.
+    var embedFailsForTest = false
+    /// For the self-tests: copy the file here before the timeline is embedded,
+    /// so its samples can be compared with what replaced it.
+    var copyBeforeEmbeddingForTest: URL?
+    private(set) var lastEmbedReportForTest: ClickTimelineEmbedder.Report?
+    private(set) var lastEmbedFailureForTest: String?
     /// What the last `start` actually put in its filter's exclusion list.
     private(set) var lastExcludedWindowIDsForTest: Set<CGWindowID> = []
 
@@ -149,28 +174,47 @@ final class RecordingEngine {
             options.microphoneDeviceID = nil
         }
 
-        var excluded = try await content.ownWindows(matching: options.excludedWindowIDs)
-        // Thrown rather than degraded: a take that quietly shows the icons the
-        // user turned off is only discovered once it has been sent to someone.
-        if !options.showsDesktopIcons {
-            excluded += try await content.desktopIconWindows()
+        let filter: SCContentFilter
+        var windowFrame: CGRect?
+        if case .window(let windowID, _) = request {
+            if content.scWindow(for: windowID) == nil { try await content.refresh() }
+            guard let window = content.scWindow(for: windowID) else {
+                throw RecordingError.windowNotFound(windowID)
+            }
+            filter = SCContentFilter(desktopIndependentWindow: window)
+            windowFrame = window.frame
+        } else {
+            var excluded = try await content.ownWindows(matching: options.excludedWindowIDs)
+            // Thrown rather than degraded: a take that quietly shows the icons the
+            // user turned off is only discovered once it has been sent to someone.
+            if !options.showsDesktopIcons {
+                excluded += try await content.desktopIconWindows()
+            }
+            lastExcludedWindowIDsForTest = Set(excluded.map(\.windowID))
+            filter = SCContentFilter(display: display, excludingWindows: excluded)
+            // Defaults to YES on this initialiser — same trap as the screenshot path.
+            filter.includeMenuBar = options.includeMenuBar
         }
-        lastExcludedWindowIDsForTest = Set(excluded.map(\.windowID))
-        let filter = SCContentFilter(display: display, excludingWindows: excluded)
-        // Defaults to YES on this initialiser — same trap as the screenshot path.
-        filter.includeMenuBar = options.includeMenuBar
         let scale = CGFloat(filter.pointPixelScale)
 
         let region: CGRect
         let sourceRect: CGRect?
+        let regionInCGGlobal: CGRect
         switch request {
         case .area(_, let rectInAppKitGlobal):
             sourceRect = DisplayGeometry.sourceRect(
                 fromAppKitGlobal: rectInAppKitGlobal, on: displayID)
             region = sourceRect ?? .zero
+            regionInCGGlobal = region.offsetBy(
+                dx: CGDisplayBounds(displayID).minX, dy: CGDisplayBounds(displayID).minY)
         case .display:
             sourceRect = nil
             region = filter.contentRect
+            regionInCGGlobal = CGDisplayBounds(displayID)
+        case .window:
+            sourceRect = nil
+            region = filter.contentRect
+            regionInCGGlobal = windowFrame ?? .zero
         }
 
         let pixelSize = Self.encodablePixelSize(of: region, scale: scale)
@@ -221,9 +265,18 @@ final class RecordingEngine {
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
 
         let session = SCKRecordingSession(outputURL: url)
+        // Before the stream, so a click on the first frame is not missed; any
+        // that land before it are dropped when the timeline is anchored.
+        let clicks = ClickRecorder()
+        clicks.start()
         let started = ContinuousClock.now
-        try await session.start(
-            filter: filter, configuration: configuration, recording: recordingConfiguration)
+        do {
+            try await session.start(
+                filter: filter, configuration: configuration, recording: recordingConfiguration)
+        } catch {
+            _ = clicks.stop()
+            throw error
+        }
         let captureStarted = ContinuousClock.now
 
         // `startCapture` returning is not the same as the file existing. Wait for
@@ -254,11 +307,13 @@ final class RecordingEngine {
         do {
             writerStarted = try await session.writerStarted.wait(timeout: .seconds(5))
         } catch {
+            _ = clicks.stop()
             _ = await session.stop()
             try? FileManager.default.removeItem(at: url)
             throw error
         }
         guard writerStarted else {
+            _ = clicks.stop()
             _ = await session.stop()
             try? FileManager.default.removeItem(at: url)
             throw RecordingError.writerNeverStarted
@@ -267,15 +322,22 @@ final class RecordingEngine {
         let captureLatency = started.duration(to: captureStarted).milliseconds
 
         let index = content.displayIDs.firstIndex(of: displayID).map { $0 + 1 } ?? 1
+        let description = switch request {
+        case .area: "Area"
+        case .window: "Window"
+        case .display: "Display \(index)"
+        }
         let recording = ActiveRecording(
             session: session,
+            clicks: clicks,
+            regionInCGGlobal: regionInCGGlobal,
             request: request,
             options: options,
             microphoneDenied: microphoneDenied,
             pointSize: region.size,
             pixelSize: CGSize(width: pixelSize.width, height: pixelSize.height),
             scale: scale,
-            sourceDescription: request.kind == "area" ? "Area" : "Display \(index)")
+            sourceDescription: description)
         active = recording
 
         Log.record.notice("""
@@ -347,6 +409,7 @@ final class RecordingEngine {
         }
         active = nil
 
+        let clickEvents = recording.clicks.stop()
         let report = await recording.session.stop()
         let url = recording.url
         if let failure = report.writerFailure {
@@ -378,8 +441,16 @@ final class RecordingEngine {
         // than deleted: an unplayable file can still be repaired, and only the
         // user can decide it is worthless.
         let duration = await Self.assetDuration(of: url)
+        let intact = report.writerFailure == nil && report.finalised && duration != nil
 
-        let result = RecordingResult(
+        // Only on a take that finished cleanly: a salvaged file is the user's
+        // only copy of something that already went wrong once.
+        var clickCount = 0
+        if intact {
+            clickCount = await embedClicks(clickEvents, into: url, recording: recording)
+        }
+
+        var result = RecordingResult(
             url: url,
             duration: duration ?? report.stats.duration,
             fileSize: size,
@@ -389,8 +460,8 @@ final class RecordingEngine {
             sourceDisplayID: recording.request.displayID,
             sourceDescription: recording.sourceDescription,
             startedAt: recording.startedAt)
+        result.clicks = clickCount
 
-        let intact = report.writerFailure == nil && report.finalised && duration != nil
         Log.record.notice("""
             recording \(intact ? "finished" : "SALVAGED", privacy: .public) \
             \(url.lastPathComponent, privacy: .public) \
@@ -412,8 +483,46 @@ final class RecordingEngine {
         }
     }
 
+    /// The click timeline, into the finished file. Returns how many events it
+    /// holds; any failure leaves the file as the recorder wrote it.
+    private func embedClicks(
+        _ events: [ClickRecorder.Event], into url: URL, recording: ActiveRecording
+    ) async -> Int {
+        if let copy = copyBeforeEmbeddingForTest {
+            try? FileManager.default.removeItem(at: copy)
+            try? FileManager.default.copyItem(at: url, to: copy)
+        }
+        let outcome = await ClickTimelineEmbedder.embed(
+            in: url, events: events,
+            frameHostTimes: recording.completeFrameHostTimes,
+            writerStart: recording.writerStartHostTime,
+            geometry: .init(regionInCGGlobal: recording.regionInCGGlobal,
+                            pixelSize: recording.pixelSize),
+            failForTest: embedFailsForTest)
+        switch outcome {
+        case .success(let report):
+            lastEmbedReportForTest = report
+            lastEmbedFailureForTest = nil
+            Log.record.notice("""
+                click timeline: \(report.clicks, privacy: .public) event(s), anchored by \
+                \(report.method, privacy: .public)\
+                \(report.anchorError.map { String(format: " (mean error %.2f ms)", $0 * 1000) } ?? "", privacy: .public)
+                """)
+            return report.clicks
+        case .failure(let failure):
+            lastEmbedReportForTest = nil
+            lastEmbedFailureForTest = failure.message
+            Log.record.error("""
+                click timeline not embedded, recording kept as written: \
+                \(failure.message, privacy: .public)
+                """)
+            return 0
+        }
+    }
+
     func cancel() async {
         guard let recording = active else { return }
+        _ = recording.clicks.stop()
         active = nil
         _ = await recording.session.stop()
         try? FileManager.default.removeItem(at: recording.url)

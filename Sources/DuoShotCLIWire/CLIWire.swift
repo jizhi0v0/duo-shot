@@ -146,8 +146,48 @@ package struct CLIShot: Codable, Sendable {
     }
 }
 
+/// What `duoshot record` prints.
+package struct CLIRecording: Codable, Sendable {
+    /// Filled in by the client, which is the only side that knows it.
+    package var path: String?
+    /// "as_seen" (the screen region the window or rect covers, whatever is in
+    /// front of it), "isolated" (the window on its own, covered or not) or
+    /// "rect".
+    package var mode: String
+    package var window: CLIShot.Window?
+    package var rect: CLIRect?
+    /// What the movie shows, global points, origin top-left; for a window the
+    /// frame it had when the take started.
+    package var frame: CLIRect
+    package var scale: Double
+    package var pixelWidth: Int
+    package var pixelHeight: Int
+    package var duration: Double
+    /// Mouse events in the movie's click timeline.
+    package var clicks: Int
+    /// Set when the take ended before the time asked for — the window closed,
+    /// the stream stopped. The movie holds what was recorded up to then.
+    package var endedEarly: String?
+
+    package init(mode: String, window: CLIShot.Window? = nil, rect: CLIRect? = nil,
+                 frame: CLIRect, scale: Double, pixelWidth: Int, pixelHeight: Int,
+                 duration: Double, clicks: Int, endedEarly: String? = nil) {
+        self.mode = mode; self.window = window; self.rect = rect; self.frame = frame
+        self.scale = scale; self.pixelWidth = pixelWidth; self.pixelHeight = pixelHeight
+        self.duration = duration; self.clicks = clicks; self.endedEarly = endedEarly
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case path, mode, window, rect, scale, duration, clicks
+        case frame = "frame_global_points_top_left"
+        case pixelWidth = "pixel_width"
+        case pixelHeight = "pixel_height"
+        case endedEarly = "ended_early"
+    }
+}
+
 package struct CLIRequest: Codable, Sendable {
-    package enum Command: String, Codable, Sendable { case windows, shot }
+    package enum Command: String, Codable, Sendable { case windows, shot, record }
     package var command: Command
     package var app: String?
     package var pid: Int32?
@@ -155,6 +195,8 @@ package struct CLIRequest: Codable, Sendable {
     package var panel: Bool?
     package var isolated: Bool?
     package var rect: CLIRect?
+    /// `record` only: how long, at most `CLIWire.maximumRecordSeconds`.
+    package var seconds: Double?
 
     package init(command: Command, app: String? = nil, pid: Int32? = nil) {
         self.command = command; self.app = app; self.pid = pid
@@ -168,13 +210,15 @@ package struct CLIReply: Codable, Sendable {
     package var exitCode: Int32?
     package var windows: [CLIWindow]?
     package var shot: CLIShot?
-    /// Length of the PNG that follows the header line.
+    package var recording: CLIRecording?
+    /// Length of the PNG or movie that follows the header line.
     package var bytes: Int?
 
     package init(ok: Bool, error: String? = nil, exitCode: Int32? = nil,
-                 windows: [CLIWindow]? = nil, shot: CLIShot? = nil, bytes: Int? = nil) {
+                 windows: [CLIWindow]? = nil, shot: CLIShot? = nil,
+                 recording: CLIRecording? = nil, bytes: Int? = nil) {
         self.ok = ok; self.error = error; self.exitCode = exitCode
-        self.windows = windows; self.shot = shot; self.bytes = bytes
+        self.windows = windows; self.shot = shot; self.recording = recording; self.bytes = bytes
     }
 
     package static func failure(_ message: String, exitCode: Int32) -> CLIReply {
@@ -191,16 +235,45 @@ package struct CLIFramesReport: Codable, Sendable {
     package var sheets: [Sheet]?
     package var changes: [Change]?
     package var threshold: Double?
+    /// Mouse-downs from the movie's click timeline; absent when it has none.
+    package var clicks: [CLIClick]?
+    /// Present when any frame has a click ring drawn on it.
+    package var clickRingsNote: String?
 
     package init(video: String, duration: Double) {
         self.video = video; self.duration = duration
     }
 
+    enum CodingKeys: String, CodingKey {
+        case video, duration, frames, sheets, changes, threshold, clicks
+        case clickRingsNote = "click_rings_note"
+    }
+
     package struct Frame: Codable, Sendable {
         package var path: String
         package var time: Double
+        /// Clicks within 100 ms of this frame, drawn on it as rings (and on its
+        /// contact-sheet cell) at these positions in the written image.
+        package var clickRings: [Ring]?
 
-        package init(path: String, time: Double) { self.path = path; self.time = time }
+        package init(path: String, time: Double, clickRings: [Ring]? = nil) {
+            self.path = path; self.time = time; self.clickRings = clickRings
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case path, time
+            case clickRings = "click_rings"
+        }
+    }
+
+    package struct Ring: Codable, Sendable {
+        /// The click's time on the movie's timeline.
+        package var t: Double
+        /// In the written image's pixels, origin top-left (after any crop).
+        package var x: Double
+        package var y: Double
+
+        package init(t: Double, x: Double, y: Double) { self.t = t; self.x = x; self.y = y }
     }
 
     package struct Sheet: Codable, Sendable {
@@ -222,8 +295,40 @@ package struct CLIFramesReport: Codable, Sendable {
     package struct Change: Codable, Sendable {
         package var time: Double
         package var score: Double
+        /// Milliseconds since the latest mouse-down at or before the change,
+        /// when there was one within the last second; null otherwise — and
+        /// absent when the movie has no click timeline.
+        package var afterClickMs: Double?
+        package var click: CLIClick?
 
         package init(time: Double, score: Double) { self.time = time; self.score = score }
+
+        enum CodingKeys: String, CodingKey {
+            case time, score, click
+            case afterClickMs = "after_click_ms"
+        }
+
+        package func encode(to encoder: any Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(time, forKey: .time)
+            try container.encode(score, forKey: .score)
+            try container.encodeIfPresent(click, forKey: .click)
+            // Present-and-null is the answer "no click explains this"; only a
+            // movie with no timeline leaves the key out.
+            if hasTimeline { try container.encode(afterClickMs, forKey: .afterClickMs) }
+        }
+
+        /// Set once clicks have been looked for.
+        package var hasTimeline = false
+
+        package init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            time = try container.decode(Double.self, forKey: .time)
+            score = try container.decode(Double.self, forKey: .score)
+            click = try container.decodeIfPresent(CLIClick.self, forKey: .click)
+            hasTimeline = container.contains(.afterClickMs)
+            afterClickMs = try container.decodeIfPresent(Double.self, forKey: .afterClickMs)
+        }
     }
 }
 
@@ -267,6 +372,9 @@ package enum CLIWire {
     /// is well under 200 MB; a claim past this is not a screenshot, and the
     /// client must not allocate for it.
     package static let maximumPayload = 512 * 1024 * 1024
+
+    /// The longest `duoshot record` take.
+    package static let maximumRecordSeconds = 120.0
 
     package static func address(_ path: String) -> sockaddr_un? {
         var addr = sockaddr_un()

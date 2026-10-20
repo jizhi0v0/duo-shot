@@ -36,6 +36,7 @@ package enum CLIFrames {
     package typealias Frame = CLIFramesReport.Frame
     package typealias Sheet = CLIFramesReport.Sheet
     package typealias Change = CLIFramesReport.Change
+    package typealias Ring = CLIFramesReport.Ring
 
     package struct Failure: LocalizedError {
         let message: String
@@ -138,14 +139,54 @@ package enum CLIFrames {
             stills = try await framesOneByOne(of: asset, at: times, crop: crop)
         }
 
-        report.frames = try stills.enumerated().map { index, still in
+        // The click timeline, when the movie has one (`ClickTimeline`).
+        let downs = ((try? await ClickTimeline.read(from: job.video)) ?? [])
+            .filter { $0.phase == "down" }
+        let hasTimeline = (try? await asset.loadTracks(withMediaType: .metadata).isEmpty == false) ?? false
+        if hasTimeline {
+            report.clicks = downs
+            report.changes = report.changes.map { changes in
+                changes.map { change in
+                    var change = change
+                    change.hasTimeline = true
+                    if let click = downs.last(where: { $0.t <= change.time + 0.000_5 }),
+                       change.time - click.t <= 1.0 {
+                        change.afterClickMs = ((change.time - click.t) * 1000 * 10).rounded() / 10
+                        change.click = click
+                    }
+                    return change
+                }
+            }
+        }
+
+        var ringed: [Still] = []
+        var rings: [[Ring]] = []
+        for still in stills {
+            let near = downs.filter { abs($0.t - still.time) <= 0.1 && !$0.outside }
+            let marks = near.map {
+                Ring(t: $0.t, x: $0.px - (crop?.minX ?? 0), y: $0.py - (crop?.minY ?? 0))
+            }.filter { $0.x >= 0 && $0.y >= 0
+                && $0.x < Double(still.image.width) && $0.y < Double(still.image.height) }
+            rings.append(marks)
+            ringed.append(marks.isEmpty ? still
+                : Still(image: drawRings(on: still.image, marks) ?? still.image, time: still.time))
+        }
+        if rings.contains(where: { !$0.isEmpty }) {
+            report.clickRingsNote = """
+                magenta rings with a white inner ring and a cross mark mouse-downs within \
+                100 ms of the frame; duoshot drew them, they are not in the recording
+                """
+        }
+
+        report.frames = try ringed.enumerated().map { index, still in
             let url = job.directory.appendingPathComponent(
                 String(format: "frame-%04d-%.3fs.png", index + 1, still.time))
             try writePNG(still.image, to: url)
-            return Frame(path: url.path, time: still.time)
+            return Frame(path: url.path, time: still.time,
+                         clickRings: rings[index].isEmpty ? nil : rings[index])
         }
         if let tile = job.tile {
-            report.sheets = try writeSheets(stills, tile: tile, into: job.directory)
+            report.sheets = try writeSheets(ringed, tile: tile, into: job.directory)
         }
         return report
     }
@@ -443,6 +484,39 @@ package enum CLIFrames {
                 cellScale: (Double(cellWidth) / frameWidth * 1000).rounded() / 1000))
         }
         return sheets
+    }
+
+    /// The image with a ring at each mark: clearly synthetic — magenta, a white
+    /// inner ring and a cross — so nobody takes it for the app's own UI.
+    private static func drawRings(on image: CGImage, _ marks: [Ring]) -> CGImage? {
+        let width = image.width, height = image.height
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(
+                data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        let radius = max(10, Double(min(width, height)) * 0.025)
+        for mark in marks {
+            // Image rows run down; the context's y runs up.
+            let centre = CGPoint(x: mark.x, y: Double(height) - mark.y)
+            context.setStrokeColor(CGColor(srgbRed: 1, green: 0, blue: 1, alpha: 1))
+            context.setLineWidth(3)
+            context.strokeEllipse(in: CGRect(x: centre.x - radius, y: centre.y - radius,
+                                             width: radius * 2, height: radius * 2))
+            context.setStrokeColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1))
+            context.setLineWidth(1.5)
+            let inner = radius - 3
+            context.strokeEllipse(in: CGRect(x: centre.x - inner, y: centre.y - inner,
+                                             width: inner * 2, height: inner * 2))
+            context.setStrokeColor(CGColor(srgbRed: 1, green: 0, blue: 1, alpha: 1))
+            context.setLineWidth(2)
+            context.strokeLineSegments(between: [
+                CGPoint(x: centre.x - radius * 0.5, y: centre.y), CGPoint(x: centre.x + radius * 0.5, y: centre.y),
+                CGPoint(x: centre.x, y: centre.y - radius * 0.5), CGPoint(x: centre.x, y: centre.y + radius * 0.5),
+            ])
+        }
+        return context.makeImage()
     }
 
     private static func writePNG(_ image: CGImage, to url: URL) throws {

@@ -234,7 +234,7 @@ nonisolated final class SCKLatch: @unchecked Sendable {
 /// file uses it: every mutable field is behind `lock`, and the two SCK objects
 /// are only ever handed back to SCK.
 nonisolated final class SCKRecordingSession: NSObject, @unchecked Sendable,
-    SCStreamDelegate, SCRecordingOutputDelegate
+    SCStreamDelegate, SCRecordingOutputDelegate, SCStreamOutput
 {
     nonisolated struct Stats: Sendable {
         let duration: TimeInterval
@@ -261,6 +261,21 @@ nonisolated final class SCKRecordingSession: NSObject, @unchecked Sendable,
     private var unexpectedStop: (@Sendable (any Error) -> Void)?
     /// An unexpected stop that arrived before anyone was listening.
     private var missedStop: (any Error)?
+    /// Presentation times, on the host clock in seconds, of every complete
+    /// frame the stream delivered — the clock `NSEvent.timestamp` is on. The
+    /// file the recording output writes does not keep them (its sample times
+    /// start near zero), so this is the only record of when each frame was.
+    private var frameHostTimes: [Double] = []
+    /// Host-clock seconds when the writer reported it had started.
+    private var writerStartedHostTime: Double?
+    private let frameQueue = DispatchQueue(label: "duoshot.recording.frame-times")
+
+    /// The host time of every complete frame so far, in delivery order.
+    var completeFrameHostTimes: [Double] { lock.withLock { frameHostTimes } }
+    var writerStartHostTime: Double? { lock.withLock { writerStartedHostTime } }
+
+    /// The host clock, in the units `NSEvent.timestamp` uses.
+    static var hostNow: Double { Double(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) / 1e9 }
 
     init(outputURL: URL) {
         self.outputURL = outputURL
@@ -310,6 +325,8 @@ nonisolated final class SCKRecordingSession: NSObject, @unchecked Sendable,
         // Throws before the stream is running, which is the good case: a bad
         // output URL or codec fails here rather than half a second into a take.
         try stream.addRecordingOutput(output)
+        // Only to learn when each frame was; it never touches the pixels.
+        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: frameQueue)
         lock.withLock {
             self.stream = stream
             self.recordingOutput = output
@@ -437,6 +454,8 @@ nonisolated final class SCKRecordingSession: NSObject, @unchecked Sendable,
     // MARK: - SCRecordingOutputDelegate
 
     func recordingOutputDidStartRecording(_ recordingOutput: SCRecordingOutput) {
+        let now = Self.hostNow
+        lock.withLock { writerStartedHostTime = now }
         Log.record.notice("writer started -> \(self.outputURL.lastPathComponent, privacy: .public)")
         writerStarted.signal()
     }
@@ -454,6 +473,25 @@ nonisolated final class SCKRecordingSession: NSObject, @unchecked Sendable,
         writerStarted.signal(error)
         writerFinished.signal(error)
         reportUnexpectedStop(error)
+    }
+
+    // MARK: - SCStreamOutput
+
+    func stream(
+        _ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
+        of type: SCStreamOutputType
+    ) {
+        guard type == .screen,
+              let attachments = CMSampleBufferGetSampleAttachmentsArray(
+                  sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let raw = attachments.first?[.status] as? Int,
+              SCFrameStatus(rawValue: raw) == .complete
+        else { return }
+        let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
+        lock.withLock {
+            // An hour at 60 fps; past that the timeline simply stops growing.
+            if frameHostTimes.count < 216_000 { frameHostTimes.append(time) }
+        }
     }
 
     // MARK: - SCStreamDelegate

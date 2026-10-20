@@ -22,6 +22,8 @@ nonisolated struct RecordingResult: Sendable, Identifiable {
     let sourceDisplayID: CGDirectDisplayID
     let sourceDescription: String
     let startedAt: Date
+    /// Mouse events in the movie's click timeline; 0 when none was embedded.
+    var clicks = 0
 
     var durationDescription: String {
         let total = Int(duration.rounded())

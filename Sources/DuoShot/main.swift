@@ -89,6 +89,7 @@ if let mode = SelfTest.Mode(arguments: arguments) {
           --selftest-share-compat <recording.mp4>
           --selftest-share-flow          (uploads to your real bucket, then deletes)
           --selftest-cli <dir>
+          --selftest-click-timeline <dir>
 
         Rects are in AppKit global points (origin bottom-left of the main screen).
 

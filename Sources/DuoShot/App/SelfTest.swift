@@ -76,6 +76,9 @@ enum SelfTest {
         /// `DuoShot cli` end to end: the real server in-process behind the real
         /// preference, the real client as a subprocess. See `CLISelfTest`.
         case cli(directory: URL)
+        /// A take with clicks posted at it, and the timeline in the movie
+        /// (`ClickTimelineSelfTest`).
+        case clickTimeline(directory: URL)
         /// Settings persistence, key-combo encoding and the system-shortcut probe.
         case preferences
         /// Pure geometry of the armed selection's grab zones. Headless: no screen,
@@ -274,6 +277,8 @@ enum SelfTest {
                 self = .preferences
             case "--selftest-cli":
                 self = .cli(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
+            case "--selftest-click-timeline":
+                self = .clickTimeline(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-selection-zones":
                 self = .selectionZones
             case "--selftest-badge-placement":
@@ -467,6 +472,7 @@ enum SelfTest {
             case .fullscreen(let directory): return try await fullscreenMode(into: directory)
             case .preferences: return preferencesCheck()
             case .cli(let directory): return try await CLISelfTest.run(into: directory)
+            case .clickTimeline(let d): return try await ClickTimelineSelfTest.run(into: d)
             case .share(let endpoint, let token, let file, let big):
                 return await ShareSelfTest.run(
                     endpoint: endpoint, token: token, file: file, bigMegabytes: big)

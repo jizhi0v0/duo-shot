@@ -438,6 +438,7 @@ test-only:
 	run "scroll stitcher"        --selftest-scroll-stitch $(TEST_OUT); \
 	run "scroll capture flow"    --selftest-scroll-flow $(TEST_OUT); \
 	run "command line"           --selftest-cli $(TEST_OUT) -allowsCommandLineCapture YES; \
+	run "click timeline"         --selftest-click-timeline $(TEST_OUT); \
 	printf '  %-26s ' "exclusion negative control"; \
 	if "$(EXEC)" --selftest-overlay 400,300,640,400 --sharing-default --no-exclude >/dev/null 2>&1; \
 		then echo "BROKEN — the control passed, so the exclusion test cannot fail"; fail=1; \
