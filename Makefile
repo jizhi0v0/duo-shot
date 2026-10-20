@@ -212,9 +212,22 @@ mic-repro: verify
 # job: sign here, `ditto` the bundle across, and let it inherit the TCC grant,
 # which works because the Designated Requirement contains no path and no cdhash.
 # Set CHECK_HOST (user@host) in local.mk; there is deliberately no default.
-CHECK_HOST ?=
-CHECK_DIR  ?= ~/duo-shot-sdkcheck
+#
+# The other Mac's *default* toolchain is not trusted. It has to be a whole
+# Xcode 26.x, not the 27 Xcode pointed at a 26 SDK with `--sdk`:
+# `#if compiler(>=6.4)` keys on the compiler, so a 6.4 compiler compiles the
+# 27-only blocks in and they fail against the old SDK, and the diagnostics only
+# the older compiler reports are not reported at all. Measured 2026-10-20: the
+# mini was still on macOS 26.7, but its only Xcode had become 27 -- Swift 6.4,
+# the 27 SDK, the same as here -- and this target went on saying OK while
+# proving nothing. So it pins DEVELOPER_DIR to a side-by-side Xcode 26.x and
+# refuses to say OK unless the compiler it got is older than 6.4 and the SDK
+# is a 26.
+CHECK_HOST  ?=
+CHECK_DIR   ?= ~/duo-shot-sdkcheck
+CHECK_XCODE ?= /Applications/Xcode-26.6.app
 NEED_CHECK_HOST = @test -n "$(CHECK_HOST)" || { echo "CHECK_HOST is not set -- put CHECK_HOST := user@host in local.mk"; exit 1; }
+CHECK_ENV = export DEVELOPER_DIR="$(CHECK_XCODE)/Contents/Developer";
 
 .PHONY: check-26
 check-26:
@@ -224,12 +237,20 @@ check-26:
 		--exclude '.build' --exclude 'build' --exclude '.git' --exclude 'dist' \
 		--exclude 'Worker/node_modules' --exclude 'Worker/.wrangler' \
 		./ "$(CHECK_HOST):$(CHECK_DIR)/"
-	@echo "remote SDK:"
+	@echo "remote toolchain:"
+	@ssh -o BatchMode=yes "$(CHECK_HOST)" '$(CHECK_ENV) \
+		test -d "$$DEVELOPER_DIR" || { echo "  FAILED -- no $$DEVELOPER_DIR; install Xcode 26.x there or set CHECK_XCODE"; exit 1; }; \
+		sw_vers -productVersion | sed "s/^/  macOS /"; \
+		echo "  $$(xcrun --find swift)"; \
+		swift=$$(swift --version 2>&1 | grep -o "Swift version [0-9.]*" | head -1); \
+		sdk=$$(xcrun --sdk macosx --show-sdk-version 2>/dev/null); \
+		echo "  $${swift:-Swift version unknown}"; echo "  macOS SDK $${sdk:-unknown}"; \
+		v=$${swift#Swift version }; major=$${v%%.*}; minor=$$(echo "$$v" | cut -d. -f2); \
+		case "$$major.$$minor" in 6.[0-3]) ;; *) echo "  FAILED -- needs Swift 6.0-6.3 (older than 6.4), got \"$$v\""; exit 1;; esac; \
+		case "$$sdk" in 26|26.*) ;; *) echo "  FAILED -- needs a macOS 26 SDK, got \"$$sdk\""; exit 1;; esac'
 	@ssh -o BatchMode=yes "$(CHECK_HOST)" \
-		'sw_vers -productVersion | sed "s/^/  macOS /"; swift --version 2>&1 | head -1 | sed "s/^/  /"'
-	@ssh -o BatchMode=yes "$(CHECK_HOST)" \
-		'cd $(CHECK_DIR) && swift build -c $(CONFIG) 2>&1 | grep -E "error:|warning: .*deprecat|Build complete" | head -30'
-	@ssh -o BatchMode=yes "$(CHECK_HOST)" 'cd $(CHECK_DIR) && swift build -c $(CONFIG) >/dev/null 2>&1' \
+		'$(CHECK_ENV) cd $(CHECK_DIR) && swift build -c $(CONFIG) 2>&1 | grep -E "error:|warning: .*deprecat|Build complete" | head -30'
+	@ssh -o BatchMode=yes "$(CHECK_HOST)" '$(CHECK_ENV) cd $(CHECK_DIR) && swift build -c $(CONFIG) >/dev/null 2>&1' \
 		&& echo "  OK -- builds against the older SDK" \
 		|| { echo "  FAILED -- see the errors above"; exit 1; }
 

@@ -26,12 +26,17 @@ make install       # replace /Applications/DuoShot.app AND restart it
   assertion and it must stay green.
 - **Two machines, and which one you are on changes what a green build means.**
   One runs Xcode beta with the newest SDK; the other (`CHECK_HOST`, set in the
-  untracked `local.mk`) runs the deployment minimum. Check before concluding anything:
-  `sw_vers -productVersion`, `xcrun --show-sdk-version --sdk macosx`. On the
-  minimum machine an ordinary `make verify` already *is* the cross-SDK check,
-  and `make check-26` is a no-op that rsyncs to itself. On the newest-SDK
-  machine it is the only thing standing between you and a build everybody else
-  cannot compile.
+  untracked `local.mk`) runs the oldest *macOS* — 26.7 as of 2026-10-20 — but
+  its default Xcode is 27 (Swift 6.4, 27 SDK), the same toolchain as the
+  first. So on neither machine is an ordinary `make verify` a cross-SDK check.
+  The old toolchain is a side-by-side Xcode 26.6 (`CHECK_XCODE`, default
+  `/Applications/Xcode-26.6.app`, 17F113; Swift 6.3.3, macOS 26.5 SDK), and `make
+  check-26` pins `DEVELOPER_DIR` to it, prints the compiler and SDK it got, and
+  fails unless they are older than Swift 6.4 and a 26 SDK. It is the only thing
+  standing between you and a build everybody else cannot compile; if it fails
+  on the toolchain lines rather than the build, the check did not run. Check
+  before concluding anything: `sw_vers -productVersion`,
+  `xcrun --show-sdk-version --sdk macosx`.
 - A symbol newer than the deployment target needs **both** guards.
   `#available(macOS 27.0, *)` is a runtime check — the symbol still has to
   exist at compile time, and one that is absent from the 26 SDK fails the build
