@@ -228,10 +228,45 @@ of this user's can capture the screen with DuoShot's grant — so:
   and a panel closing between them returned a picture of what was behind it, cut
   to its outline, with alpha 1. The window is re-checked after the region and
   anything different exits 6. The alpha read before capturing is not enough.
+- **`duoshot record --isolated` records a window the way `shot --isolated`
+  takes it** (`SCContentFilter(desktopIndependentWindow:)`): covered or not,
+  without raising or activating anything. It ends the take, keeping what was
+  recorded (exit 4, `ended_early`), when the window leaves the screen — closed,
+  minimized, another Space. During any take macOS shows its own purple
+  recording dot beside Control Center in the menu bar (photographed; it is
+  drawn in that item, not a window of its own).
 - **`--selftest-*` is compiled out of what ships** (`SELFTEST=0`, `#if
   DUOSHOT_SELFTEST`). Launched through LaunchServices, DuoShot is its own TCC
   responsible process, so a self-test entry point in a release build is a
   capture-anything-to-any-path command for any same-user process.
+
+## Click timeline
+
+Every take — a hotkey one or `duoshot record` — carries the clicks made during
+it as a timed metadata track in the movie (`ClickTimeline`,
+`ClickTimelineEmbedder`). Three things are not visible from the code:
+
+- **`NSEvent` global *and* local monitors, not polling and not a tap.**
+  Measured with no Accessibility or Input Monitoring grant: the global monitor
+  sees clicks delivered to other apps, the local one those delivered to ours,
+  together 20 of 20 including 0 ms clicks, `timestamp` within 0.1–3.9 ms of
+  the post. Polling `pressedMouseButtons` missed fast clicks; a listen-only
+  `CGEventTap` without Input Monitoring is silently given nothing. Mouse only.
+- **The movie does not keep capture times.** `SCRecordingOutput` writes
+  sample times from near zero behind an edit list. The session logs the host
+  time of every complete frame the stream delivers — the clock
+  `NSEvent.timestamp` is on — and the finished file's frames are lined up with
+  that log by their spacing; matched frame host time minus its movie time is
+  movie zero. Measured: the stream delivered exactly the file's frames, and the
+  first is movie zero. A decoding `AVAssetReader` reports movie time; a raw one
+  (no output settings) reports media time, which needs the edit list.
+- **It is a post-process, and a remux.** `SCRecordingOutput` writes the file
+  itself, so the track is added afterwards by copying every sample, unencoded,
+  into a new file that replaces the original only after the copy is checked.
+  `AVMutableMovie` and passthrough export both lost the last two AAC packets
+  (priming applied twice); the `AVAssetWriter` remux keeps them, but only with
+  the writer's movie timescale set to the source's. Gaps between clicks are
+  explicit empty groups, or a trim drags an earlier click in at time zero.
 
 ## The image editor
 
