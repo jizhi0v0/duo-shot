@@ -114,14 +114,6 @@ final class RecordingEngine {
     var isRecording: Bool { active != nil }
     var current: ActiveRecording? { active }
 
-    /// For the self-tests: make the click timeline's post-process fail after
-    /// it has written its copy, to prove the original survives.
-    var embedFailsForTest = false
-    /// For the self-tests: copy the file here before the timeline is embedded,
-    /// so its samples can be compared with what replaced it.
-    var copyBeforeEmbeddingForTest: URL?
-    private(set) var lastEmbedReportForTest: ClickTimelineEmbedder.Report?
-    private(set) var lastEmbedFailureForTest: String?
     /// What the last `start` actually put in its filter's exclusion list.
     private(set) var lastExcludedWindowIDsForTest: Set<CGWindowID> = []
 
@@ -443,12 +435,6 @@ final class RecordingEngine {
         let duration = await Self.assetDuration(of: url)
         let intact = report.writerFailure == nil && report.finalised && duration != nil
 
-        // Only on a take that finished cleanly: a salvaged file is the user's
-        // only copy of something that already went wrong once.
-        var clickCount = 0
-        if intact {
-            clickCount = await embedClicks(clickEvents, into: url, recording: recording)
-        }
 
         var result = RecordingResult(
             url: url,
@@ -460,7 +446,17 @@ final class RecordingEngine {
             sourceDisplayID: recording.request.displayID,
             sourceDescription: recording.sourceDescription,
             startedAt: recording.startedAt)
-        result.clicks = clickCount
+        // Only for a take that finished cleanly — a salvaged file is the
+        // user's only copy of something that already went wrong once — and
+        // only once it has been saved (`ClickTimelineJobs`).
+        if intact {
+            result.clickTimeline = ClickTimelineEmbedder.Pending(
+                events: clickEvents, frameHostTimes: recording.completeFrameHostTimes,
+                writerStart: recording.writerStartHostTime,
+                geometry: .init(regionInCGGlobal: recording.regionInCGGlobal,
+                                pixelSize: recording.pixelSize),
+                showsCursor: recording.options.showsCursor)
+        }
 
         Log.record.notice("""
             recording \(intact ? "finished" : "SALVAGED", privacy: .public) \
@@ -480,43 +476,6 @@ final class RecordingEngine {
             return result
         case .lost(let url, let failure):
             throw failure ?? RecordingError.fileMissing(url)
-        }
-    }
-
-    /// The click timeline, into the finished file. Returns how many events it
-    /// holds; any failure leaves the file as the recorder wrote it.
-    private func embedClicks(
-        _ events: [ClickRecorder.Event], into url: URL, recording: ActiveRecording
-    ) async -> Int {
-        if let copy = copyBeforeEmbeddingForTest {
-            try? FileManager.default.removeItem(at: copy)
-            try? FileManager.default.copyItem(at: url, to: copy)
-        }
-        let outcome = await ClickTimelineEmbedder.embed(
-            in: url, events: events,
-            frameHostTimes: recording.completeFrameHostTimes,
-            writerStart: recording.writerStartHostTime,
-            geometry: .init(regionInCGGlobal: recording.regionInCGGlobal,
-                            pixelSize: recording.pixelSize),
-            failForTest: embedFailsForTest)
-        switch outcome {
-        case .success(let report):
-            lastEmbedReportForTest = report
-            lastEmbedFailureForTest = nil
-            Log.record.notice("""
-                click timeline: \(report.clicks, privacy: .public) event(s), anchored by \
-                \(report.method, privacy: .public)\
-                \(report.anchorError.map { String(format: " (mean error %.2f ms)", $0 * 1000) } ?? "", privacy: .public)
-                """)
-            return report.clicks
-        case .failure(let failure):
-            lastEmbedReportForTest = nil
-            lastEmbedFailureForTest = failure.message
-            Log.record.error("""
-                click timeline not embedded, recording kept as written: \
-                \(failure.message, privacy: .public)
-                """)
-            return 0
         }
     }
 

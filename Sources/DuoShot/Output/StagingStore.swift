@@ -57,6 +57,10 @@ final class StagingStore {
     ///   prune each other's files. The app has `shared` and nothing else.
     init(directory: URL? = nil) { self.root = directory }
 
+    /// Paths `prune` must leave alone: a take whose click timeline is being
+    /// added right now (`ClickTimelineJobs`).
+    static var inUse: Set<String> = []
+
     /// Encodes the capture into staging and returns where it landed.
     ///
     /// `async` because the encode is the expensive half: a 5K screenshot is a
@@ -179,6 +183,7 @@ final class StagingStore {
         let stat = entries.compactMap { url -> (url: URL, date: Date, size: Int)? in
             let values = try? url.resourceValues(forKeys: keys)
             if values?.isDirectory == true { return nil }
+            if Self.inUse.contains(url.standardizedFileURL.path) { return nil }
             return (url, values?.contentModificationDate ?? .distantPast, values?.fileSize ?? 0)
         }
         // Newest first, so "keep" is a prefix under both caps.

@@ -435,6 +435,11 @@ final class RecordingCoordinator {
             if let output = OutputPipeline.shared.process(
                 result, saveDirectoryOverride: saveDirectoryOverride) {
                 onResult?(output)
+                // Saved and announced first; the timeline follows, on the
+                // file where it now is.
+                if let pending = result.clickTimeline {
+                    ClickTimelineJobs.shared.start(pending, into: output.url)
+                }
             }
         case .salvaged(let result, let failure):
             Log.record.error("""

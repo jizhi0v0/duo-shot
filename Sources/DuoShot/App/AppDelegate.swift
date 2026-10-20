@@ -26,6 +26,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isReauthorising = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // What an interrupted click timeline or command-line take left behind:
+        // hidden copies nothing else would ever remove.
+        let staging = StagingStore.shared
+        ClickTimelineJobs.sweep([staging.directory, staging.unsavedDirectory,
+                                 Preferences.shared.saveDirectory])
+        CLIServer.sweepTakes()
         let granted = ScreenPermission.isGranted
         Log.app.notice("""
             launched screen-capture-access=\(granted ? "granted" : "denied", privacy: .public) \
@@ -317,11 +323,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "quitting with \(abandoned, privacy: .public) upload(s) in flight; abandoning them")
         }
 
-        guard recorder.hasTakeInFlight else { return .terminateNow }
+        // Takes are saved before their click timeline is added, so a timeline
+        // still being written is all a quit costs: cancel it, start no more.
+        let jobs = ClickTimelineJobs.shared
+        jobs.cancelAll()
+
+        guard recorder.hasTakeInFlight || commandLine.hasTakeInFlight || !jobs.isIdle
+        else { return .terminateNow }
 
         Log.app.notice("quit requested during a take; finalising before exit")
         Task {
             await recorder.settle()
+            // A command-line take ends early and is sent to its client.
+            await commandLine.settle()
+            await jobs.waitUntilIdle(timeout: .seconds(5))
             replyToTermination()
         }
         // A quit that can never complete is worse than a lost recording, and

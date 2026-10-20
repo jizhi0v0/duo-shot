@@ -586,11 +586,9 @@ enum CLISelfTest {
                 print("  windows that appeared during the take (any system recording indicator would be here): \(newWindows.isEmpty ? "none" : newWindows.joined(separator: "; "))")
                 let clicks = ((try? await ClickTimeline.read(from: movie)) ?? []).filter { $0.phase == "down" }
                 let inside = clicks.first { !$0.outside }
-                let outsideClick = clicks.first { $0.outside }
-                check(clicks.count == 2 && inside.map {
-                        abs($0.px - 60 * scale) <= 1 && abs($0.py - 50 * scale) <= 1 } == true
-                        && outsideClick != nil,
-                      "--isolated: clicks mapped into the window's pixels, the one outside it flagged",
+                check(clicks.count == 1 && inside.map {
+                        abs($0.px - 60 * scale) <= 1 && abs($0.py - 50 * scale) <= 1 } == true,
+                      "--isolated: the click on the window mapped into its pixels; the one outside it not stored",
                       clicks.map { String(format: "(%.0f,%.0f) px outside=%@", $0.px, $0.py, $0.outside ? "yes" : "no") }.joined(separator: "; "))
             } else {
                 check(run.status == 0 && info?.mode == "as_seen" && greenest > 0.9,
@@ -617,6 +615,25 @@ enum CLISelfTest {
                 && aboveBefore.contains(UInt32(cover.windowNumber)) && lost.isEmpty,
               "--isolated: nothing activated or raised (frontmost app; everything above it still above it)",
               "\(run.summary); front \(frontBefore ?? 0) -> \(NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0), \(aboveBefore.count) above before, now below it: \(lostNames)")
+
+        print("(r6) quitting mid-take ends it, sends it, and leaves nothing behind")
+        let quitMovie = directory.appendingPathComponent("cli-record-quit.mp4")
+        try? FileManager.default.removeItem(at: quitMovie)
+        let quitTake = Task { await client(["record", "--rect", rectArgument, "--seconds", "8",
+                                            "--out", quitMovie.path], socket: socket) }
+        try await Task.sleep(for: .milliseconds(1500))
+        let settleStart = Date()
+        await server.settle()
+        let settled = Date().timeIntervalSince(settleStart)
+        run = await quitTake.value
+        let quitInfo = try? JSONDecoder().decode(CLIRecording.self, from: run.stdoutData)
+        let quitKept = (try? await AVURLAsset(url: quitMovie).load(.duration).seconds) ?? 0
+        let leftInTemp = (try? FileManager.default.contentsOfDirectory(
+            atPath: FileManager.default.temporaryDirectory.appendingPathComponent("DuoShotCommandLine").path)) ?? []
+        check(run.status == CLIExit.captureFailed && (quitInfo?.endedEarly ?? "").contains("quitting")
+                && quitKept > 1 && quitKept < 4 && !server.hasTakeInFlight && leftInTemp.isEmpty,
+              "exit 4, ended early because DuoShot is quitting, the movie kept, the temp directory empty",
+              String(format: "%@; settle took %.2f s; movie %.2f s; left in temp %d", run.summary, settled, quitKept, leftInTemp.count))
 
         print("(r5) the window goes away mid-take")
         for minimize in [false, true] {

@@ -385,6 +385,8 @@ final class CLIServer {
 
         let reply: CLIReply
         var payload = Data()
+        var movie: URL?
+        var ownsTake = false
         if let request = try? JSONDecoder().decode(CLIRequest.self, from: line) {
             Log.capture.notice("""
                 command line: \(request.command.rawValue, privacy: .public) \
@@ -393,7 +395,7 @@ final class CLIServer {
             if request.command == .record {
                 // Not on the serial queue: a two-minute take would hold every
                 // other request behind it, and it shares no engine with them.
-                (reply, payload) = await record(request, epoch: accepted)
+                (reply, movie, ownsTake) = await record(request, epoch: accepted)
             } else {
                 (reply, payload) = await serialized { [weak self] in
                     guard let self else { return (.failure("DuoShot is quitting", exitCode: CLIExit.unreachable), Data()) }
@@ -413,6 +415,24 @@ final class CLIServer {
         data.append(0x0A)
         data.append(payload)
         await Self.send(data, to: client)
+        // A movie follows its header straight from disk, never held whole in
+        // memory, and the take counts as running until it has gone.
+        if let movie {
+            await Self.sendFile(movie, to: client)
+            try? FileManager.default.removeItem(at: movie)
+        }
+        if ownsTake { recordInFlight = false }
+    }
+
+    @concurrent private static func sendFile(_ url: URL, to client: Int32) async {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return }
+        defer { try? handle.close() }
+        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        let end = Date().addingTimeInterval(replyDeadline + Double(size) / 20_000_000)
+        while let chunk = try? handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+            let remaining = end.timeIntervalSinceNow
+            guard remaining > 0, CLIWire.writeAll(client, chunk, within: remaining) else { return }
+        }
     }
 
     @concurrent private static func receive(_ client: Int32) async -> Data? {
@@ -461,31 +481,71 @@ final class CLIServer {
 
     // MARK: - Recording
 
-    private func record(_ request: CLIRequest, epoch accepted: Int) async -> (CLIReply, Data) {
+    /// The reply, the movie to send after it, and whether this request now
+    /// owns the one command-line take (and must release it once sent).
+    private func record(
+        _ request: CLIRequest, epoch accepted: Int
+    ) async -> (CLIReply, URL?, Bool) {
         guard let seconds = request.seconds, seconds > 0, seconds <= CLIWire.maximumRecordSeconds else {
             return (.failure("record needs --seconds above 0 and at most \(Int(CLIWire.maximumRecordSeconds))",
-                             exitCode: CLIExit.usage), Data())
+                             exitCode: CLIExit.usage), nil, false)
         }
         guard !recordInFlight else {
-            return (.failure("a command-line recording is already running", exitCode: CLIExit.captureFailed), Data())
+            return (.failure("a command-line recording is already running", exitCode: CLIExit.captureFailed), nil, false)
         }
         recordInFlight = true
-        defer { recordInFlight = false }
         do {
-            return try await recordTake(request, seconds: seconds, epoch: accepted)
+            let (reply, movie) = try await recordTake(request, seconds: seconds, epoch: accepted)
+            return (reply, movie, true)
         } catch let failure as Failure {
-            return (.failure(failure.message, exitCode: failure.exitCode), Data())
+            return (.failure(failure.message, exitCode: failure.exitCode), nil, true)
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? "\(error)"
-            return (.failure("recording failed: \(message)", exitCode: CLIExit.captureFailed), Data())
+            return (.failure("recording failed: \(message)", exitCode: CLIExit.captureFailed), nil, true)
         }
+    }
+
+    /// A command-line take is running or its movie is still being sent.
+    var hasTakeInFlight: Bool { recordInFlight }
+
+    /// For quitting: ends a running command-line take early — finalised, with
+    /// its timeline if one can still be added, and sent to its client — and
+    /// returns once it has gone.
+    func settle() async {
+        guard recordInFlight else { return }
+        if recordEndedEarly == nil { recordEndedEarly = "DuoShot is quitting" }
+        let deadline = ContinuousClock.now + .seconds(30)
+        while recordInFlight, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+    }
+
+    private static var takeDirectory: URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("DuoShotCommandLine", isDirectory: true)
+    }
+
+    /// Removes whatever a quit, a crash or a kill left in the private take
+    /// directory: every file there is one of ours and belongs to no client
+    /// any more.
+    @discardableResult
+    static func sweepTakes() -> Int {
+        let directory = takeDirectory
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+        var removed = 0
+        for name in names where (try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))) != nil {
+            removed += 1
+        }
+        if removed > 0 {
+            Log.app.notice("removed \(removed, privacy: .public) command-line take(s) left from an earlier run")
+        }
+        return removed
     }
 
     /// Where a take is written before its bytes go back: a 0700 directory of
     /// the app's own, never a path the client named.
     private static func privateTakeURL() throws -> URL {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("DuoShotCommandLine", isDirectory: true)
+        let directory = takeDirectory
         try FileManager.default.createDirectory(
             at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         chmod(directory.path, 0o700)
@@ -494,7 +554,7 @@ final class CLIServer {
 
     private func recordTake(
         _ request: CLIRequest, seconds: Double, epoch accepted: Int
-    ) async throws -> (CLIReply, Data) {
+    ) async throws -> (CLIReply, URL) {
         var mode = "rect"
         var windowRef: CLIShot.Window?
         let recordingRequest: RecordingRequest
@@ -529,7 +589,10 @@ final class CLIServer {
 
         try await beginCapture(accepted)
         let url = try Self.privateTakeURL()
-        defer { try? FileManager.default.removeItem(at: url) }
+        // Removed here on every way out but success; on success the movie is
+        // the caller's to send and then remove.
+        var delivered = false
+        defer { if !delivered { try? FileManager.default.removeItem(at: url) } }
         var options = RecordingOptions.default
         options.capturesMicrophone = false
         recordEndedEarly = nil
@@ -560,14 +623,20 @@ final class CLIServer {
 
         switch await recorder.finish() {
         case .finished(let result), .salvaged(let result, _):
-            let data = try Data(contentsOf: result.url)
-            if result.url != url { try? FileManager.default.removeItem(at: result.url) }
+            // Before replying: the agent asked for the movie with its clicks.
+            var clicks = 0
+            if let pending = result.clickTimeline,
+               case .success(let report) = await ClickTimelineJobs.shared.run(pending, into: result.url) {
+                clicks = report.clicks
+            }
+            let size = (try? FileManager.default.attributesOfItem(atPath: result.url.path)[.size] as? Int) ?? 0
             let info = CLIRecording(
                 mode: mode, window: windowRef, rect: request.rect, frame: CLIRect(region),
                 scale: Double(result.scale), pixelWidth: Int(result.pixelSize.width),
                 pixelHeight: Int(result.pixelSize.height), duration: result.duration,
-                clicks: result.clicks, endedEarly: recordEndedEarly)
-            return (CLIReply(ok: true, recording: info, bytes: data.count), data)
+                clicks: clicks, endedEarly: recordEndedEarly)
+            delivered = true
+            return (CLIReply(ok: true, recording: info, bytes: size), result.url)
         case .lost(_, let failure):
             throw Failure(message: "nothing was recorded\(failure.map { ": \($0.localizedDescription)" } ?? "")")
         }

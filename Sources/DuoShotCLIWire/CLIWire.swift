@@ -373,6 +373,10 @@ package enum CLIWire {
     /// client must not allocate for it.
     package static let maximumPayload = 512 * 1024 * 1024
 
+    /// The most a `record` reply may claim: a movie, not a screenshot. Two
+    /// minutes at a 50 Mbit/s screen bitrate is about 750 MB.
+    package static let maximumMoviePayload = 2 * 1024 * 1024 * 1024
+
     /// The longest `duoshot record` take.
     package static let maximumRecordSeconds = 120.0
 

@@ -79,6 +79,9 @@ enum SelfTest {
         /// A take with clicks posted at it, and the timeline in the movie
         /// (`ClickTimelineSelfTest`).
         case clickTimeline(directory: URL)
+        /// A measurement: a large synthetic take's embed time, and a quit
+        /// cancelling one (`ClickTimelineSelfTest.quitTiming`).
+        case clickTimelineQuit(directory: URL, gigabytes: Double)
         /// Settings persistence, key-combo encoding and the system-shortcut probe.
         case preferences
         /// Pure geometry of the armed selection's grab zones. Headless: no screen,
@@ -277,6 +280,11 @@ enum SelfTest {
                 self = .preferences
             case "--selftest-cli":
                 self = .cli(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
+            case "--selftest-click-timeline-quit":
+                let numbers = rest.dropFirst().compactMap(Double.init)
+                self = .clickTimelineQuit(
+                    directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"),
+                    gigabytes: numbers.first ?? 2)
             case "--selftest-click-timeline":
                 self = .clickTimeline(directory: URL(fileURLWithPath: positional() ?? "build/selftest-output"))
             case "--selftest-selection-zones":
@@ -473,6 +481,8 @@ enum SelfTest {
             case .preferences: return preferencesCheck()
             case .cli(let directory): return try await CLISelfTest.run(into: directory)
             case .clickTimeline(let d): return try await ClickTimelineSelfTest.run(into: d)
+            case .clickTimelineQuit(let d, let gb):
+                return try await ClickTimelineSelfTest.quitTiming(into: d, gigabytes: gb)
             case .share(let endpoint, let token, let file, let big):
                 return await ShareSelfTest.run(
                     endpoint: endpoint, token: token, file: file, bigMegabytes: big)

@@ -1,7 +1,9 @@
 import AVFoundation
 import CoreGraphics
 import DuoShotCLIWire
+import Darwin
 import Foundation
+import Synchronization
 
 /// Puts a take's clicks into its movie file as a timed metadata track
 /// (`ClickTimeline`), after `SCRecordingOutput` has finished writing it.
@@ -11,8 +13,9 @@ import Foundation
 /// at which a track can be added to it. So the finished file is remuxed:
 /// every audio and video sample is copied as it is — no decode, no encode —
 /// into a new file beside it with the metadata track added, the copy is
-/// checked against the original, and only then does it replace it. Any
-/// failure leaves the original exactly as it was.
+/// checked against the original (`confirmSameMedia`), flushed to disk, and
+/// only then swapped in. Any failure, a change to the file meanwhile, or a
+/// cancellation leaves the original exactly as it was.
 ///
 /// **Why a remux with `AVAssetWriter`, measured on a real take.** Copying the
 /// tracks with `AVMutableMovie` (`insertTimeRange(..., copySampleData: true)`)
@@ -35,12 +38,28 @@ import Foundation
 /// the file holds, 14 of 14, and the first of them is movie time zero (27.8 ms
 /// after the writer reported starting). A click at host time `h` is then at
 /// movie time `h - anchor`.
+///
+/// **Only what the picture shows.** A click outside the recorded area — or,
+/// for an isolated take, outside the window — is not stored at all, and a take
+/// that hides the pointer gets no timeline: a shared file must not carry more
+/// than its pixels do (a PIN pad or an on-screen keyboard beside the region).
 nonisolated enum ClickTimelineEmbedder {
     struct Geometry: Sendable {
         /// The recorded area, global points, origin top-left.
         let regionInCGGlobal: CGRect
         /// The encoded frame size.
         let pixelSize: CGSize
+    }
+
+    /// Everything a take leaves for its timeline, carried on its result until
+    /// the file has been saved and can be worked on.
+    struct Pending: Sendable {
+        let events: [ClickRecorder.Event]
+        let frameHostTimes: [Double]
+        let writerStart: Double?
+        let geometry: Geometry
+        /// The take shows the pointer. Off, there is no timeline at all.
+        let showsCursor: Bool
     }
 
     struct Report: Sendable {
@@ -50,6 +69,8 @@ nonisolated enum ClickTimelineEmbedder {
         let anchorError: Double?
         /// Host-clock seconds of movie time zero.
         let anchorHostTime: Double
+        /// Why nothing was embedded although nothing failed, if so.
+        var skipped: String?
     }
 
     struct Failure: LocalizedError {
@@ -57,45 +78,112 @@ nonisolated enum ClickTimelineEmbedder {
         var errorDescription: String? { message }
     }
 
+    /// Set from anywhere to stop an embed that is running; it gives up at the
+    /// next sample and leaves the original alone.
+    final class Cancellation: Sendable {
+        private let flag = Mutex(false)
+        init() {}
+        func cancel() { flag.withLock { $0 = true } }
+        var isCancelled: Bool { flag.withLock { $0 } }
+    }
+
+    /// For the self-test of `confirmSameMedia`: damage the copy on purpose.
+    enum Fault: String, Sendable, CaseIterable {
+        case dropVideoSample = "a dropped video sample"
+        case shiftVideoFrame = "frames from the third on shifted by 1/600 s"
+        case loseAudioTail = "the last audio packet lost"
+        case changeEditList = "a different edit list"
+        case none
+    }
+
     /// Embeds, or leaves the file alone and says why. Never throws.
     @concurrent
     static func embed(
-        in url: URL, events: [ClickRecorder.Event], frameHostTimes: [Double],
-        writerStart: Double?, geometry: Geometry, failForTest: Bool = false
+        in url: URL, _ pending: Pending, cancellation: Cancellation = Cancellation(),
+        fault: Fault = .none, failForTest: Bool = false
     ) async -> Result<Report, Failure> {
         do {
+            let identity = try fileIdentity(url)
             let asset = AVURLAsset(url: url)
             let duration = try await asset.load(.duration)
-            let movieTimes = try await videoMovieTimes(of: asset)
+            let movieTimes = try await videoMovieTimes(of: asset, cancellation: cancellation)
             guard let anchor = anchor(
-                hostTimes: frameHostTimes, movieTimes: movieTimes, writerStart: writerStart)
+                hostTimes: pending.frameHostTimes, movieTimes: movieTimes,
+                writerStart: pending.writerStart)
             else { throw Failure(message: "no frame times to anchor the clicks to") }
+            var report = Report(clicks: 0, method: anchor.method, anchorError: anchor.meanError,
+                                anchorHostTime: anchor.offset)
+            guard pending.showsCursor else {
+                report.skipped = "the take hides the pointer"
+                return .success(report)
+            }
 
-            let marks: [(Double, ClickMark)] = events.compactMap { event in
+            let marks: [(Double, ClickMark)] = pending.events.compactMap { event in
                 let t = event.timestamp - anchor.offset
                 guard t >= 0, t < duration.seconds else { return nil }
-                return (t, mark(for: event, geometry: geometry))
+                let mark = mark(for: event, geometry: pending.geometry)
+                return mark.outside ? nil : (t, mark)
             }
             guard !marks.isEmpty else {
-                return .success(Report(clicks: 0, method: anchor.method, anchorError: anchor.meanError,
-                                       anchorHostTime: anchor.offset))
+                report.skipped = "no clicks inside the recorded area"
+                return .success(report)
             }
 
             let destination = url.deletingLastPathComponent()
-                .appendingPathComponent(".duoshot-clicks-\(UUID().uuidString.prefix(8))")
+                .appendingPathComponent("\(sweepPrefix)\(UUID().uuidString.prefix(8))")
                 .appendingPathExtension(url.pathExtension.isEmpty ? "mp4" : url.pathExtension)
             defer { try? FileManager.default.removeItem(at: destination) }
             try await remux(asset, duration: duration, marks: marks, to: destination,
-                            fileType: url.pathExtension.lowercased() == "mov" ? .mov : .mp4)
-            try await confirmSameMedia(asset, as: destination, movieTimes: movieTimes)
+                            fileType: url.pathExtension.lowercased() == "mov" ? .mov : .mp4,
+                            cancellation: cancellation, fault: fault)
+            try await confirmSameMedia(asset, as: AVURLAsset(url: destination), cancellation: cancellation)
+            try fullSync(destination)
             if failForTest { throw Failure(message: "failing on purpose (self-test)") }
+            guard !cancellation.isCancelled else { throw Failure(message: "cancelled") }
+            // Trimmed, moved or deleted since this started: whatever it is now,
+            // it is no longer the file the copy was made from.
+            guard try fileIdentity(url) == identity else {
+                throw Failure(message: "the file changed while its timeline was being added")
+            }
             _ = try FileManager.default.replaceItemAt(url, withItemAt: destination)
-            return .success(Report(clicks: marks.count, method: anchor.method, anchorError: anchor.meanError,
-                                   anchorHostTime: anchor.offset))
+            report = Report(clicks: marks.count, method: anchor.method, anchorError: anchor.meanError,
+                            anchorHostTime: anchor.offset)
+            return .success(report)
         } catch let failure as Failure {
             return .failure(failure)
         } catch {
             return .failure(Failure(message: error.localizedDescription))
+        }
+    }
+
+    /// The prefix of every copy this writes, for the sweep at launch: a copy
+    /// left by a crash or a kill is hidden, so nothing else ever removes it.
+    static let sweepPrefix = ".duoshot-clicks-"
+
+    private struct Identity: Equatable {
+        let device: dev_t, inode: ino_t, size: off_t, modified: timespec
+
+        static func == (a: Identity, b: Identity) -> Bool {
+            a.device == b.device && a.inode == b.inode && a.size == b.size
+                && a.modified.tv_sec == b.modified.tv_sec && a.modified.tv_nsec == b.modified.tv_nsec
+        }
+    }
+
+    private static func fileIdentity(_ url: URL) throws -> Identity {
+        var info = stat()
+        guard stat(url.path, &info) == 0 else { throw Failure(message: "the file is gone") }
+        return Identity(device: info.st_dev, inode: info.st_ino, size: info.st_size,
+                        modified: info.st_mtimespec)
+    }
+
+    /// To the disk, not the drive's cache: the swap that follows is atomic,
+    /// and must not make the only copy one that a power cut can lose.
+    private static func fullSync(_ url: URL) throws {
+        let fd = open(url.path, O_RDONLY)
+        guard fd >= 0 else { throw Failure(message: "cannot open the copy to flush it") }
+        defer { close(fd) }
+        if fcntl(fd, F_FULLFSYNC) != 0, fsync(fd) != 0 {
+            throw Failure(message: "cannot flush the copy to disk")
         }
     }
 
@@ -153,64 +241,123 @@ nonisolated enum ClickTimelineEmbedder {
 
     /// Every video sample's presentation time on the movie's timeline: media
     /// time mapped through the track's edit list.
-    static func videoMovieTimes(of asset: AVURLAsset) async throws -> [Double] {
+    static func videoMovieTimes(
+        of asset: AVURLAsset, cancellation: Cancellation? = nil
+    ) async throws -> [Double] {
         guard let track = try await asset.loadTracks(withMediaType: .video).first else { return [] }
+        return try await samples(of: track, in: asset, cancellation: cancellation).map(\.time).sorted()
+    }
+
+    /// One sample as the copy check sees it.
+    struct Sample: Equatable {
+        /// Movie time, through the edit list.
+        let time: Double
+        let duration: Double
+        let size: Int
+    }
+
+    /// Every sample of a track, in decode order, read raw (no output settings
+    /// — a raw reader reports media time, which is mapped here).
+    /// Reading a multi-gigabyte take's tables takes seconds, so a quit is
+    /// listened for here too, not only while copying.
+    static func samples(
+        of track: AVAssetTrack, in asset: AVURLAsset, cancellation: Cancellation? = nil
+    ) async throws -> [Sample] {
         let segments = try await track.load(.segments)
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
         output.alwaysCopiesSampleData = false
         reader.add(output)
-        guard reader.startReading() else { throw Failure(message: "cannot read the video samples") }
-        var times: [Double] = []
-        while let sample = output.copyNextSampleBuffer() {
-            guard CMSampleBufferGetNumSamples(sample) > 0 else { continue }
-            let media = CMSampleBufferGetPresentationTimeStamp(sample)
-            for segment in segments where !segment.isEmpty
-                && CMTimeRangeContainsTime(segment.timeMapping.source, time: media) {
-                times.append((media - segment.timeMapping.source.start
-                              + segment.timeMapping.target.start).seconds)
-                break
+        guard reader.startReading() else { throw Failure(message: "cannot read the samples") }
+        var samples: [Sample] = []
+        while let buffer = output.copyNextSampleBuffer() {
+            if cancellation?.isCancelled == true {
+                reader.cancelReading()
+                throw Failure(message: "cancelled")
+            }
+            let count = CMSampleBufferGetNumSamples(buffer)
+            guard count > 0 else { continue }
+            var timing = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: count)
+            var timingCount = 0
+            CMSampleBufferGetSampleTimingInfoArray(
+                buffer, entryCount: count, arrayToFill: &timing, entriesNeededOut: &timingCount)
+            for index in 0..<count {
+                // Audio buffers carry many packets under one timing entry, and
+                // the original and the copy are chunked differently: a packet's
+                // time is the entry's plus its place in the run.
+                var info = index < timingCount ? timing[index] : timing.first ?? CMSampleTimingInfo()
+                if timingCount == 1, count > 1 {
+                    info.presentationTimeStamp = info.presentationTimeStamp
+                        + CMTimeMultiply(info.duration, multiplier: Int32(index))
+                }
+                let media = info.presentationTimeStamp
+                var time = media.seconds
+                for segment in segments where !segment.isEmpty
+                    && CMTimeRangeContainsTime(segment.timeMapping.source, time: media) {
+                    time = (media - segment.timeMapping.source.start
+                            + segment.timeMapping.target.start).seconds
+                    break
+                }
+                samples.append(Sample(
+                    time: (time * 1_000_000).rounded() / 1_000_000,
+                    duration: (info.duration.seconds * 1_000_000).rounded() / 1_000_000,
+                    size: CMSampleBufferGetSampleSize(buffer, at: index)))
             }
         }
-        return times.sorted()
+        return samples
     }
 
-    private static func packetCount(of asset: AVURLAsset, mediaType: AVMediaType) async throws -> Int {
-        var count = 0
-        for track in try await asset.loadTracks(withMediaType: mediaType) {
-            let reader = try AVAssetReader(asset: asset)
-            let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
-            output.alwaysCopiesSampleData = false
-            reader.add(output)
-            guard reader.startReading() else { throw Failure(message: "cannot read \(mediaType.rawValue)") }
-            while let sample = output.copyNextSampleBuffer() { count += CMSampleBufferGetNumSamples(sample) }
-        }
-        return count
-    }
-
-    /// The copy must hold the same media at the same times, or it is not used.
-    private static func confirmSameMedia(
-        _ original: AVURLAsset, as copyURL: URL, movieTimes: [Double]
+    /// The copy holds the same media as the original, or it is not used.
+    ///
+    /// Compared, for every audio and video track in turn: the number of
+    /// samples; each sample's size, duration and presentation time on the
+    /// movie's timeline (all but the duration of the very last, which the
+    /// format leaves to the writer); and the track's edit list as movie-time
+    /// ranges, which bounds how much of that last sample is shown.
+    /// Bytes are not hashed — that would read the whole file a third time —
+    /// but a passthrough copy cannot change a sample's content without its
+    /// size, and the self-test hashes them. The movie's overall duration is
+    /// not compared: it is derived from the tracks, which are.
+    static func confirmSameMedia(
+        _ original: AVURLAsset, as copy: AVURLAsset, cancellation: Cancellation? = nil
     ) async throws {
-        let copy = AVURLAsset(url: copyURL)
-        let (before, after) = (try await original.load(.duration), try await copy.load(.duration))
-        // The container's duration may move by less than a frame: measured on a
-        // 1.2 s take, the copy ended 0.6 ms earlier (on the audio track's end
-        // rather than the last frame's display end). The samples themselves —
-        // every byte, every video frame's movie time — are compared exactly
-        // below, so this only guards against a copy that is truly shorter.
-        guard abs(before.seconds - after.seconds) < 0.02 else {
-            throw Failure(message: "the copy's duration differs (\(before.seconds) vs \(after.seconds))")
-        }
-        let copyTimes = try await videoMovieTimes(of: copy)
-        guard copyTimes.count == movieTimes.count,
-              zip(copyTimes, movieTimes).allSatisfy({ abs($0 - $1) < 0.000_5 })
-        else { throw Failure(message: "the copy's video frames are not at the original's times") }
-        for type in [AVMediaType.audio, .video] {
-            let (a, b) = (try await packetCount(of: original, mediaType: type),
-                          try await packetCount(of: copy, mediaType: type))
-            guard a == b else {
-                throw Failure(message: "the copy has \(b) \(type.rawValue) samples, the original \(a)")
+        for type in [AVMediaType.video, .audio] {
+            let mine = try await original.loadTracks(withMediaType: type)
+            let theirs = try await copy.loadTracks(withMediaType: type)
+            guard mine.count == theirs.count else {
+                throw Failure(message: "the copy has \(theirs.count) \(type.rawValue) track(s), the original \(mine.count)")
+            }
+            for (a, b) in zip(mine, theirs) {
+                let (first, second) = (try await samples(of: a, in: original, cancellation: cancellation),
+                                       try await samples(of: b, in: copy, cancellation: cancellation))
+                guard first.count == second.count else {
+                    throw Failure(message: "the copy has \(second.count) \(type.rawValue) samples, the original \(first.count)")
+                }
+                // The last sample's duration is the one number a writer makes
+                // up: the format stores no end for it, and two writers given
+                // the same samples closed it at 1/600 s and at 50 ms. What is
+                // shown of it is bounded by the edit list, compared below.
+                let last = first.count - 1
+                let differs = { (i: Int) -> Bool in
+                    i == last
+                        ? first[i].time != second[i].time || first[i].size != second[i].size
+                        : first[i] != second[i]
+                }
+                if let index = first.indices.first(where: differs) {
+                    throw Failure(message: """
+                        \(type.rawValue) sample \(index) differs: \(first[index]) vs \(second[index])
+                        """)
+                }
+                let (edits, copied) = (try await a.load(.segments), try await b.load(.segments))
+                let describe = { (segments: [AVAssetTrackSegment]) -> [String] in
+                    segments.map {
+                        String(format: "%@%.4f+%.4f", $0.isEmpty ? "empty " : "",
+                               $0.timeMapping.target.start.seconds, $0.timeMapping.target.duration.seconds)
+                    }
+                }
+                guard describe(edits) == describe(copied) else {
+                    throw Failure(message: "the \(type.rawValue) edit list differs: \(describe(edits)) vs \(describe(copied))")
+                }
             }
         }
     }
@@ -221,12 +368,15 @@ nonisolated enum ClickTimelineEmbedder {
         let reader: AVAssetReader
         let output: AVAssetReaderTrackOutput
         let input: AVAssetWriterInput
+        let mediaType: AVMediaType
         var finished = false
+        var appended = 0
+        let total: Int
     }
 
     private static func remux(
         _ asset: AVURLAsset, duration: CMTime, marks: [(Double, ClickMark)],
-        to destination: URL, fileType: AVFileType
+        to destination: URL, fileType: AVFileType, cancellation: Cancellation, fault: Fault
     ) async throws {
         let writer = try AVAssetWriter(outputURL: destination, fileType: fileType)
         // The source's, or the leading edit of the audio is rounded to the
@@ -246,7 +396,10 @@ nonisolated enum ClickTimelineEmbedder {
             input.transform = transform
             guard writer.canAdd(input) else { throw Failure(message: "cannot copy a \(track.mediaType.rawValue) track") }
             writer.add(input)
-            lanes.append(Lane(reader: reader, output: output, input: input))
+            let total = fault == .loseAudioTail && track.mediaType == .audio
+                ? try await samples(of: track, in: asset).count : 0
+            lanes.append(Lane(reader: reader, output: output, input: input,
+                              mediaType: track.mediaType, total: total))
         }
 
         let specification: [String: Any] = [
@@ -273,17 +426,37 @@ nonisolated enum ClickTimelineEmbedder {
         guard writer.startWriting() else {
             throw Failure(message: "cannot write: \(writer.error?.localizedDescription ?? "?")")
         }
-        writer.startSession(atSourceTime: .zero)
+        writer.startSession(atSourceTime: fault == .changeEditList
+                            ? CMTime(value: 1, timescale: 10) : .zero)
 
         var metadataDone = false
         while !metadataDone || lanes.contains(where: { !$0.finished }) {
+            if cancellation.isCancelled {
+                writer.cancelWriting()
+                throw Failure(message: "cancelled")
+            }
             var moved = false
             for index in lanes.indices where !lanes[index].finished {
                 while lanes[index].input.isReadyForMoreMediaData {
-                    guard let sample = lanes[index].output.copyNextSampleBuffer() else {
+                    guard var sample = lanes[index].output.copyNextSampleBuffer() else {
                         lanes[index].input.markAsFinished()
                         lanes[index].finished = true
                         break
+                    }
+                    let isVideo = lanes[index].mediaType == .video
+                    let real = CMSampleBufferGetNumSamples(sample) > 0
+                    if real {
+                        lanes[index].appended += CMSampleBufferGetNumSamples(sample)
+                        switch fault {
+                        case .dropVideoSample where isVideo && lanes[index].appended == 2:
+                            continue
+                        case .shiftVideoFrame where isVideo && lanes[index].appended >= 3:
+                            sample = shifted(sample, by: CMTime(value: 1, timescale: 600)) ?? sample
+                        case .loseAudioTail where !isVideo && lanes[index].appended >= lanes[index].total:
+                            continue
+                        default:
+                            break
+                        }
                     }
                     guard lanes[index].input.append(sample) else {
                         throw Failure(message: "copy failed: \(writer.error?.localizedDescription ?? "?")")
@@ -309,11 +482,27 @@ nonisolated enum ClickTimelineEmbedder {
             }
             if !moved { try await Task.sleep(for: .milliseconds(1)) }
         }
-        writer.endSession(atSourceTime: duration)
+        // No `endSession(atSourceTime:)`: it stretches each track's last
+        // sample to that time, so a take whose audio outlasts its video got a
+        // longer last frame in the copy, and the copy check — rightly — refused
+        // it. Left to itself the writer ends every track where its samples do,
+        // as the original's did.
         await writer.finishWriting()
         guard writer.status == .completed else {
             throw Failure(message: "could not finish: \(writer.error?.localizedDescription ?? "?")")
         }
+    }
+
+    /// For `Fault.shiftVideoFrame`: the same sample, later.
+    private static func shifted(_ sample: CMSampleBuffer, by offset: CMTime) -> CMSampleBuffer? {
+        var timing = CMSampleTimingInfo()
+        guard CMSampleBufferGetSampleTimingInfo(sample, at: 0, timingInfoOut: &timing) == noErr else { return nil }
+        timing.presentationTimeStamp = timing.presentationTimeStamp + offset
+        var copy: CMSampleBuffer?
+        CMSampleBufferCreateCopyWithNewTiming(
+            allocator: nil, sampleBuffer: sample, sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing, sampleBufferOut: &copy)
+        return copy
     }
 
     /// One group per instant, empty groups in between (see `ClickTimeline`).

@@ -24,6 +24,9 @@ nonisolated struct RecordingResult: Sendable, Identifiable {
     let startedAt: Date
     /// Mouse events in the movie's click timeline; 0 when none was embedded.
     var clicks = 0
+    /// What the click timeline needs, until the take is saved and it can be
+    /// added (`ClickTimelineJobs`). Nil for a take that did not end cleanly.
+    var clickTimeline: ClickTimelineEmbedder.Pending?
 
     var durationDescription: String {
         let total = Int(duration.rounded())

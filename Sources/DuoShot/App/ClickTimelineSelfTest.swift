@@ -45,14 +45,13 @@ enum ClickTimelineSelfTest {
         let before = directory.appendingPathComponent("clicks-before-embedding.mp4")
         try? FileManager.default.removeItem(at: url)
         let engine = RecordingEngine()
-        engine.copyBeforeEmbeddingForTest = before
         var options = RecordingOptions.default
         // On, so the untouched-samples check covers an audio track too.
         options.capturesSystemAudio = true
         options.showsMouseClicks = false
-        // The pointer moving into the picture before each click is a change of
-        // its own, and would be the one `--scene` reports.
-        options.showsCursor = false
+        // The pointer stays in the picture: a take that hides it gets no
+        // timeline at all (checked in (7)).
+        options.showsCursor = true
         let recording = try await engine.start(
             .area(displayID: displayID, rectInAppKitGlobal: frame), options: options, to: url)
 
@@ -74,14 +73,31 @@ enum ClickTimelineSelfTest {
         fixture.flip()
         try await Task.sleep(for: .milliseconds(600))
         let result = try await engine.stop()
-        let report = engine.lastEmbedReportForTest
+        // The take as the recorder wrote it, before anything was added.
+        try? FileManager.default.removeItem(at: before)
+        try FileManager.default.copyItem(at: url, to: before)
+        guard let pending = result.clickTimeline else {
+            check(false, "the take hands over its clicks")
+            return finish()
+        }
+        var report: ClickTimelineEmbedder.Report?
+        var failure = "-"
+        switch await ClickTimelineJobs.shared.run(pending, into: url) {
+        case .success(let value): report = value
+        case .failure(let value): failure = value.message
+        }
 
         let clicks = try await ClickTimeline.read(from: url)
         let downs = clicks.filter { $0.phase == "down" }
-        check(report != nil && result.clicks == 10 && clicks.count == 10 && downs.count == 5,
-              "the timeline is in the movie: 5 downs and 5 ups",
-              "result.clicks=\(result.clicks) read=\(clicks.count) method=\(report?.method ?? "none") failure=\(engine.lastEmbedFailureForTest ?? "-")")
-        guard let anchor = report?.anchorHostTime, downs.count == posted.count else {
+        let insidePosted = posted.filter(\.inside)
+        check(report?.clicks == 8 && clicks.count == 8 && downs.count == 4,
+              "the timeline is in the movie: the 4 clicks inside, down and up",
+              "embedded=\(report?.clicks ?? -1) read=\(clicks.count) method=\(report?.method ?? "none") failure=\(failure)")
+        let outsidePoint = posted.first { !$0.inside }?.point ?? .zero
+        check(!clicks.contains { abs($0.x - outsidePoint.x) < 1 && abs($0.y - outsidePoint.y) < 1 }
+                && !clicks.contains { $0.outside },
+              "the click outside the recorded area is not stored at all")
+        guard let anchor = report?.anchorHostTime, downs.count == insidePosted.count else {
             return finish()
         }
         print(String(format: "  anchored by %@, mean error %.3f ms",
@@ -104,7 +120,7 @@ enum ClickTimelineSelfTest {
 
         print("(2) each click at its time and its place")
         let frameInterval = 1.0 / Double(options.frameRate)
-        for (index, (click, truth)) in zip(downs, posted).enumerated() {
+        for (index, (click, truth)) in zip(downs, insidePosted).enumerated() {
             let expected = truth.host - anchor
             check(abs(click.t - expected) < frameInterval,
                   "click \(index + 1): the event's own time, within one frame of when it was posted",
@@ -116,8 +132,8 @@ enum ClickTimelineSelfTest {
                   "click \(index + 1): exact position, global points and video pixels",
                   String(format: "(%.1f,%.1f) pt (%.1f,%.1f) px, posted (%.1f,%.1f) pt (%.1f,%.1f) px",
                          click.x, click.y, click.px, click.py, truth.point.x, truth.point.y, px, py))
-            check(click.outside == !truth.inside && click.button == (truth.button == .left ? "left" : "right"),
-                  "click \(index + 1): \(truth.inside ? "inside" : "outside, flagged"), \(click.button)")
+            check(!click.outside && click.button == (truth.button == .left ? "left" : "right"),
+                  "click \(index + 1): inside, \(click.button)")
         }
 
         // The picture agrees with the mapping. Each flip of the fixture is
@@ -178,7 +194,7 @@ enum ClickTimelineSelfTest {
         let run = await CLISelfTest.client(["frames", url.path, "--out", scene.path, "--scene"], socket: "")
         let framesReport = try? JSONDecoder().decode(CLIFramesReport.self, from: run.stdoutData)
         let changes = framesReport?.changes ?? []
-        let leftInside = zip(downs, posted).filter { $0.1.inside && $0.1.button == .left }.map(\.0)
+        let leftInside = zip(downs, insidePosted).filter { $0.1.button == .left }.map(\.0)
         for click in leftInside {
             let change = changes.first { $0.time >= click.t - frameInterval && $0.time <= click.t + 0.2 }
             check(change.map { $0.hasTimeline && ($0.afterClickMs ?? -1) >= 0 && ($0.afterClickMs ?? 1e9) < 200
@@ -202,28 +218,281 @@ enum ClickTimelineSelfTest {
         check(!ringed.isEmpty && framesReport?.clickRingsNote != nil && ringPixel == "magenta",
               "frames near a click carry a ring, and the JSON says it was drawn",
               "\(ringed.count) ringed, ring pixel \(ringPixel ?? "?")")
-        check(framesReport?.clicks?.count == 5, "frames lists the 5 clicks",
+        check(framesReport?.clicks?.count == 4, "frames lists the 4 clicks",
               "\(framesReport?.clicks?.count ?? -1)")
 
         print("(6) a timeline that cannot be embedded costs nothing")
         let failing = directory.appendingPathComponent("clicks-failing.mp4")
-        let failingBefore = directory.appendingPathComponent("clicks-failing-before.mp4")
         try? FileManager.default.removeItem(at: failing)
-        let failingEngine = RecordingEngine()
-        failingEngine.embedFailsForTest = true
-        failingEngine.copyBeforeEmbeddingForTest = failingBefore
-        _ = try await failingEngine.start(
-            .area(displayID: displayID, rectInAppKitGlobal: frame), options: options, to: failing)
+        try FileManager.default.copyItem(at: before, to: failing)
+        let failingOutcome = await ClickTimelineJobs.shared.run(pending, into: failing, failForTest: true)
+        var intact = try await mediaDigest(of: failing) == mediaDigest(of: before)
+        var noTrack = try await AVURLAsset(url: failing).loadTracks(withMediaType: .metadata).isEmpty
+        let failedMessage: String? = if case .failure(let f) = failingOutcome { f.message } else { nil }
+        check(failedMessage != nil && intact && noTrack,
+              "the recording stays exactly as it was written, without a timeline",
+              "intact=\(intact) noTrack=\(noTrack) failure=\(failedMessage ?? "nil")")
+
+        print("(7) a take that hides the pointer gets no timeline")
+        let hidden = directory.appendingPathComponent("clicks-no-pointer.mp4")
+        try? FileManager.default.removeItem(at: hidden)
+        var hiddenOptions = options
+        hiddenOptions.showsCursor = false
+        let hiddenEngine = RecordingEngine()
+        _ = try await hiddenEngine.start(
+            .area(displayID: displayID, rectInAppKitGlobal: frame), options: hiddenOptions, to: hidden)
         try await Task.sleep(for: .milliseconds(400))
         _ = try await postClick(at: insideA, button: .left)
         try await Task.sleep(for: .milliseconds(600))
-        let failed = try? await failingEngine.stop()
-        let intact = try await mediaDigest(of: failing) == mediaDigest(of: failingBefore)
-        let noTrack = try await AVURLAsset(url: failing).loadTracks(withMediaType: .metadata).isEmpty
-        check(failed != nil && intact && noTrack && failingEngine.lastEmbedFailureForTest != nil,
-              "the recording comes back exactly as it was written, without a timeline",
-              "result=\(failed != nil) intact=\(intact) noTrack=\(noTrack) failure=\(failingEngine.lastEmbedFailureForTest ?? "nil")")
+        let hiddenResult = try await hiddenEngine.stop()
+        var hiddenSkipped: String?
+        if let hiddenPending = hiddenResult.clickTimeline,
+           case .success(let hiddenReport) = await ClickTimelineJobs.shared.run(hiddenPending, into: hidden) {
+            hiddenSkipped = hiddenReport.skipped
+        }
+        noTrack = try await AVURLAsset(url: hidden).loadTracks(withMediaType: .metadata).isEmpty
+        check(noTrack && hiddenSkipped != nil, "no metadata track, and it says why",
+              "noTrack=\(noTrack) skipped=\(hiddenSkipped ?? "nil")")
+
+        print("(8) the copy is checked, and a bad one is never swapped in")
+        for fault in ClickTimelineEmbedder.Fault.allCases where fault != .none {
+            let damaged = directory.appendingPathComponent("clicks-fault.mp4")
+            try? FileManager.default.removeItem(at: damaged)
+            try FileManager.default.copyItem(at: before, to: damaged)
+            let outcome = await ClickTimelineJobs.shared.run(pending, into: damaged, fault: fault)
+            intact = try await mediaDigest(of: damaged) == mediaDigest(of: before)
+            let message: String? = if case .failure(let f) = outcome { f.message } else { nil }
+            check(message != nil && intact, "\(fault.rawValue): refused, original untouched",
+                  message ?? "swapped in")
+        }
+
+        print("(9) a cancelled timeline (quitting) leaves the take and no copy")
+        let cancelled = directory.appendingPathComponent("clicks-cancelled.mp4")
+        try? FileManager.default.removeItem(at: cancelled)
+        try FileManager.default.copyItem(at: before, to: cancelled)
+        let cancellation = ClickTimelineEmbedder.Cancellation()
+        cancellation.cancel()
+        let cancelOutcome = await ClickTimelineJobs.shared.run(pending, into: cancelled, cancellation: cancellation)
+        intact = try await mediaDigest(of: cancelled) == mediaDigest(of: before)
+        let leftovers = ((try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? [])
+            .filter { $0.hasPrefix(ClickTimelineEmbedder.sweepPrefix) }
+        let cancelMessage: String? = if case .failure(let f) = cancelOutcome { f.message } else { nil }
+        check(cancelMessage == "cancelled" && intact && leftovers.isEmpty,
+              "cancelled: original untouched, no copy left behind",
+              "\(cancelMessage ?? "not cancelled"), intact=\(intact), leftovers \(leftovers)")
+
+        print("(10) staging leaves a take alone while its timeline is added")
+        let stagingDirectory = directory.appendingPathComponent("staging-prune", isDirectory: true)
+        try? FileManager.default.removeItem(at: stagingDirectory)
+        try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
+        let store = StagingStore(directory: stagingDirectory)
+        let older = stagingDirectory.appendingPathComponent("older-take.mp4")
+        let newer = stagingDirectory.appendingPathComponent("newer-take.mp4")
+        FileManager.default.createFile(atPath: older.path, contents: Data(count: 1024))
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -60)],
+                                              ofItemAtPath: older.path)
+        // Sparse: 3 GiB to the byte budget, nothing on disk.
+        FileManager.default.createFile(atPath: newer.path, contents: nil)
+        if let handle = try? FileHandle(forWritingTo: newer) {
+            try handle.truncate(atOffset: 3 << 30)
+            try handle.close()
+        }
+        StagingStore.inUse.insert(older.standardizedFileURL.path)
+        store.prune()
+        let keptWhileInUse = FileManager.default.fileExists(atPath: older.path)
+        StagingStore.inUse.remove(older.standardizedFileURL.path)
+        store.prune()
+        let prunedAfter = !FileManager.default.fileExists(atPath: older.path)
+        try? FileManager.default.removeItem(at: stagingDirectory)
+        check(keptWhileInUse && prunedAfter,
+              "a take in use survives a prune that removes it once it is not",
+              "kept while in use: \(keptWhileInUse), pruned after: \(prunedAfter)")
+
+        print("(11) the launch sweep removes what an interrupted timeline left, and only that")
+        let sweepDirectory = directory.appendingPathComponent("sweep", isDirectory: true)
+        try? FileManager.default.removeItem(at: sweepDirectory)
+        try FileManager.default.createDirectory(at: sweepDirectory, withIntermediateDirectories: true)
+        let orphan = sweepDirectory.appendingPathComponent(ClickTimelineEmbedder.sweepPrefix + "orphan.mp4")
+        let keeper = sweepDirectory.appendingPathComponent("someone-elses.mp4")
+        FileManager.default.createFile(atPath: orphan.path, contents: Data(count: 16))
+        FileManager.default.createFile(atPath: keeper.path, contents: Data(count: 16))
+        let swept = ClickTimelineJobs.sweep([sweepDirectory])
+        check(swept == 1 && !FileManager.default.fileExists(atPath: orphan.path)
+                && FileManager.default.fileExists(atPath: keeper.path),
+              "the orphaned copy removed, the other file kept", "removed \(swept)")
+        try? FileManager.default.removeItem(at: sweepDirectory)
         return finish()
+    }
+
+    // MARK: - Quit timing (a measurement, not in `make test`)
+
+    /// `--selftest-click-timeline-quit <dir> [GB]`: how long a large take's
+    /// timeline takes, and how long a quit waits for one being cancelled.
+    ///
+    /// The large take is made without encoding: three seconds of a window that
+    /// shows a different noise image every frame, recorded for real, then its
+    /// compressed samples written back to back with shifted times until the
+    /// file is the size asked for.
+    static func quitTiming(into directory: URL, gigabytes: Double) async throws -> Int32 {
+        guard ScreenPermission.isGranted else { return 1 }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let screen = NSScreen.screens[0]
+        guard let displayID = ScreenIndex.displayID(of: screen) else { return 1 }
+        let frame = CGRect(x: screen.visibleFrame.minX + 60, y: screen.visibleFrame.minY + 60,
+                           width: 900, height: 600)
+        let window = NSWindow(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.level = .floating
+        window.isOpaque = true
+        let view = NSImageView(frame: CGRect(origin: .zero, size: frame.size))
+        view.imageScaling = .scaleAxesIndependently
+        window.contentView = view
+        window.orderFrontRegardless()
+        defer { window.orderOut(nil) }
+        let images = (0..<8).map { noiseImage(width: 900, height: 600, seed: UInt64($0 + 1)) }
+
+        let source = directory.appendingPathComponent("quit-source.mp4")
+        try? FileManager.default.removeItem(at: source)
+        var options = RecordingOptions.default
+        options.capturesSystemAudio = false
+        let engine = RecordingEngine()
+        _ = try await engine.start(.area(displayID: displayID, rectInAppKitGlobal: frame),
+                                   options: options, to: source)
+        for index in 0..<180 {
+            view.image = images[index % images.count]
+            view.display()
+            try await Task.sleep(for: .milliseconds(16))
+        }
+        _ = try await engine.stop()
+        let sourceBytes = (try FileManager.default.attributesOfItem(atPath: source.path)[.size] as? Int) ?? 0
+
+        let large = directory.appendingPathComponent("quit-large.mp4")
+        let target = Int(gigabytes * 1_000_000_000)
+        let copies = max(1, target / max(sourceBytes, 1))
+        let started = Date()
+        try await repeatVideo(of: source, times: copies, to: large)
+        let largeBytes = (try FileManager.default.attributesOfItem(atPath: large.path)[.size] as? Int) ?? 0
+        print(String(format: "large take:    %.2f GB (%d copies of a %.1f MB take), built in %.1f s",
+                     Double(largeBytes) / 1e9, copies, Double(sourceBytes) / 1e6, Date().timeIntervalSince(started)))
+
+        // A timeline for it: its own frame times as the host clock, one click.
+        let movieTimes = try await ClickTimelineEmbedder.videoMovieTimes(of: AVURLAsset(url: large))
+        let region = DisplayGeometry.flipped(frame)
+        let pending = ClickTimelineEmbedder.Pending(
+            events: [ClickRecorder.Event(timestamp: 1000 + 1.0,
+                                         locationInCGGlobal: CGPoint(x: region.midX, y: region.midY),
+                                         isDown: true, button: "left", clickCount: 1)],
+            frameHostTimes: movieTimes.map { $0 + 1000 }, writerStart: nil,
+            geometry: .init(regionInCGGlobal: region,
+                            pixelSize: CGSize(width: frame.width * screen.backingScaleFactor,
+                                              height: frame.height * screen.backingScaleFactor)),
+            showsCursor: true)
+
+        let fullStart = Date()
+        let full = await ClickTimelineJobs.shared.run(pending, into: large)
+        let fullTime = Date().timeIntervalSince(fullStart)
+        let fullText: String = switch full {
+        case .success(let report): "embedded \(report.clicks)"
+        case .failure(let failure): "failed: \(failure.message)"
+        }
+        print(String(format: "full embed:    %.1f s for %.2f GB (%.2f s/GB), %@",
+                     fullTime, Double(largeBytes) / 1e9, fullTime / (Double(largeBytes) / 1e9), fullText))
+
+        // The quit: cancel one second into an embed and time the unwinding.
+        var info = stat()
+        stat(large.path, &info)
+        let identityBefore = (info.st_ino, info.st_size, info.st_mtimespec.tv_sec, info.st_mtimespec.tv_nsec)
+        let cancellation = ClickTimelineEmbedder.Cancellation()
+        let job = Task { await ClickTimelineJobs.shared.run(pending, into: large, cancellation: cancellation) }
+        try await Task.sleep(for: .seconds(1))
+        let cancelAt = Date()
+        cancellation.cancel()
+        let outcome = await job.value
+        let unwind = Date().timeIntervalSince(cancelAt)
+        stat(large.path, &info)
+        let identityAfter = (info.st_ino, info.st_size, info.st_mtimespec.tv_sec, info.st_mtimespec.tv_nsec)
+        let leftovers = ((try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? [])
+            .filter { $0.hasPrefix(ClickTimelineEmbedder.sweepPrefix) }
+        let message: String = if case .failure(let f) = outcome { f.message } else { "finished anyway" }
+        print(String(format: "quit:          cancelled 1 s in, unwound in %.3f s (%@); file unchanged: %@; copies left: %d",
+                     unwind, message, identityBefore == identityAfter ? "yes" : "NO", leftovers.count))
+        try? FileManager.default.removeItem(at: large)
+        try? FileManager.default.removeItem(at: source)
+        let ok = unwind < 1 && identityBefore == identityAfter && leftovers.isEmpty
+        print("result:        \(ok ? "PASS" : "FAIL")")
+        return ok ? 0 : 1
+    }
+
+    private static func noiseImage(width: Int, height: Int, seed: UInt64) -> NSImage {
+        var bytes = [UInt8](repeating: 255, count: width * height * 4)
+        var state = seed &* 0x9E3779B97F4A7C15
+        for i in stride(from: 0, to: bytes.count, by: 4) {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            bytes[i] = UInt8(truncatingIfNeeded: state >> 24)
+            bytes[i + 1] = UInt8(truncatingIfNeeded: state >> 32)
+            bytes[i + 2] = UInt8(truncatingIfNeeded: state >> 40)
+        }
+        let image = bytes.withUnsafeMutableBytes { raw -> CGImage? in
+            CGContext(data: raw.baseAddress, width: width, height: height, bitsPerComponent: 8,
+                      bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)?.makeImage()
+        }
+        return image.map { NSImage(cgImage: $0, size: NSSize(width: width, height: height)) } ?? NSImage()
+    }
+
+    /// The source's video samples, `times` times over, each run later than the
+    /// last by the source's duration. Passthrough: nothing is encoded.
+    @concurrent private static func repeatVideo(of source: URL, times: Int, to destination: URL) async throws {
+        try? FileManager.default.removeItem(at: destination)
+        let asset = AVURLAsset(url: source)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else { return }
+        let (formats, duration) = (try await track.load(.formatDescriptions), try await asset.load(.duration))
+        let writer = try AVAssetWriter(outputURL: destination, fileType: .mp4)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: formats.first)
+        input.expectsMediaDataInRealTime = false
+        writer.add(input)
+        writer.startWriting()
+        writer.startSession(atSourceTime: .zero)
+        // Each run starts where the last one's decode times end, so the joins
+        // are seamless: no sample's duration depends on the gap after it.
+        let timings = try await ClickTimelineEmbedder.samples(of: track, in: asset)
+        let span = CMTime(seconds: timings.reduce(0) { $0 + $1.duration }, preferredTimescale: 600)
+        _ = duration
+        for run in 0..<times {
+            let offset = CMTimeMultiply(span, multiplier: Int32(run))
+            let reader = try AVAssetReader(asset: asset)
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+            reader.add(output)
+            reader.startReading()
+            while let sample = output.copyNextSampleBuffer() {
+                guard CMSampleBufferGetNumSamples(sample) > 0 else { continue }
+                var count = 0
+                CMSampleBufferGetSampleTimingInfoArray(sample, entryCount: 0, arrayToFill: nil, entriesNeededOut: &count)
+                var timing = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: count)
+                CMSampleBufferGetSampleTimingInfoArray(sample, entryCount: count, arrayToFill: &timing, entriesNeededOut: &count)
+                for index in timing.indices {
+                    timing[index].presentationTimeStamp = timing[index].presentationTimeStamp + offset
+                    if timing[index].decodeTimeStamp.isValid {
+                        timing[index].decodeTimeStamp = timing[index].decodeTimeStamp + offset
+                    }
+                }
+                var shifted: CMSampleBuffer?
+                CMSampleBufferCreateCopyWithNewTiming(
+                    allocator: nil, sampleBuffer: sample, sampleTimingEntryCount: count,
+                    sampleTimingArray: &timing, sampleBufferOut: &shifted)
+                while !input.isReadyForMoreMediaData { try await Task.sleep(for: .milliseconds(1)) }
+                guard let shifted, input.append(shifted) else {
+                    throw NSError(domain: "repeatVideo", code: 1, userInfo: [
+                        NSLocalizedDescriptionKey: "append failed in run \(run): \(writer.error?.localizedDescription ?? "no copy")"])
+                }
+            }
+        }
+        input.markAsFinished()
+        // No endSession, like the remux: it would stretch the last frame.
+        await writer.finishWriting()
+        if writer.status != .completed {
+            throw NSError(domain: "repeatVideo", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "finish failed: \(writer.error?.localizedDescription ?? "?")"])
+        }
     }
 
     private static func finish() -> Int32 {

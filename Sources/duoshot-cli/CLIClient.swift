@@ -131,17 +131,12 @@ package enum CLIClient {
             request.rect = parsed
         }
 
-        switch exchange(request, waiting: seconds + 60) {
+        let url = URL(fileURLWithPath: out).standardizedFileURL
+        switch exchangeToFile(request, waiting: seconds + 60, file: url) {
         case .failure(let code): return code
-        case .success(let (reply, movie)):
-            guard var recording = reply.recording, let movie else {
+        case .success(let (reply, _)):
+            guard var recording = reply.recording else {
                 return fail("DuoShot sent no movie", CLIExit.captureFailed)
-            }
-            let url = URL(fileURLWithPath: out).standardizedFileURL
-            do {
-                try movie.write(to: url, options: .atomic)
-            } catch {
-                return fail("cannot write \(url.path): \(error.localizedDescription)", CLIExit.captureFailed)
             }
             recording.path = url.path
             printJSON(recording)
@@ -314,6 +309,69 @@ package enum CLIClient {
             return .failure(fail("the image was cut short", CLIExit.captureFailed))
         }
         return .success((reply, payload))
+    }
+
+    /// Like `exchange`, for a reply that carries a movie: the bytes go straight
+    /// to a hidden file beside `file` and are moved into place once complete,
+    /// never held whole in memory.
+    private static func exchangeToFile(_ request: CLIRequest, waiting: Double, file: URL) -> Exchange {
+        let fd: Int32
+        switch CLIWire.connect(to: socketPath) {
+        case .success(let connected): fd = connected
+        case .failure(let error): return .failure(unreachable(error.code))
+        }
+        defer { close(fd) }
+        CLIWire.setTimeout(fd, seconds: 30)
+        guard var line = try? CLIWire.encoder.encode(request) else {
+            return .failure(fail("cannot encode the request", CLIExit.usage))
+        }
+        line.append(0x0A)
+        guard CLIWire.writeAll(fd, line), let header = CLIWire.readLine(fd, limit: 1 << 20, within: waiting),
+              let reply = try? JSONDecoder().decode(CLIReply.self, from: header)
+        else { return .failure(fail("DuoShot did not answer", CLIExit.unreachable)) }
+        guard reply.ok else {
+            return .failure(fail(reply.error ?? "DuoShot refused the request",
+                                 reply.exitCode ?? CLIExit.captureFailed))
+        }
+        guard let count = reply.bytes, count > 0 else {
+            return .failure(fail("DuoShot sent no movie", CLIExit.captureFailed))
+        }
+        guard count <= CLIWire.maximumMoviePayload else {
+            return .failure(fail("reply claims \(count) bytes, more than any recording; refused",
+                                 CLIExit.captureFailed))
+        }
+        let partial = file.deletingLastPathComponent()
+            .appendingPathComponent(".duoshot-partial-\(UUID().uuidString.prefix(8))")
+        guard FileManager.default.createFile(atPath: partial.path, contents: nil),
+              let handle = try? FileHandle(forWritingTo: partial)
+        else { return .failure(fail("cannot write beside \(file.path)", CLIExit.captureFailed)) }
+        var received = 0
+        var buffer = [UInt8](repeating: 0, count: 1 << 20)
+        while received < count {
+            let n = buffer.withUnsafeMutableBytes {
+                Darwin.read(fd, $0.baseAddress, min($0.count, count - received))
+            }
+            if n < 0, errno == EINTR { continue }
+            guard n > 0 else { break }
+            handle.write(Data(buffer[0..<n]))
+            received += n
+        }
+        try? handle.close()
+        guard received == count else {
+            try? FileManager.default.removeItem(at: partial)
+            return .failure(fail("the movie was cut short (\(received) of \(count) bytes)", CLIExit.captureFailed))
+        }
+        do {
+            if FileManager.default.fileExists(atPath: file.path) {
+                _ = try FileManager.default.replaceItemAt(file, withItemAt: partial)
+            } else {
+                try FileManager.default.moveItem(at: partial, to: file)
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: partial)
+            return .failure(fail("cannot write \(file.path): \(error.localizedDescription)", CLIExit.captureFailed))
+        }
+        return .success((reply, nil))
     }
 
     /// Not reachable. Which of three things is true decides what to do about
