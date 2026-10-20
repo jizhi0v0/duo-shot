@@ -276,6 +276,15 @@ it as a timed metadata track in the movie (`ClickTimeline`,
   one it read; quitting cancels it (measured: 3 ms to unwind, 1 s into a 3 GB
   copy) and the take keeps no timeline. Copies an interrupted job leaves are
   hidden, so the launch sweeps them.
+- **The copy is made in staging, never beside the take.** A hidden file in an
+  iCloud Drive save folder was measured uploading within ten seconds while it
+  was still being written — every take went up twice — while `replaceItemAt`
+  from staging into that folder kept the item's identity and uploaded once.
+  On another volume than staging, or with less free than the take's size plus
+  10 GiB (room for the next take, which can record meanwhile), the take keeps
+  no timeline. Jobs run one at a time. Trim and delete stop the job on their
+  file and wait for it: `replaceItemAt` with the original gone just moves the
+  copy into place, which would bring a deleted take back or undo a trim.
 - **Only what the picture shows.** Clicks outside the recorded area (outside
   the window, for `--isolated`) are not stored, and a take that hides the
   pointer gets no timeline.
