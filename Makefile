@@ -13,6 +13,12 @@ SIGN_ID   ?= Developer ID Application: BO LI ($(TEAM_ID))
 CONFIG    ?= release
 MACOS_MIN ?= 26.0
 NOTARY_PROFILE ?= DuoShot
+# The --selftest-* entry points. On for every target except `dist`, which sets
+# it to 0: a shipped binary must not have them -- see main.swift. SwiftPM keys
+# its build on the flags, so flipping this rebuilds rather than reusing a
+# product compiled the other way.
+SELFTEST  ?= 1
+SWIFT_FLAGS = $(if $(filter 1,$(SELFTEST)),-Xswiftc -DDUOSHOT_SELFTEST)
 
 APP       := build/$(APP_NAME).app
 CONTENTS  := $(APP)/Contents
@@ -38,7 +44,7 @@ X86_64_SCRATCH := .build/universal-x86_64
 # anywhere in it fails the sign with "AMFIUnserializeXML: syntax error".
 ENTITLEMENTS := Resources/DuoShot.entitlements
 
-.PHONY: all build universal bundle sign dr-check verify run launch logs selftest mic-check install dist clean help
+.PHONY: all build universal bundle sign dr-check verify run launch logs selftest mic-check install dist-app dist clean help
 
 all: verify
 
@@ -53,13 +59,14 @@ help:
 	@echo "make selftest  - headless capture checks"
 	@echo "make logs      - stream os_log for $(BUNDLE_ID)"
 	@echo "make install   - copy to /Applications, restarting a running instance"
+	@echo "make dist-app  - the release build dist ships, without notarizing"
 	@echo "make dist      - sign, notarize, staple, validate and zip"
 	@echo "make check-26  - compile against an older macOS SDK on $(CHECK_HOST)"
 	@echo "make share-check - typecheck + test the share Worker (needs node)"
 	@echo "make share-selftest - run the app's share pipeline against a local wrangler dev"
 
 build:
-	swift build -c $(CONFIG)
+	swift build -c $(CONFIG) $(SWIFT_FLAGS)
 
 # SwiftPM builds one target triple at a time. A released app has to carry both
 # slices while macOS 26 still runs on Intel Macs, so build into isolated scratch
@@ -68,11 +75,11 @@ universal:
 	@set -eu; \
 	ARM_TRIPLE="arm64-apple-macosx$(MACOS_MIN)"; \
 	INTEL_TRIPLE="x86_64-apple-macosx$(MACOS_MIN)"; \
-	swift build -c $(CONFIG) --triple "$$ARM_TRIPLE" --scratch-path "$(ARM64_SCRATCH)"; \
-	swift build -c $(CONFIG) --triple "$$INTEL_TRIPLE" --scratch-path "$(X86_64_SCRATCH)"; \
-	ARM_BIN="$$(swift build -c $(CONFIG) --triple "$$ARM_TRIPLE" \
+	swift build -c $(CONFIG) $(SWIFT_FLAGS) --triple "$$ARM_TRIPLE" --scratch-path "$(ARM64_SCRATCH)"; \
+	swift build -c $(CONFIG) $(SWIFT_FLAGS) --triple "$$INTEL_TRIPLE" --scratch-path "$(X86_64_SCRATCH)"; \
+	ARM_BIN="$$(swift build -c $(CONFIG) $(SWIFT_FLAGS) --triple "$$ARM_TRIPLE" \
 		--scratch-path "$(ARM64_SCRATCH)" --show-bin-path)/$(APP_NAME)"; \
-	INTEL_BIN="$$(swift build -c $(CONFIG) --triple "$$INTEL_TRIPLE" \
+	INTEL_BIN="$$(swift build -c $(CONFIG) $(SWIFT_FLAGS) --triple "$$INTEL_TRIPLE" \
 		--scratch-path "$(X86_64_SCRATCH)" --show-bin-path)/$(APP_NAME)"; \
 	test -x "$$ARM_BIN"; test -x "$$INTEL_BIN"; \
 	mkdir -p "$$(dirname "$(UNIVERSAL_EXEC)")"; \
@@ -91,7 +98,7 @@ universal:
 # costs a second full compile and `make verify` is the innermost loop in this
 # project. It runs dozens of times a day and not one of those runs is a release.
 BUNDLE_DEPS ?= build
-BUNDLE_EXEC ?= $$(swift build -c $(CONFIG) --show-bin-path)/$(APP_NAME)
+BUNDLE_EXEC ?= $$(swift build -c $(CONFIG) $(SWIFT_FLAGS) --show-bin-path)/$(APP_NAME)
 
 bundle: $(BUNDLE_DEPS)
 	@set -eu; \
@@ -448,7 +455,7 @@ share-selftest: build
 	trap 'pkill -f "wrangler dev" 2>/dev/null || true' EXIT; \
 	curl -s --retry-connrefused --retry 40 --retry-delay 1 -o /dev/null http://127.0.0.1:8787/ || \
 		{ echo "wrangler dev did not come up:"; tail -20 /tmp/duoshot-wrangler-dev.log; exit 1; }; \
-	"$$(swift build -c $(CONFIG) --show-bin-path)/$(APP_NAME)" \
+	"$$(swift build -c $(CONFIG) $(SWIFT_FLAGS) --show-bin-path)/$(APP_NAME)" \
 		--selftest-share --endpoint http://127.0.0.1:8787 --token local-dev-token
 
 logs:
@@ -478,8 +485,12 @@ install: verify
 # One-time setup on a release machine:
 #   xcrun notarytool store-credentials DuoShot
 # Override the profile name with `make dist NOTARY_PROFILE=...`.
-dist:
-	@$(MAKE) verify BUNDLE_DEPS=universal BUNDLE_EXEC='$(UNIVERSAL_EXEC)'
+#
+# `dist-app` is everything up to the submission: the release binary, signed the
+# way it ships. It exists so that binary can be inspected and tried without
+# sending anything to Apple.
+dist-app:
+	@$(MAKE) verify BUNDLE_DEPS=universal BUNDLE_EXEC='$(UNIVERSAL_EXEC)' SELFTEST=0
 	@codesign --force \
 		--sign "$(SIGN_ID)" \
 		--identifier $(BUNDLE_ID) \
@@ -488,6 +499,8 @@ dist:
 		--timestamp \
 		"$(APP)"
 	@$(MAKE) dr-check
+
+dist: dist-app
 	@mkdir -p dist
 	@rm -f "dist/$(APP_NAME)-submit.zip" "dist/$(APP_NAME).zip"
 	@ditto -c -k --keepParent "$(APP)" "dist/$(APP_NAME)-submit.zip"

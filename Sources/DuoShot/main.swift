@@ -11,6 +11,14 @@ let arguments = Array(CommandLine.arguments.dropFirst())
 let application = NSApplication.shared
 application.setActivationPolicy(.accessory)
 
+// The self-tests are compiled in only when the Makefile passes
+// -DDUOSHOT_SELFTEST, which every target does except `dist`. They are an entry
+// point into this process's Screen Recording grant: launched through
+// LaunchServices, DuoShot is its own responsible process, so any app that can
+// say `open -n -b <id> --args --selftest-capture <path>` would get the whole
+// screen written wherever it liked without holding the grant itself. A release
+// build has no dispatch at all -- a `--selftest-*` argument launches the app.
+#if DUOSHOT_SELFTEST
 /// Runs a self-test once AppKit is up, then exits with its status.
 final class SelfTestRunner: NSObject, NSApplicationDelegate {
     private let mode: SelfTest.Mode
@@ -23,9 +31,11 @@ final class SelfTestRunner: NSObject, NSApplicationDelegate {
         Task { exit(await SelfTest.run(self.mode)) }
     }
 }
+#endif
 
 let delegate: any NSApplicationDelegate
 
+#if DUOSHOT_SELFTEST
 if let mode = SelfTest.Mode(arguments: arguments) {
     delegate = SelfTestRunner(mode: mode)
 } else if arguments.contains(where: { $0.hasPrefix("--selftest") }) {
@@ -74,6 +84,9 @@ if let mode = SelfTest.Mode(arguments: arguments) {
 } else {
     delegate = AppDelegate()
 }
+#else
+delegate = AppDelegate()
+#endif
 
 application.delegate = delegate
 application.run()
