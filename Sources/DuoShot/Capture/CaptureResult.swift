@@ -17,6 +17,11 @@ nonisolated struct CaptureResult: @unchecked Sendable, Identifiable {
     let sourceDisplayID: CGDirectDisplayID
     let sourceDescription: String
     let capturedAt: Date
+    /// Where on the desktop the picture came from, CG global points, when the
+    /// engine knows it exactly: a window capture with no padding. Nil otherwise.
+    /// Only the command line reads it (`CLIServer`), to report what the file
+    /// covers rather than what was asked for.
+    var coversInCGGlobal: CGRect? = nil
 
     var pixelSize: CGSize {
         CGSize(width: image.width, height: image.height)

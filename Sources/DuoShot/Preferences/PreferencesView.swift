@@ -15,6 +15,34 @@ import UniformTypeIdentifiers
 
 // MARK: - General
 
+/// "Allow command-line capture". Session-only: it is off at every launch and
+/// is not a preference at all — see `CommandLineAccess` for why. The switch
+/// shows whether the server is *listening*, not what was last asked for, so a
+/// socket held by another DuoShot reads as off, with the reason under it.
+struct CommandLineSection: View {
+    let access: CommandLineAccess
+
+    var body: some View {
+        Section {
+            Toggle("Allow command-line capture", isOn: Binding(
+                get: { access.isListening },
+                set: { access.request($0) }))
+                .accessibilityLabel(Text("Allow command-line capture"))
+        } footer: {
+            VStack(alignment: .leading, spacing: 4) {
+                if let problem = access.problem {
+                    Text("Not listening: \(problem).")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+                Text("While on, any program run by this user can capture the screen through DuoShot (the duoshot command-line tool), without a Screen Recording permission of its own. Off again at every launch.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
 /// The app itself: how it shows up, and the one piece of capture feedback that
 /// belongs to the app rather than to the image.
 struct GeneralSettingsView: View {
@@ -62,6 +90,8 @@ struct GeneralSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            CommandLineSection(access: CommandLineAccess.shared)
         }
         .formStyle(.grouped)
         // Approving a login item — or switching it back off — happens in System

@@ -20,8 +20,22 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// Why the last thing that had nowhere else to report itself failed — a file
     /// dropped on the item, or a capture — until it is dismissed or superseded.
     private var notice: String?
+    /// Whether the user wants the icon ("Show menu bar icon"). The item is up
+    /// when this is on *or* the command line is listening — see `updatePresence`.
+    private var userShowsIcon = true
+    /// The command line's state, once `follow(_:)` has been called.
+    private weak var commandLine: CommandLineAccess?
 
     var onOpenSettings: () -> Void = {}
+
+    /// For the self-test: the menu reads `ShareSettings`, whose Keychain read
+    /// can block headless on a prompt nobody answers (CLAUDE.md), so a test
+    /// that only asserts on the button turns the menu off.
+    static var buildsMenu = true
+    /// For the self-test: stands in for `recorder.isRecording`, so the clock
+    /// branch can be drawn without starting a take.
+    var recordingOverrideForTest: Bool?
+    private var isRecording: Bool { recordingOverrideForTest ?? recorder.isRecording }
 
     init(
         coordinator: CaptureCoordinator, recorder: RecordingCoordinator,
@@ -52,6 +66,38 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     func remove() {
         if let statusItem { NSStatusBar.system.removeStatusItem(statusItem) }
         statusItem = nil
+    }
+
+    /// "Show menu bar icon". Hiding it does not hide the item while the command
+    /// line is listening: the mark is the only thing on screen that says any
+    /// program of this user's can capture through DuoShot.
+    func setUserShowsIcon(_ shows: Bool) {
+        userShowsIcon = shows
+        updatePresence()
+    }
+
+    /// Shows the command line's state in the menu bar, now and on every change.
+    func follow(_ access: CommandLineAccess) {
+        commandLine = access
+        access.onListeningChanged = { [weak self] in self?.updatePresence() }
+        updatePresence()
+    }
+
+    private var isCommandLineListening: Bool { commandLine?.isListening ?? false }
+
+    private func updatePresence() {
+        if userShowsIcon || isCommandLineListening {
+            install()
+            refreshRecordingState()
+        } else {
+            remove()
+        }
+    }
+
+    /// The button's title with the command line's mark after it, in every
+    /// state — the clock and the failure triangle included.
+    private func setTitle(_ base: String) {
+        statusItem?.button?.title = base + (isCommandLineListening ? " CLI" : "")
     }
 
     /// Hides the menu bar item from ScreenCaptureKit, for the length of a
@@ -164,7 +210,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         recordingTicker = nil
         guard let button = statusItem?.button else { return }
 
-        if recorder.isRecording {
+        if isRecording {
             button.image = NSImage(
                 systemSymbolName: "stop.circle.fill", accessibilityDescription: "Stop recording")
             button.image?.isTemplate = true
@@ -185,19 +231,23 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 systemSymbolName: "exclamationmark.triangle.fill",
                 accessibilityDescription: "A capture failed")
             button.image?.isTemplate = true
-            button.title = ""
+            setTitle("")
         } else {
             button.image = NSImage(
                 systemSymbolName: "camera.viewfinder", accessibilityDescription: "DuoShot")
             button.image?.isTemplate = true
-            button.title = ""
+            // Said where it can be seen: while this is up, any program of this
+            // user's can capture the screen through DuoShot.
+            setTitle("")
+            button.toolTip = isCommandLineListening
+                ? "DuoShot: command-line capture is on" : nil
         }
         statusItem?.menu = buildMenu()
     }
 
     private func updateRecordingTitle() {
         let total = Int(recorder.elapsed)
-        statusItem?.button?.title = String(format: " %d:%02d", total / 60, total % 60)
+        setTitle(String(format: " %d:%02d", total / 60, total % 60))
     }
 
     // MARK: - Menu
@@ -308,6 +358,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func buildMenu() -> NSMenu {
         let menu = NSMenu()
+        guard Self.buildsMenu else { return menu }
         menu.delegate = self
 
         // Above everything, including during a take: a drop that failed is the

@@ -12,6 +12,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// one-selection-at-a-time reason as the recorder.
     private lazy var scroller = ScrollCaptureCoordinator(
         engine: coordinator.engine, overlay: coordinator.overlay)
+    /// The command line's server. Listens only while the user allows it.
+    ///
+    /// Its own engine, not `coordinator.engine`: a CLI request refreshes the
+    /// engine's shareable content, and doing that to the shared one replaced
+    /// the window list and Dock shape an interactive capture with its overlay
+    /// up was relying on. Two engines share nothing — no cache to disturb, no
+    /// lock to wait on — and a CLI request needs none of the interactive
+    /// engine's state (pre-captures, the freeze photograph).
+    private lazy var commandLine = CLIServer(engine: CaptureEngine())
     private lazy var statusItem = StatusItemController(
         coordinator: coordinator, recorder: recorder, scroller: scroller)
     private var isReauthorising = false
@@ -30,8 +39,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         wireSettings()
 
         previews.timeout = .seconds(Preferences.shared.previewTimeout)
-        if Preferences.shared.showsMenuBarIcon { statusItem.install() }
+        statusItem.setUserShowsIcon(Preferences.shared.showsMenuBarIcon)
         registerHotkeys()
+        commandLine.follow(CommandLineAccess.shared)
+        statusItem.follow(CommandLineAccess.shared)
 
         Task { await self.ensureScreenCaptureAccess() }
     }
@@ -206,12 +217,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         Preferences.shared.onMenuBarIconChanged = { [weak self] in
-            guard let self else { return }
-            if Preferences.shared.showsMenuBarIcon {
-                self.statusItem.install()
-            } else {
-                self.statusItem.remove()
-            }
+            self?.statusItem.setUserShowsIcon(Preferences.shared.showsMenuBarIcon)
         }
     }
 

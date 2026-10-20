@@ -33,6 +33,13 @@
 	<false/>
 	<key>NSSupportsSuddenTermination</key>
 	<false/>
+	<!--
+	  This build can serve the command line (the `duoshot` tool). The tool
+	  reads it out of the running app's bundle to tell "turned off" from "too
+	  old to have it".
+	-->
+	<key>DuoShotCommandLineProtocol</key>
+	<integer>1</integer>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 Bo Li. MIT License.</string>
 	<!--

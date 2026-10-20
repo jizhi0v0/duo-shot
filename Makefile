@@ -155,8 +155,31 @@ dr-check:
 		exit 1; \
 	fi
 
-verify: sign dr-check
+verify: sign dr-check client
 	@otool -l "$(EXEC)" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print "  minos " $$2; exit}'
+
+# --- the command line's client ---------------------------------------------
+# `duoshot`, a standalone tool signed with its own identifier, kept OUT of the
+# bundle on purpose: TCC judged a helper inside Contents/ as the enclosing app
+# for folder access (tccd AUTHREQ_SUBJECT subject=$(BUNDLE_ID) for a binary
+# signed $(BUNDLE_ID).cli), so an agent running it would have read files with
+# DuoShot's grants. It is not part of the app's Designated Requirement.
+# `make install` puts it in ~/.local/bin; the self-test finds it next to the
+# bundle. Native slice only; `dist` does not ship it.
+CLIENT     := build/duoshot
+CLIENT_ID  := $(BUNDLE_ID).cli
+CLIENT_BIN ?= $$(swift build -c $(CONFIG) --show-bin-path)/duoshot-cli
+
+.PHONY: client
+client: build
+	@set -eu; \
+	BIN="$(CLIENT_BIN)"; \
+	test -x "$$BIN" || { echo "missing product: $$BIN"; exit 1; }; \
+	cp "$$BIN" "$(CLIENT)"; \
+	codesign --force --sign "$(SIGN_ID)" --identifier $(CLIENT_ID) \
+		--options runtime --timestamp=none "$(CLIENT)"; \
+	codesign --verify --strict "$(CLIENT)"; \
+	echo "signed $(CLIENT) as $(CLIENT_ID)"
 
 # --- running -----------------------------------------------------------------
 # Run the INNER binary for the dev loop: stdout/stderr stay attached, so crashes
@@ -302,11 +325,15 @@ test-mini: verify
 		./ "$(CHECK_HOST):$(CHECK_DIR)/"
 	@rm -f build/DuoShot.zip
 	@ditto -c -k --keepParent "$(APP)" build/DuoShot.zip
+	@# Not "duoshot.zip": on a case-insensitive volume that IS DuoShot.zip.
+	@rm -f build/duoshot-cli.zip
+	@ditto -c -k "$(CLIENT)" build/duoshot-cli.zip
 	@ssh -o BatchMode=yes "$(CHECK_HOST)" 'mkdir -p $(CHECK_DIR)/build'
-	@scp -q build/DuoShot.zip "$(CHECK_HOST):$(CHECK_DIR)/build/"
+	@scp -q build/DuoShot.zip build/duoshot-cli.zip "$(CHECK_HOST):$(CHECK_DIR)/build/"
 	@ssh -o BatchMode=yes "$(CHECK_HOST)" \
-		'cd $(CHECK_DIR)/build && rm -rf DuoShot.app && ditto -x -k DuoShot.zip . \
-		 && codesign --verify --strict DuoShot.app'
+		'cd $(CHECK_DIR)/build && rm -rf DuoShot.app duoshot && ditto -x -k DuoShot.zip . \
+		 && ditto -x -k duoshot-cli.zip . \
+		 && codesign --verify --strict DuoShot.app && codesign --verify --strict duoshot'
 	@echo "signature intact on $(CHECK_HOST); running the suite there"
 	@ssh -o BatchMode=yes "$(CHECK_HOST)" 'cd $(CHECK_DIR) && make test-only'
 
@@ -404,6 +431,7 @@ test-only:
 	run "delayed recording"      --selftest-record-delay $(TEST_OUT); \
 	run "scroll stitcher"        --selftest-scroll-stitch $(TEST_OUT); \
 	run "scroll capture flow"    --selftest-scroll-flow $(TEST_OUT); \
+	run "command line"           --selftest-cli $(TEST_OUT) -allowsCommandLineCapture YES; \
 	printf '  %-26s ' "exclusion negative control"; \
 	if "$(EXEC)" --selftest-overlay 400,300,640,400 --sharing-default --no-exclude >/dev/null 2>&1; \
 		then echo "BROKEN — the control passed, so the exclusion test cannot fail"; fail=1; \
@@ -481,6 +509,9 @@ install: verify
 	cp -R "$(APP)" /Applications/
 	@open -a "/Applications/$(APP_NAME).app"
 	@echo "installed and relaunched /Applications/$(APP_NAME).app"
+	@mkdir -p "$(HOME)/.local/bin"
+	cp "$(CLIENT)" "$(HOME)/.local/bin/duoshot"
+	@echo "installed $(HOME)/.local/bin/duoshot (not added to PATH)"
 
 # One-time setup on a release machine:
 #   xcrun notarytool store-credentials DuoShot

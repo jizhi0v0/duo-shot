@@ -301,8 +301,163 @@ final class CaptureEngine {
             scale: shot.scale,
             sourceDisplayID: displayID,
             sourceDescription: info?.displayName ?? "Window",
-            capturedAt: .now
+            capturedAt: .now,
+            coversInCGGlobal: options.windowPadding > 0 ? nil : shot.coversInCGGlobal
         )
+    }
+
+    /// A window as it looks on screen, for the command line's default `shot`.
+    struct SeenWindow {
+        let result: CaptureResult
+        /// The window, the group `captureGroup` framed with it and the
+        /// adornments drawn over it — everything in the file that is *its own*.
+        /// Any other window in front of it inside `result.coversInCGGlobal` is
+        /// in the picture too, and the caller says so.
+        let ownWindowIDs: Set<CGWindowID>
+    }
+
+    /// A window that was not the same on both sides of an as-seen capture.
+    struct ChangedDuringCapture: Error, LocalizedError {
+        let reason: String
+        var errorDescription: String? { reason }
+    }
+
+    /// For the self-test: runs between the shape and the region of an as-seen
+    /// capture, which is the window in which a closing panel goes unnoticed.
+    var betweenAsSeenCapturesForTest: (() async -> Void)?
+
+    /// The window's region of the screen, cut to the window's own alpha.
+    ///
+    /// The Dock's technique (`captureStrip` + `shaped`) applied to any window.
+    /// An isolated capture flattens a translucent surface to its base tint —
+    /// there is no backdrop left in it to sample (see "Window capture" in
+    /// CLAUDE.md: red behind a glass panel counted 0 in every isolated mode and
+    /// 432906 as a region). So the isolated capture supplies only the *shape*
+    /// and the rect — group framing, trim and adornments exactly as the
+    /// ordinary path frames them — and the pixels come from the same rect taken
+    /// off the display, kept where that shape has alpha.
+    ///
+    /// The two captures are taken one after the other, not at one instant, and
+    /// a panel that closes between them leaves a shape with nothing of the
+    /// panel's under it: measured in acceptance, closing one 110–130 ms after
+    /// the request returned success, alpha 1, and a picture of what was behind
+    /// it cut to the panel's outline, 6 times in 14. So after the region the
+    /// window is checked again — on screen, where it was, opaque — and its
+    /// shape retaken and compared. Anything different throws
+    /// `ChangedDuringCapture`, which is worth retrying; a wrong picture is not.
+    func captureAsSeen(_ windowID: CGWindowID, options: CaptureOptions) async throws -> SeenWindow {
+        guard let window = content.scWindow(for: windowID) else {
+            throw CaptureError.windowNotFound(windowID)
+        }
+        let info = content.windows.first { $0.id == windowID }
+        // The Dock is already captured this way, from its own pixels.
+        if info?.visibleFrame != nil {
+            let result = try await capture(.window(windowID), options: options)
+            return SeenWindow(result: result, ownWindowIDs: [windowID])
+        }
+        let displayID = ScreenIndex
+            .screen(containingAppKitGlobal: DisplayGeometry.flipped(window.frame).origin)
+            .flatMap(ScreenIndex.displayID(of:))
+            ?? CGMainDisplayID()
+
+        guard let before = WindowZOrder.entries()[windowID]?.bounds else {
+            throw ChangedDuringCapture(reason: "window \(windowID) is no longer on screen")
+        }
+        let base = try await captureIsolated(window, options: options)
+        var shape = await withAdornments(base, of: windowID, options: options, recovery: nil)
+        var own = shape.groupedWindowIDs.union([windowID])
+        let live = WindowZOrder.sortedFrontToBack(content.windows)
+        if let picked = live.first(where: { $0.id == windowID }) {
+            own.formUnion(Self.adornments(
+                of: picked, in: live,
+                excluding: options.excludedWindowIDs.union(shape.groupedWindowIDs)).map(\.id))
+        }
+
+        await betweenAsSeenCapturesForTest?()
+        let region = try await captureRegion(
+            shape.coversInCGGlobal, on: displayID, options: options)
+        try await confirmUnchanged(windowID, window: window, bounds: before, shape: base, options: options)
+        guard let cut = await WindowComposite.masking(region.image, to: shape.image) else {
+            throw CaptureError.noImageProduced
+        }
+        Log.capture.notice("""
+            window \(windowID, privacy: .public) captured as seen: \
+            \(cut.width, privacy: .public)x\(cut.height, privacy: .public) px of the display, \
+            cut to its own outline
+            """)
+        return SeenWindow(
+            result: CaptureResult(
+                image: cut,
+                pointSize: shape.coversInCGGlobal.size,
+                scale: region.scale,
+                sourceDisplayID: displayID,
+                sourceDescription: info?.displayName ?? "Window",
+                capturedAt: .now,
+                coversInCGGlobal: shape.coversInCGGlobal),
+            ownWindowIDs: own)
+    }
+
+    /// The second half of `captureAsSeen`'s guard: the window as it is now
+    /// against the window the shape was taken from.
+    private func confirmUnchanged(
+        _ windowID: CGWindowID, window: SCWindow, bounds: CGRect, shape: WindowShot,
+        options: CaptureOptions
+    ) async throws {
+        guard let now = WindowZOrder.entries()[windowID], let where_ = now.bounds else {
+            throw ChangedDuringCapture(reason: "window \(windowID) closed while it was being captured")
+        }
+        guard now.alpha >= 0.99 else {
+            throw ChangedDuringCapture(reason: String(
+                format: "window %u started fading while it was being captured (alpha=%.3f)",
+                windowID, now.alpha))
+        }
+        guard where_ == bounds else {
+            throw ChangedDuringCapture(reason: "window \(windowID) moved or resized while it was being captured")
+        }
+        let again = try? await captureIsolated(window, options: options)
+        guard let again, !PixelCompare.isBlank(again.image),
+              again.coversInCGGlobal == shape.coversInCGGlobal
+        else {
+            throw ChangedDuringCapture(reason: "window \(windowID) changed shape while it was being captured")
+        }
+    }
+
+    /// Whether a window paints anything inside a rect (CG global points), from
+    /// its own pixels captured alone. Nil when it could not be captured.
+    ///
+    /// Every pixel of the overlap, not a thumbnail: an occluder can be a few
+    /// points of a much larger window, and a downscale averages it away.
+    func draws(_ windowID: CGWindowID, within rectInCGGlobal: CGRect) async -> Bool? {
+        guard let window = content.scWindow(for: windowID) else { return nil }
+        let filter = SCContentFilter(desktopIndependentWindow: window)
+        let scale = CGFloat(filter.pointPixelScale)
+        guard let image = try? await SCKBridge.captureScreenshot(
+                  filter: filter,
+                  configuration: configuration(for: filter.contentRect, scale: scale, options: .default)
+              ).image
+        else { return nil }
+        let frame = window.frame
+        let pixels = CGRect(
+            x: (rectInCGGlobal.minX - frame.minX) * scale,
+            y: (rectInCGGlobal.minY - frame.minY) * scale,
+            width: rectInCGGlobal.width * scale, height: rectInCGGlobal.height * scale
+        ).integral.intersection(CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        guard !pixels.isNull, !pixels.isEmpty, let crop = image.cropping(to: pixels) else {
+            return false
+        }
+        let width = crop.width, height = crop.height
+        var bytes = [UInt8](repeating: 0, count: width * height * 4)
+        let drawn = bytes.withUnsafeMutableBytes { raw -> Bool in
+            guard let context = CGContext(
+                data: raw.baseAddress, width: width, height: height, bitsPerComponent: 8,
+                bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            else { return false }
+            context.draw(crop, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard drawn else { return nil }
+        return stride(from: 3, to: bytes.count, by: 4).contains { bytes[$0] > 8 }
     }
 
     /// A window capture, plus where on the desktop its pixels came from.

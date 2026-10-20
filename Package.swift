@@ -14,10 +14,37 @@ let package = Package(
         // One ObjC file, existing only because Swift cannot @catch. Compiled into
         // the same binary, so it adds no nested code for `make sign` to handle.
         .target(name: "ObjCException", path: "Sources/ObjCException"),
+        // The command line's wire format: what the app (the server) and the
+        // `duoshot` tool (the client) both have to agree on, and nothing more —
+        // the client's code is not linked into the app. No default isolation.
+        .target(
+            name: "DuoShotCLIWire",
+            path: "Sources/DuoShotCLIWire",
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+                .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
+            ]
+        ),
+        // The client, `duoshot`. A standalone tool, signed with its own
+        // identifier and kept *outside* DuoShot.app (Makefile: build/duoshot,
+        // ~/.local/bin/duoshot) — see Sources/DuoShotCLIWire/CLIWire.swift for
+        // why. Not named "duoshot" here: SwiftPM puts every product in one
+        // directory, and on a case-insensitive volume that is the same file as
+        // "DuoShot".
+        .executableTarget(
+            name: "duoshot-cli",
+            dependencies: ["DuoShotCLIWire"],
+            path: "Sources/duoshot-cli",
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+                .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
+            ]
+        ),
         .executableTarget(
             name: "DuoShot",
             dependencies: [
                 "ObjCException",
+                "DuoShotCLIWire",
                 .product(name: "Linkdrop", package: "Linkdrop"),
             ],
             path: "Sources/DuoShot",

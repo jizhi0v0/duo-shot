@@ -8,6 +8,18 @@ import AppKit
 // not for anything that puts a panel on screen.
 
 let arguments = Array(CommandLine.arguments.dropFirst())
+// The command line's client is not in this binary, nor in this bundle: it is
+// the standalone `duoshot` tool (build/duoshot, ~/.local/bin/duoshot after
+// `make install`), whose code is not linked in here. Anything run through this
+// binary — or through any binary inside DuoShot.app — would read files with
+// DuoShot's privacy grants. See `CLIWire`.
+if arguments.first == "cli" {
+    FileHandle.standardError.write(Data("""
+        The command line is the standalone `duoshot` tool, not this binary.
+
+        """.utf8))
+    exit(2)
+}
 let application = NSApplication.shared
 application.setActivationPolicy(.accessory)
 
@@ -76,6 +88,7 @@ if let mode = SelfTest.Mode(arguments: arguments) {
                            [--file <f>] [--big <MB>]
           --selftest-share-compat <recording.mp4>
           --selftest-share-flow          (uploads to your real bucket, then deletes)
+          --selftest-cli <dir>
 
         Rects are in AppKit global points (origin bottom-left of the main screen).
 
