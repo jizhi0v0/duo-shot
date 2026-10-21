@@ -59,12 +59,25 @@ nonisolated enum VideoTrim {
     /// different colour pipeline than the one `RecordingEngine` was careful to
     /// choose. Not in v1.
     ///
-    /// Written to a sibling and swapped with `replaceItemAt` rather than
+    /// Written to a separate file and swapped with `replaceItemAt` rather than
     /// exported over the original: the export reads the file it is replacing, so
     /// writing in place would be reading a file that is being truncated, and a
     /// crash halfway through would leave neither take.
+    ///
+    /// **That file is written in `workDirectory` (staging), never beside the
+    /// take**, for the reason `ClickTimelineEmbedder` gives. Measured on an
+    /// iCloud Drive folder: a hidden `.duoshot-trim-*` file beside the take was
+    /// marked uploading 0.4 s after it was created, while it was still growing,
+    /// and one kept there for 150 s finished uploading in full. Written in an
+    /// unsynced directory on the same volume, it was never an iCloud item, and
+    /// `replaceItemAt` kept the take's document ID, made no conflict copy, and
+    /// the take uploaded once. `replaceItemAt` needs the two on one volume, so
+    /// a take on another volume than staging is trimmed beside itself, as it
+    /// always was.
     @concurrent
-    static func apply(range: CMTimeRange, toFileAt url: URL) async throws -> Outcome {
+    static func apply(
+        range: CMTimeRange, toFileAt url: URL, workDirectory: URL
+    ) async throws -> Outcome {
         // A click timeline swapped in after this reads the file would undo the
         // trim (`ClickTimelineJobs`).
         await ClickTimelineJobs.stop(url)
@@ -81,10 +94,11 @@ nonisolated enum VideoTrim {
         // honoured is not assumed — see below.
         session.shouldOptimizeForNetworkUse = true
 
+        let work = scratchDirectory(for: url, preferring: workDirectory)
         let isQuickTime = url.pathExtension.lowercased() == "mov"
-        var written = try await export(session, beside: url, as: isQuickTime ? .mov : .mp4)
+        var written = try await export(session, for: url, in: work, as: isQuickTime ? .mov : .mp4)
         do {
-            written = await makeFastStart(written, beside: url)
+            written = await makeFastStart(written, for: url, in: work)
             let after = try? await AVURLAsset(url: written).load(.duration)
             try replace(url, with: written)
             return Outcome(
@@ -97,9 +111,9 @@ nonisolated enum VideoTrim {
     }
 
     private static func export(
-        _ session: AVAssetExportSession, beside url: URL, as type: AVFileType
+        _ session: AVAssetExportSession, for url: URL, in directory: URL, as type: AVFileType
     ) async throws -> URL {
-        let destination = sibling(of: url)
+        let destination = temporary(for: url, in: directory)
         do {
             try await session.export(to: destination, as: type)
             return destination
@@ -122,15 +136,15 @@ nonisolated enum VideoTrim {
     /// Returns the original on any failure, exactly as `makeFastStartCopy`'s
     /// callers do: a trimmed recording that starts a beat slowly beats an
     /// untrimmed one.
-    private static func makeFastStart(_ written: URL, beside url: URL) async -> URL {
+    private static func makeFastStart(_ written: URL, for url: URL, in directory: URL) async -> URL {
         guard MP4Layout.isFastStart(written) == false,
               let remuxed = await MP4Layout.makeFastStartCopy(of: written)
         else { return written }
 
         // `makeFastStartCopy` writes into the system temporary directory, which
         // is not necessarily the volume staging lives on, and `replaceItemAt`
-        // wants a sibling of what it is replacing.
-        let destination = sibling(of: url)
+        // wants its replacement on the volume of what it is replacing.
+        let destination = temporary(for: url, in: directory)
         guard (try? FileManager.default.moveItem(at: remuxed, to: destination)) != nil else {
             try? FileManager.default.removeItem(at: remuxed)
             return written
@@ -147,11 +161,22 @@ nonisolated enum VideoTrim {
         }
     }
 
-    /// A dot-prefixed name in the same directory: invisible in Finder, on the
-    /// same volume as the file it will replace, and unique so two trims of two
+    /// `workDirectory` when it is on the take's volume, which `replaceItemAt`
+    /// needs; otherwise the take's own directory.
+    private static func scratchDirectory(for url: URL, preferring workDirectory: URL) -> URL {
+        let folder = url.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: workDirectory, withIntermediateDirectories: true)
+        var take = stat(), work = stat()
+        guard stat(folder.path, &take) == 0, stat(workDirectory.path, &work) == 0,
+              take.st_dev == work.st_dev
+        else { return folder }
+        return workDirectory
+    }
+
+    /// A dot-prefixed name: invisible in Finder, and unique so two trims of two
     /// recordings cannot collide.
-    private static func sibling(of url: URL) -> URL {
-        url.deletingLastPathComponent()
+    private static func temporary(for url: URL, in directory: URL) -> URL {
+        directory
             .appendingPathComponent(".duoshot-trim-\(UUID().uuidString.prefix(8))")
             .appendingPathExtension(url.pathExtension.isEmpty ? "mp4" : url.pathExtension)
     }

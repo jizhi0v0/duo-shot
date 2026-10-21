@@ -274,7 +274,8 @@ final class VideoTrimEditor: NSView {
                 self?.bar.setBusy(false)
             }
             do {
-                let outcome = try await VideoTrim.apply(range: range, toFileAt: url)
+                let outcome = try await VideoTrim.apply(
+                    range: range, toFileAt: url, workDirectory: StagingStore.shared.directory)
                 Log.record.notice("""
                     trim: \(url.lastPathComponent, privacy: .public) \
                     \(outcome.from, format: .fixed(precision: 2))s -> \

@@ -7960,6 +7960,22 @@ enum SelfTest {
         // passes below are not the test staging something artificial — the real
         // path sets `needsLayout` and enters the busy state in that order, and
         // the window's own display cycle flushes it while the export runs.
+
+        // MARK: where the export is written
+        //
+        // Never beside the take: the save folder can be one iCloud watches, and
+        // a hidden file there was measured uploading while it was still being
+        // written (`VideoTrim.apply`). Both folders are looked at every 2 ms for
+        // as long as the export runs, and the file seen in staging is what proves
+        // that is often enough — without it, a temporary file that came and went
+        // between two looks would pass.
+        let staging = StagingStore.shared.directory
+        func names(_ folder: URL) -> Set<String> {
+            Set((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
+        }
+        let folderBefore = names(directory), stagingBefore = names(staging)
+        var strangers: Set<String> = [], inStaging: Set<String> = []
+
         editor.layoutSubtreeIfNeeded()
         let restingWidth = editor.barFrameForTest.width
         editor.trimForTest(wanted)
@@ -7970,10 +7986,18 @@ enum SelfTest {
         check("the bar widens for the progress hint", busyWidth > restingWidth + 1,
               String(format: "%.0fpt resting, %.0fpt busy", restingWidth, busyWidth))
 
-        for _ in 0..<200 where editor.isExportingForTest {
-            try await Task.sleep(for: .milliseconds(100))
+        let deadline = ContinuousClock.now + .seconds(20)
+        while editor.isExportingForTest, ContinuousClock.now < deadline {
+            strangers.formUnion(names(directory).subtracting(folderBefore))
+            inStaging.formUnion(names(staging).subtracting(stagingBefore)
+                .filter { $0.hasPrefix(".duoshot-trim-") })
+            try await Task.sleep(for: .milliseconds(2))
         }
         check("the export finished", !editor.isExportingForTest)
+        check("the export was written in staging", !inStaging.isEmpty,
+              inStaging.isEmpty ? "never seen in \(staging.path)" : inStaging.sorted().joined(separator: ", "))
+        check("and nothing ever appeared beside the take", strangers.isEmpty,
+              strangers.sorted().joined(separator: ", "))
 
         // A display cycle, which is all the window gets on screen too — and not
         // a layout the test forces: `layoutSubtreeIfNeeded` lays out only what
@@ -8010,12 +8034,13 @@ enum SelfTest {
 
         // MARK: what it left behind
 
-        // The export writes a dot-prefixed sibling and swaps it in. One left
-        // lying next to the recording is a whole second copy of a take the user
-        // asked to make shorter.
-        let strays = (try? FileManager.default.contentsOfDirectory(
-            atPath: directory.path))?.filter { $0.hasPrefix(".duoshot-trim-") } ?? []
-        check("no temporary file left beside it", strays.isEmpty, strays.joined(separator: ", "))
+        // The export writes a dot-prefixed file and swaps it in. One left lying
+        // anywhere is a whole second copy of a take the user asked to make
+        // shorter, and in staging a hidden one is never pruned.
+        let strays = names(directory).union(names(staging).subtracting(stagingBefore))
+            .filter { $0.hasPrefix(".duoshot-trim-") }
+        check("no temporary file left beside it or in staging", strays.isEmpty,
+              strays.sorted().joined(separator: ", "))
 
         // The link path re-checks this and would remux again at upload time, so
         // a trimmed file that lost its front `moov` costs the whole file's worth

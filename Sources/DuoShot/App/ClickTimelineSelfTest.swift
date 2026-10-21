@@ -180,7 +180,7 @@ enum ClickTimelineSelfTest {
         _ = try await VideoTrim.apply(
             range: CMTimeRange(start: CMTime(seconds: cut, preferredTimescale: 600),
                                end: CMTime(seconds: result.duration, preferredTimescale: 600)),
-            toFileAt: trimmed)
+            toFileAt: trimmed, workDirectory: StagingStore.shared.directory)
         let kept = try await ClickTimeline.read(from: trimmed)
         let expected = clicks.filter { $0.t >= cut }
         check(kept.count == expected.count && zip(kept, expected).allSatisfy {
@@ -460,7 +460,7 @@ enum ClickTimelineSelfTest {
         _ = try await VideoTrim.apply(
             range: CMTimeRange(start: CMTime(seconds: cut, preferredTimescale: 600),
                                end: CMTime(seconds: duration, preferredTimescale: 600)),
-            toFileAt: trimFile)
+            toFileAt: trimFile, workDirectory: StagingStore.shared.directory)
         let trimOutcome = await trimJob.value
         let trimmedLength = (try? await AVURLAsset(url: trimFile).load(.duration).seconds) ?? 0
         check(trimInFlight && message(trimOutcome) == "cancelled" && trimmedLength < duration - cut / 2,
