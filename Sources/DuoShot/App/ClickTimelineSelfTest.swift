@@ -310,18 +310,24 @@ enum ClickTimelineSelfTest {
               "a take in use survives a prune that removes it once it is not",
               "kept while in use: \(keptWhileInUse), pruned after: \(prunedAfter)")
 
-        print("(11) the launch sweep removes what an interrupted timeline left, and only that")
+        print("(11) the launch sweep removes what an interrupted timeline or trim left, and only that")
         let sweepDirectory = directory.appendingPathComponent("sweep", isDirectory: true)
         try? FileManager.default.removeItem(at: sweepDirectory)
         try FileManager.default.createDirectory(at: sweepDirectory, withIntermediateDirectories: true)
         let orphan = sweepDirectory.appendingPathComponent(ClickTimelineEmbedder.sweepPrefix + "orphan.mp4")
+        // A trim's export, and the sibling AVFoundation writes beside it.
+        let trimOrphan = sweepDirectory.appendingPathComponent(VideoTrim.sweepPrefix + "orphan.mp4")
+        let trimSibling = sweepDirectory.appendingPathComponent(
+            VideoTrim.sweepPrefix + "orphan.mp4.sb-1a2b3c4d-AbCdEf")
         let keeper = sweepDirectory.appendingPathComponent("someone-elses.mp4")
-        FileManager.default.createFile(atPath: orphan.path, contents: Data(count: 16))
-        FileManager.default.createFile(atPath: keeper.path, contents: Data(count: 16))
+        for file in [orphan, trimOrphan, trimSibling, keeper] {
+            FileManager.default.createFile(atPath: file.path, contents: Data(count: 16))
+        }
         let swept = ClickTimelineJobs.sweep([sweepDirectory])
-        check(swept == 1 && !FileManager.default.fileExists(atPath: orphan.path)
-                && FileManager.default.fileExists(atPath: keeper.path),
-              "the orphaned copy removed, the other file kept", "removed \(swept)")
+        let left = ((try? FileManager.default.contentsOfDirectory(atPath: sweepDirectory.path)) ?? []).sorted()
+        check(swept == 3 && left == [keeper.lastPathComponent],
+              "the orphaned copy and trim export removed, the other file kept",
+              "removed \(swept), left \(left.joined(separator: ", "))")
         try? FileManager.default.removeItem(at: sweepDirectory)
 
         try await jobContract(directory: directory, before: before, insideA: insideA, insideB: insideB,

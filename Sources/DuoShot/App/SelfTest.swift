@@ -7990,7 +7990,7 @@ enum SelfTest {
         while editor.isExportingForTest, ContinuousClock.now < deadline {
             strangers.formUnion(names(directory).subtracting(folderBefore))
             inStaging.formUnion(names(staging).subtracting(stagingBefore)
-                .filter { $0.hasPrefix(".duoshot-trim-") })
+                .filter { $0.hasPrefix(VideoTrim.sweepPrefix) })
             try await Task.sleep(for: .milliseconds(2))
         }
         check("the export finished", !editor.isExportingForTest)
@@ -8038,7 +8038,7 @@ enum SelfTest {
         // anywhere is a whole second copy of a take the user asked to make
         // shorter, and in staging a hidden one is never pruned.
         let strays = names(directory).union(names(staging).subtracting(stagingBefore))
-            .filter { $0.hasPrefix(".duoshot-trim-") }
+            .filter { $0.hasPrefix(VideoTrim.sweepPrefix) }
         check("no temporary file left beside it or in staging", strays.isEmpty,
               strays.sorted().joined(separator: ", "))
 

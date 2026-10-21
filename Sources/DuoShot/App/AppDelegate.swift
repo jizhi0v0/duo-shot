@@ -26,9 +26,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isReauthorising = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // What an interrupted click timeline or command-line take left behind:
-        // hidden copies nothing else would ever remove. Every copy is written
-        // into the jobs' work directory and nowhere else.
+        // What an interrupted click timeline, trim or command-line take left
+        // behind: hidden copies nothing else would ever remove. Every timeline
+        // copy is written into the jobs' work directory and nowhere else, and a
+        // trim's export there too unless the take is on another volume.
         ClickTimelineJobs.sweep([ClickTimelineJobs.shared.workDirectory])
         CLIServer.sweepTakes()
         let granted = ScreenPermission.isGranted

@@ -173,11 +173,16 @@ nonisolated enum VideoTrim {
         return workDirectory
     }
 
+    /// The prefix of every temporary file this writes, for the sweep at launch:
+    /// one left by a crash or a kill is hidden, and in staging nothing else ever
+    /// removes it. AVFoundation's own `<name>.sb-*` sibling carries it too.
+    static let sweepPrefix = ".duoshot-trim-"
+
     /// A dot-prefixed name: invisible in Finder, and unique so two trims of two
     /// recordings cannot collide.
     private static func temporary(for url: URL, in directory: URL) -> URL {
         directory
-            .appendingPathComponent(".duoshot-trim-\(UUID().uuidString.prefix(8))")
+            .appendingPathComponent("\(sweepPrefix)\(UUID().uuidString.prefix(8))")
             .appendingPathExtension(url.pathExtension.isEmpty ? "mp4" : url.pathExtension)
     }
 }

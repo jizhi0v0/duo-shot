@@ -137,22 +137,24 @@ final class ClickTimelineJobs {
         }
     }
 
-    /// Removes the hidden copies an interrupted embed left in `directories`.
-    /// Only files this writes: the name carries `sweepPrefix`.
+    /// Removes the hidden copies an interrupted embed or trim left in
+    /// `directories`. Only files those write: the name carries
+    /// `ClickTimelineEmbedder.sweepPrefix` or `VideoTrim.sweepPrefix`.
     @discardableResult
     static func sweep(_ directories: [URL]) -> Int {
         var removed = 0
         for directory in directories {
             guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path)
             else { continue }
-            for name in names where name.hasPrefix(ClickTimelineEmbedder.sweepPrefix) {
+            for name in names where name.hasPrefix(ClickTimelineEmbedder.sweepPrefix)
+                || name.hasPrefix(VideoTrim.sweepPrefix) {
                 if (try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))) != nil {
                     removed += 1
                 }
             }
         }
         if removed > 0 {
-            Log.record.notice("removed \(removed, privacy: .public) copy(ies) an interrupted click timeline left")
+            Log.record.notice("removed \(removed, privacy: .public) copy(ies) an interrupted click timeline or trim left")
         }
         return removed
     }
